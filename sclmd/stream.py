@@ -10,15 +10,15 @@ from .checkpoint import Checkpoint
 VRAM_MARGIN = 768 << 20  # left free for the driver and other processes
 
 
-def cap_vram(device: str = "cuda"):
+def cap_vram(device: str = "cuda", margin: int = VRAM_MARGIN):
     """Windows pages over-subscribed VRAM out to system RAM instead of failing, and everything slows to a crawl.
-    Cap PyTorch below the VRAM that is free now, so it fails instead."""
+    Cap PyTorch below the VRAM that is free now (less `margin` for the driver and other programs), so it fails instead."""
     if not str(device).startswith("cuda"):
         return
     index = torch.device(device).index
     index = torch.cuda.current_device() if index is None else index
     free, total = torch.cuda.mem_get_info(index)
-    torch.cuda.set_per_process_memory_fraction((free - VRAM_MARGIN) / total, index)
+    torch.cuda.set_per_process_memory_fraction((free - margin) / total, index)
 
 
 class Stream:

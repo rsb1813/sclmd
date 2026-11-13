@@ -1,0 +1,16 @@
+{
+  "layer": 30,
+  "rate": 6,
+  "what": [
+    "scale",
+    "norms"
+  ],
+  "steps": 200,
+  "lr": 0.001,
+  "train_before": 0.012142629089892453,
+  "test_before": 0.012207504163027764,
+  "train_after": 0.011892293346055589,
+  "test_after": 0.011994842899377663,
+  "seconds": 83.7,
+  "peak_vram_gib": 8.95
+}

@@ -22,19 +22,35 @@ NORMS = ("in_ln", "post_attn_ln", "pre_ff_ln", "post_ff_ln", "q_norm", "k_norm",
 
 
 class Coded(torch.nn.Module):
-    """A matrix as pair codes with its scales and codebook as parameters; the product is taken in the rotated basis."""
+    """A matrix as pair codes; the product is taken in the rotated basis. Trainable: a factor on each row's scale
+    (exp of `gain`, which starts at zero) and, with train_book, the codebook."""
 
-    def __init__(self, codes, scales, book):
+    def __init__(self, codes, scales, book, train_book: bool):
         super().__init__()
-        self.codes = codes.long().to(DEV)  # [rows, cols / 2]
         self.rot = C.rotation(codes.shape[1] * 2, DEV)
-        self.scale = torch.nn.Parameter(scales.float().to(DEV).clone())
-        self.book = torch.nn.Parameter(book.float().to(DEV).clone())
+        self.scale0 = scales.float().to(DEV)
+        self.gain = torch.nn.Parameter(torch.zeros_like(self.scale0))
+        self.book = torch.nn.Parameter(book.float().to(DEV).clone(), requires_grad=train_book)
+        self.codes = codes.to(DEV).int() if train_book else None  # [rows, cols / 2]
+        self.unit = None if train_book else book.float().to(DEV)[codes.to(DEV).long()].flatten(-2)  # [rows, cols], fixed
 
     def forward(self, x):
         flat = x.reshape(-1, x.shape[-1])
-        w = (self.book[self.codes].flatten(-2) * self.scale[:, None])  # [rows, cols] in the rotated basis
+        unit = self.book[self.codes].flatten(-2) if self.unit is None else self.unit
+        w = unit * (self.scale0 * self.gain.exp())[:, None]  # [rows, cols] in the rotated basis
         return (self.rot.rotate(flat) @ w.t()).reshape(*x.shape[:-1], -1)
+
+
+class Scaled(torch.nn.Module):
+    """A norm weight (or the layer's scalar) times a trainable factor that starts at one."""
+
+    def __init__(self, value):
+        super().__init__()
+        self.value = value
+        self.gain = torch.nn.Parameter(torch.zeros_like(value))
+
+    def get(self):
+        return self.value * self.gain.exp()
 
 
 def main():
@@ -61,14 +77,15 @@ def main():
     w = {k: v.float() for k, v in ck.layer(i, DEV).items()}
     with torch.no_grad():
         want = torch.cat([M.layer_forward(cfg, i, w, h[q : q + 1], positions) for q in range(h.shape[0])])
-    mats = {m: Coded(*C.stored(args.name, i, {m: args.rate})[m][:3]) for m in M.LINEARS if m in w}
-    small = {k: torch.nn.Parameter(w[k].clone()) for k in NORMS}
+    what = args.what.split(",")
+    mats = {m: Coded(*C.stored(args.name, i, {m: args.rate})[m][:3], train_book="book" in what) for m in M.LINEARS if m in w}
+    small = {k: Scaled(w[k].clone()) for k in NORMS}
     for m in M.LINEARS:
         w.pop(m, None)
     torch.cuda.empty_cache()
-    wq = dict(small) | mats
 
     def run(q):
+        wq = {k: v.get() for k, v in small.items()} | mats
         return M.layer_forward(cfg, i, wq, h[q : q + 1], positions, linear=lambda x, m: m(x))
 
     def score(rows):
@@ -79,9 +96,8 @@ def main():
 
     train, test = list(range(args.train)), list(range(args.train, args.train + args.test))
     before = (score(train[:8]), score(test))
-    what = args.what.split(",")
-    params = ([p for m in mats.values() for p in ([m.scale] if "scale" in what else []) + ([m.book] if "book" in what else [])]
-              + (list(small.values()) if "norms" in what else []))
+    params = ([p for m in mats.values() for p in ([m.gain] if "scale" in what else []) + ([m.book] if "book" in what else [])]
+              + ([v.gain for v in small.values()] if "norms" in what else []))
     opt = torch.optim.Adam(params, lr=args.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.steps)
     t = time.time()

@@ -282,25 +282,28 @@ def main() -> None:
     ap.add_argument("--head", type=int, default=8)
     ap.add_argument("--context", type=int, default=8192, help="tokens a conversation can hold (82 KB of VRAM each, taken at the start: what it takes, the plan cannot spend on 4-bit matrices). Attention weights are fp16: past about 16,000 positions the smallest lose precision, which has not been measured")
     ap.add_argument("--no-drafter", action="store_true")
+    ap.add_argument("--reserve", type=float, default=VRAM_MARGIN / 2**30, help="GiB of the VRAM that is free now to leave to other "
+                    "programs. Less means more matrices at 4 bits; if other programs then take more, Windows pages VRAM out and everything slows down")
     cli = ap.parse_args()
+    reserve = int(cli.reserve * 2**30)
     console = Console()
     console.print("[grey62]모델을 올리는 중입니다 (약 15초)…[/]")
     import transformers
     from transformers import AutoTokenizer
 
     transformers.logging.set_verbosity_error()
-    cap_vram()
+    cap_vram(margin=reserve)
     tok = AutoTokenizer.from_pretrained(ckpt("orig"))
     cfg = M.Config.load(ckpt("orig"))
     head, estimate = cli.head, None
     if cli.plan == "auto":
         # what is free now, less what PyTorch is kept from (cap_vram), the rest of the engine, and room to load in
-        free = torch.cuda.mem_get_info()[0] - VRAM_MARGIN
+        free = torch.cuda.mem_get_info()[0] - reserve
         rest = E.fixed_bytes(cfg, head, cli.context) + (0 if cli.no_drafter else E.DRAFTER_BYTES)
         budget = free - rest - LOAD_ROOM
         if budget < P.code_bytes(cfg, P.uniform(cfg, 6)):
-            console.print(f"[yellow]VRAM이 모자랍니다: 지금 비어 있는 것은 {(free + VRAM_MARGIN) / 2**30:.1f}GiB이고, 전부 3bit로도 "
-                          f"{(P.code_bytes(cfg, P.uniform(cfg, 6)) + rest + LOAD_ROOM + VRAM_MARGIN) / 2**30:.1f}GiB가 필요합니다. "
+            console.print(f"[yellow]VRAM이 모자랍니다: 지금 비어 있는 것은 {(free + reserve) / 2**30:.1f}GiB이고, 전부 3bit로도 "
+                          f"{(P.code_bytes(cfg, P.uniform(cfg, 6)) + rest + LOAD_ROOM + reserve) / 2**30:.1f}GiB가 필요합니다. "
                           f"다른 프로그램을 닫거나 --context 를 줄여 보세요.[/]")
             return
         plan, estimate = P.fit(cfg, cli.name, budget, of=SHARES)
