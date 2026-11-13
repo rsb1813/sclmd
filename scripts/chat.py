@@ -16,8 +16,7 @@ from rich.console import Console
 from sclmd import ckpt
 from sclmd import engine as E
 from sclmd import model as M
-from sclmd.drafter import Drafter
-from sclmd.generate import Picker, drafter_guess, extend
+from sclmd.generate import Picker, extend
 from sclmd.stream import cap_vram
 
 DEPTH = 6  # the drafter's generation_config.json: num_assistant_tokens
@@ -143,7 +142,7 @@ class Session:
                 sent = text
 
         pick = Picker(opts["temperature"], opts["top_k"], opts["top_p"], seed=random.getrandbits(30))
-        guess = drafter_guess(self.drafter, eng, DEPTH) if self.drafter is not None and self.use_drafter else None
+        guess = self.drafter.guess if self.drafter is not None and self.use_drafter else None
         stats = {}
         extend(eng, len(full), logits[-1], hidden[-1], min(opts["num_predict"], room), pick, guess, self.stop, stats, emit,
                lambda: halt() or looped[0])
@@ -299,7 +298,7 @@ def main() -> None:
         plan, head = {i: {m: 6 for m in M.LINEARS} for i in range(cfg.n_layers)}, cli.head
     with torch.no_grad():
         eng = E.Engine.load(cli.name, plan, head, cli.context)
-        drafter = None if cli.no_drafter else Drafter.load(ckpt("drafter"), "cuda")
+        drafter = None if cli.no_drafter else E.EngineDrafter.load(eng, ckpt("drafter"), DEPTH)
         opts = {"temperature": 1.0, "top_p": 0.95, "top_k": 64, "num_predict": 4096, "verbose": True, "showthink": False}
         session = Session(tok, eng, drafter)
         console.print(f"\n[bold]sclmd chat[/] · gemma-4-31B-it · VRAM {torch.cuda.memory_allocated() / 2**30:.1f}GiB · "

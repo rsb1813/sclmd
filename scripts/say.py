@@ -11,8 +11,7 @@ from transformers import AutoTokenizer
 from sclmd import ckpt
 from sclmd import engine as E
 from sclmd import model as M
-from sclmd.drafter import Drafter
-from sclmd.generate import Picker, drafter_guess, generate
+from sclmd.generate import Picker, generate
 from sclmd.stream import cap_vram
 
 DEPTH = 6  # the drafter's generation_config.json: num_assistant_tokens
@@ -51,7 +50,7 @@ def main():
     plan, head = load_plan(args.plan, args.rate, args.head, cfg)
     t = time.time()
     eng = E.Engine.load(args.name, plan, head, args.capacity)
-    drafter = None if args.no_drafter else Drafter.load(ckpt("drafter"), "cuda")
+    drafter = None if args.no_drafter else E.EngineDrafter.load(eng, ckpt("drafter"), DEPTH)
     torch.cuda.synchronize()
     print(f"[say] loaded in {time.time() - t:.0f} s, VRAM {torch.cuda.memory_allocated() / 2**30:.2f} GiB, prompt {len(prompt)} tokens", flush=True)
     pick = Picker(args.temperature, seed=args.seed)
@@ -66,8 +65,8 @@ def main():
         torch.cuda.synchronize()
         return ids, time.perf_counter() - t, stats
 
-    run(None if drafter is None else drafter_guess(drafter, eng, DEPTH))  # the first run pays for CUDA's and PyTorch's start-up
-    ids, seconds, stats = run(None if drafter is None else drafter_guess(drafter, eng, DEPTH))
+    run(None if drafter is None else drafter.guess)  # the first run pays for CUDA's and PyTorch's start-up
+    ids, seconds, stats = run(None if drafter is None else drafter.guess)
     print(tok.decode(ids, skip_special_tokens=False))
     print(f"[say] {len(ids)} tokens in {seconds:.2f} s including the prompt's {len(prompt)}: {len(ids) / seconds:.1f} tok/s, "
           f"{stats['tokens'] / max(stats['passes'], 1):.2f} tokens a pass" + ("" if drafter is None else " with the drafter"), flush=True)

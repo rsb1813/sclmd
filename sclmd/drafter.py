@@ -27,18 +27,20 @@ class Drafter:
                    state["model.embed_tokens.weight"])
 
     @torch.no_grad()
-    def step(self, token_embed: torch.Tensor, hidden: torch.Tensor, last: torch.Tensor, shared: dict) -> tuple[torch.Tensor, torch.Tensor]:
+    def step(self, token_embed: torch.Tensor, hidden: torch.Tensor, last: torch.Tensor, shared: dict, linear=F.linear,
+             rounded=None) -> tuple[torch.Tensor, torch.Tensor]:
         """One guess for each of n places in a sequence.
         token_embed [batch, n, backbone]: the main model's (scaled) embedding of the token just before the guess.
         hidden [batch, n, backbone]: the main model's last output (after its final norm) at the position before that
             token, or this function's second result when guessing further ahead.
         last [n]: the last position whose keys each place may read; the place itself sits at last + 1.
         shared: layer type -> (keys, values, their positions).
+        linear, rounded: as in model.layer_forward (a test of the engine's drafter passes the engine's arithmetic).
         Returns (logits [batch, n, vocab], the hidden state for the guess after this one)."""
         cfg = self.cfg
-        h = F.linear(torch.cat((token_embed, hidden), dim=-1), self.pre)
+        h = linear(torch.cat((token_embed, hidden), dim=-1), self.pre)
         for i, w in enumerate(self.layers):
             # transformers lets the drafter read `window + 1` keys in a sliding layer
-            h = M.layer_forward(cfg, i, w, h, last + 1, shared=shared, see=(last, cfg.window + 1))
+            h = M.layer_forward(cfg, i, w, h, last + 1, shared=shared, see=(last, cfg.window + 1), linear=linear, rounded=rounded)
         h = M.rms_norm(h, self.norm, cfg.eps)
-        return F.linear(h, self.head), F.linear(h, self.post)
+        return linear(h, self.head), linear(h, self.post)

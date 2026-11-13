@@ -269,7 +269,9 @@ def test_text_is_the_same_with_any_mix_of_right_and_wrong_guesses(small_e):
     assert generate(small_e.engine(), PROMPT, 30, pick, guess) == sampled
 
 
-def test_with_the_drafter_the_text_is_unchanged(small_e):
+@pytest.fixture(scope="module")
+def drafter_e():
+    """(config, state) of a small random drafter for the `small_e` model; its matrices are fp16 values, as the engine keeps them."""
     from transformers import Gemma4AssistantConfig, Gemma4AssistantForCausalLM, Gemma4TextConfig
 
     text = dict(ETEXT, hidden_size=64, intermediate_size=128, num_hidden_layers=4, num_kv_shared_layers=4, final_logit_softcapping=None,
@@ -277,8 +279,57 @@ def test_with_the_drafter_the_text_is_unchanged(small_e):
     config = Gemma4AssistantConfig(text_config=Gemma4TextConfig(**text), backbone_hidden_size=ETEXT["hidden_size"])
     hf = randomize(Gemma4AssistantForCausalLM(config).eval(), 6)
     hf.lm_head.weight = hf.model.embed_tokens.weight
-    drafter = Drafter.from_state(M.Config.from_text_config(config.text_config.to_dict()), {k: v.to(DEV) for k, v in hf.state_dict().items()})
+    state = {k: (v.half().float() if v.dim() == 2 else v).to(DEV) for k, v in hf.state_dict().items()}
+    return M.Config.from_text_config(config.text_config.to_dict()), state
+
+
+def engine_drafter(eng: E.Engine, drafter_e) -> E.EngineDrafter:
+    cfg, state = drafter_e
+    return E.EngineDrafter(eng, cfg, [M.layer_weights(state, "model.", i) for i in range(cfg.n_layers)], state["pre_projection.weight"],
+                           state["post_projection.weight"], state["model.norm.weight"], state["model.embed_tokens.weight"])
+
+
+def dense16(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """A matrix of fp16 values times an input, as the engine's kernel computes it: the input is fp16 too."""
+    flat = x.reshape(-1, x.shape[-1]).float()
+    length = flat.norm(dim=-1, keepdim=True)
+    fps = torch.where(length > 16384, torch.exp2(torch.ceil(torch.log2(length / 16384))), torch.ones_like(length))
+    return (((flat / fps).half().float() @ w.t()) * fps).reshape(*x.shape[:-1], -1)
+
+
+def test_the_drafter_on_the_engine_matches_the_reference_drafter(small_e, drafter_e):
+    ref = Drafter.from_state(*drafter_e)
+    eng = small_e.engine()
+    nat = engine_drafter(eng, drafter_e)
+    ids = ids_of(44, 12)
+    hidden = torch.cat([eng.feed(ids[a : a + 11])[1] for a in range(0, 44, 11)])
+    g = torch.Generator().manual_seed(13)
+    for length in (44, 41, 36):  # as after a pass whose guesses were all kept, partly kept, all rejected
+        keys = {t: (k.float(), v.float(), pos) for t, (k, v, pos) in eng.keys(length).items()}
+        embed, state = eng.embed([ids[length - 1]])[0], hidden[length - 1]
+        for step in range(3):
+            want_logits, want_next = ref.step(embed[None, None], state[None, None], torch.tensor([length - 1], device=DEV), keys,
+                                              linear=dense16, rounded=fp16)
+            logits, state = nat.step(embed, state, length)
+            assert close(logits[None], want_logits[0], WHOLE_MODEL) and close(state[None], want_next[0], WHOLE_MODEL), (length, step)
+            assert int(logits.argmax()) == int(want_logits.argmax())
+            state = state.clone()
+            embed = eng.embed([int(torch.randint(3, 300, (1,), generator=g))])[0]
+    # whole guesses: the same tokens as the drafter in PyTorch
+    for length in (44, 40):
+        want = drafter_guess(ref, eng, 6)(ids[length - 1], hidden[length - 1], length)
+        assert nat.guess(ids[length - 1], hidden[length - 1], length) == want
+
+
+def test_with_the_drafter_the_text_is_unchanged(small_e, drafter_e):
+    drafter = Drafter.from_state(*drafter_e)
     truth = generate(small_e.engine(), PROMPT, 40, Picker())
+    eng = small_e.engine()
+    assert generate(eng, PROMPT, 40, Picker(), engine_drafter(eng, drafter_e).guess) == truth
+    pick = Picker(temperature=1.0, top_k=64, top_p=0.95, seed=3)
+    sampled = generate(small_e.engine(), PROMPT, 40, pick)
+    eng = small_e.engine()
+    assert generate(eng, PROMPT, 40, pick, engine_drafter(eng, drafter_e).guess) == sampled
     eng, stats = small_e.engine(), {}
     assert generate(eng, PROMPT, 40, Picker(), drafter_guess(drafter, eng, 6), stats=stats) == truth
     # and the drafter on the engine's keys guesses what it guesses on the reference's

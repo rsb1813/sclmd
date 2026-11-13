@@ -279,3 +279,121 @@ class Engine:
                 slot = pos % k.shape[0]
                 out[t] = (k[slot].transpose(0, 1)[None], v[slot].transpose(0, 1)[None], pos)
         return out
+
+
+# ---- The drafter on the engine's kernels (engine/sclmd.cu: sclmd_draft)
+
+class Dense(C.Structure):
+    _fields_ = [("w", C.c_void_p), ("rows", C.c_int), ("cols", C.c_int)]
+
+
+class DLayer(C.Structure):
+    _fields_ = ([(m, Dense) for m in ("q", "o", "gate", "up", "down")] +
+                [(p, C.c_void_p) for p in ("in_ln", "post_attn_ln", "pre_ff_ln", "post_ff_ln", "q_norm", "inv_freq")] +
+                [("scalar", C.c_float), ("full", C.c_int), ("head_dim", C.c_int), ("kv_heads", C.c_int)])
+
+
+class DrafterC(C.Structure):
+    _fields_ = ([("layers", C.c_void_p)] + [(n, C.c_int) for n in ("n_layers", "hidden", "mlp", "heads", "vocab", "backbone")] +
+                [("eps", C.c_float), ("pad", C.c_int), ("pre", Dense), ("post", Dense), ("head", Dense), ("norm", C.c_void_p)] +
+                [(p, C.c_void_p) for p in ("inp", "h", "hn", "logits", "next", "x", "fps", "xf", "y", "y2", "qhat", "scores", "probs", "attn")])
+
+
+def pack_dense(w: torch.Tensor, device: str = "cuda", rows_at_once: int = 4096) -> torch.Tensor:
+    """Weights [rows, cols] as fp16 in the order the kernel reads them (int32 [strip][tile][lane][4]), a part of the
+    rows at a time."""
+    rows, cols = w.shape
+    assert rows % 16 == 0 and cols % 16 == 0
+    out = torch.empty(rows * cols // 2, dtype=torch.int32, device=device)
+    for a in range(0, rows, rows_at_once):
+        c = w[a : a + rows_at_once].to(device=device, dtype=torch.float16).contiguous().view(torch.int32)  # a word: two columns
+        c = c.view(c.shape[0] // 16, 16, cols // 16, 8).permute(0, 2, 1, 3)  # [strip, tile, row in strip, pair in tile]
+        out[a * cols // 2 : (a + c.shape[0] * 16) * cols // 2] = c[:, :, _ROW.to(device), _PAIR.to(device)].reshape(-1)
+    return out
+
+
+class EngineDrafter:
+    """The drafter beside an Engine: guess(token, hidden, length) as generation asks for it (sclmd/generate.py).
+    Its matrices are fp16 as stored (bf16 weights fit in fp16 exactly, tiny ones aside); its work memory is the
+    engine's, which is idle while the drafter guesses.
+
+    layers: per layer its weights by the names of model.LAYER_KEYS (q, o, gate, up, down, the norms, scalar)."""
+
+    def __init__(self, eng: Engine, cfg: M.Config, layers: list, pre: torch.Tensor, post: torch.Tensor, norm: torch.Tensor,
+                 head: torch.Tensor, depth: int = 6):
+        self.eng, self.cfg, self.depth, dev = eng, cfg, depth, eng.device
+        main = eng.cfg
+        assert cfg.kv_shared == cfg.n_layers and cfg.head_dim == main.head_dim and cfg.kv_heads == main.kv_heads
+        assert cfg.window == main.window and pre.shape[1] == 2 * main.hidden
+        self.keep = []
+        f32 = lambda t: self._own(t.to(device=dev, dtype=torch.float32).contiguous())  # noqa: E731
+        self.c_layers = (DLayer * cfg.n_layers)()
+        for i, (lay, cl) in enumerate(zip(layers, self.c_layers)):
+            t = cfg.layer_types[i]
+            hd = cfg.head_dim[t]
+            for name in ("q", "o", "gate", "up", "down"):
+                setattr(cl, name, self._dense(lay[name]))
+            for name in ("in_ln", "post_attn_ln", "pre_ff_ln", "post_ff_ln", "q_norm"):
+                setattr(cl, name, f32(lay[name]).data_ptr())
+            theta, rotated = cfg.rope[t]
+            inv = torch.zeros(hd // 2)
+            inv[:rotated] = 1.0 / (theta ** (torch.arange(0, 2 * rotated, 2).float() / hd))
+            cl.inv_freq = f32(inv).data_ptr()
+            cl.scalar, cl.full, cl.head_dim, cl.kv_heads = float(lay["scalar"]), int(t == M.FULL), hd, cfg.kv_heads[t]
+        z = lambda *shape: self._own(torch.zeros(*shape, dtype=torch.float32, device=dev))  # noqa: E731
+        self.inp, self.h, self.hn, self.logits, self.next = z(2 * main.hidden), z(cfg.hidden), z(cfg.hidden), z(cfg.vocab), z(main.hidden)
+        c = self.c = DrafterC()
+        c.layers = C.cast(self.c_layers, C.c_void_p)
+        c.n_layers, c.hidden, c.mlp, c.heads, c.vocab, c.backbone = cfg.n_layers, cfg.hidden, cfg.mlp, cfg.heads, cfg.vocab, main.hidden
+        c.eps = cfg.eps
+        c.pre, c.post, c.head, c.norm = self._dense(pre), self._dense(post), self._dense(head), f32(norm).data_ptr()
+        for name in ("inp", "h", "hn", "logits", "next"):
+            setattr(c, name, getattr(self, name).data_ptr())
+        work = eng.work  # wide enough for the main model's matrices: checked here for the drafter's
+        widest = max(2 * main.hidden, cfg.mlp, cfg.heads * max(cfg.head_dim.values()))
+        assert work["x"].shape[1] >= widest and work["y"].shape[1] >= widest and work["y2"].shape[1] >= cfg.mlp
+        assert cfg.heads <= main.heads
+        for name in ("x", "fps", "xf", "y", "y2", "qhat", "scores", "probs", "attn"):
+            setattr(c, name, work[name].data_ptr())
+        self.sliding, self.full = eng.c_layers[main.last_of(M.SLIDING)], eng.c_layers[main.last_of(M.FULL)]
+        self.lib = lib()
+        sizes = [C.c_int() for _ in range(3)]
+        self.lib.sclmd_draft_sizes(*[C.byref(s) for s in sizes])
+        assert [s.value for s in sizes] == [C.sizeof(Dense), C.sizeof(DLayer), C.sizeof(DrafterC)], "struct layouts differ"
+        self.lib.sclmd_draft.argtypes = [C.c_void_p, C.c_void_p, C.c_void_p, C.c_int, C.c_int]
+
+    @classmethod
+    def load(cls, eng: Engine, folder: str, depth: int = 6) -> "EngineDrafter":
+        from .checkpoint import Checkpoint
+
+        ck = Checkpoint(folder)
+        layers = [ck.layer(i, "cpu") for i in range(ck.cfg.n_layers)]
+        return cls(eng, ck.cfg, layers, ck.get("pre_projection.weight"), ck.get("post_projection.weight"), ck.norm(), ck.embed(), depth)
+
+    def _own(self, t: torch.Tensor) -> torch.Tensor:
+        self.keep.append(t)
+        return t
+
+    def _dense(self, w: torch.Tensor) -> Dense:
+        return Dense(self._own(pack_dense(w, self.eng.device)).data_ptr(), w.shape[0], w.shape[1])
+
+    def step(self, token_embed: torch.Tensor, hidden: torch.Tensor, length: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """One guess for position length + 1 from the token at `length` (its embedding in the main model) and a hidden
+        state -> (logits [vocab], the hidden state for the guess after it). Both are the drafter's own memory:
+        the next step writes over them."""
+        eng = self.eng
+        assert length <= eng.length and eng._kept(length - (eng.cfg.window + 1)), "further back than the sliding layers keep"
+        n = eng.cfg.hidden
+        self.inp[:n], self.inp[n:] = token_embed, hidden
+        status = self.lib.sclmd_draft(C.byref(self.c), C.byref(self.sliding), C.byref(self.full), eng.cfg.window, length)
+        assert status == 0, f"GPU kernel launch failed ({status})"
+        return self.logits, self.next
+
+    def guess(self, token: int, hidden: torch.Tensor, length: int) -> list:
+        """Up to `depth` tokens after `token`, which sits at position `length` (generate.py's guess)."""
+        out = []
+        for _ in range(self.depth):
+            logits, hidden = self.step(self.eng.embed([token])[0], hidden, length)
+            token = int(logits.argmax())
+            out.append(token)
+        return out
