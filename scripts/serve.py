@@ -194,7 +194,11 @@ class Server:
         seq = job.seq
         if job.done in ("stop", "length") and job.out:
             kept = self.kept[seq] = Kept(seq, req.full[: req.start], job.snapped)
-            later = self.canon(req, job.out) if self.canon is not None else None
+            try:
+                later = self.canon(req, job.out) if self.canon is not None else None
+            except Exception as e:  # noqa: BLE001  (a template that cannot write the reply: nothing is read ahead)
+                print(f"[serve] seq {seq}: the reply's later form could not be made ({type(e).__name__}: {e})", flush=True)
+                later = None
             if later is not None and later[: req.start] == kept.base and req.start < len(later) <= eng.capacity - 2 * eng.rows:
                 # the reply as a later turn writes it is read in from the turn's start, with rows nothing else needs
                 if job.snapped:
@@ -253,7 +257,11 @@ class Server:
                 req.t_first = time.perf_counter()
         for req in [r for r in self.active if r.job.done is not None]:
             self.active.remove(req)
-            self._finish(req)
+            try:
+                self._finish(req)
+            except Exception:  # it is in no list any more: told here, the others by run()
+                req.events.put(("error", 500, "the server failed while ending the reply"))
+                raise
         return True
 
     def run(self) -> None:

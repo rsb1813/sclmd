@@ -6,6 +6,28 @@
   "cut": "replies that ran out of the 16,384 tokens; over_8k: replies that would not have fitted the chat's default 8,192",
   "tasks": [
     {
+      "task": "aime_2026",
+      "runs": 1,
+      "items": 19,
+      "of": 30,
+      "correct": 19,
+      "score": 100.0,
+      "low": 83.2,
+      "high": 100.0,
+      "card": 89.2,
+      "no_answer": 0,
+      "cut": 0,
+      "looped": 0,
+      "errors": 0,
+      "over_8k": 11,
+      "score_at_8k": 42.1,
+      "mean_tokens": 7645,
+      "mean_thinking": 6734,
+      "tok_s": 144.1,
+      "hours": 0.28,
+      "note": "the card's scores are counts out of 120: four runs of the 30 problems"
+    },
+    {
       "task": "mmlu_pro",
       "runs": 1,
       "items": 70,

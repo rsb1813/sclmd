@@ -152,6 +152,7 @@ def _job(memory: int):
 
 
 RUNNER = "r2"  # in the key of a cached result: results of an earlier way of running programs are not used
+TIMED_OUT = [False]  # set when a program ran out of time: such a result is counted but not cached (the machine may have been busy)
 
 
 def run_program(source: str, stdin: str, timeout: float, memory: int = 4 << 30) -> tuple[bool, str]:
@@ -172,6 +173,7 @@ def run_program(source: str, stdin: str, timeout: float, memory: int = 4 << 30) 
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.communicate()
+            TIMED_OUT[0] = True
             return False, ""
         finally:
             if job:
@@ -317,14 +319,18 @@ def score_task(bench: str, task: str, tag: str, files: list, run_code: bool) -> 
                 got = code_of(answer, f"def {t['entry_point']}" if task == "humaneval" else None)
                 if got is not None:
                     key = f"{RUNNER}:{r['id']}:{hashlib.sha256(got.encode()).hexdigest()[:16]}"
-                    if key not in cache and run_code:
-                        cache[key] = humaneval_passes(got, t) if task == "humaneval" else lcb_passes(got, t)
-                        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-                        with open(cache_path, "w", encoding="utf-8") as f:
-                            json.dump(cache, f)
-                    if key not in cache:
+                    if key in cache:
+                        right = cache[key]
+                    elif run_code:
+                        TIMED_OUT[0] = False
+                        right = humaneval_passes(got, t) if task == "humaneval" else lcb_passes(got, t)
+                        if not TIMED_OUT[0]:
+                            cache[key] = right
+                            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                            with open(cache_path, "w", encoding="utf-8") as f:
+                                json.dump(cache, f)
+                    else:
                         continue  # not run yet: left out of the count
-                    right = cache[key]
                     got = "code"
             rows.append((r, got, right))
             s = by_stratum.setdefault(it["stratum"], [0, 0])

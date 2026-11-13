@@ -355,7 +355,7 @@ HTTP의 합계가 위 표보다 낮은 이유: 먼저 끝난 답을 "나중 턴�
 - 문항 준비 `scripts/bench_prepare.py`(공개 데이터셋 → `data/bench/items`, git에 안 넣음), 답 `scripts/bench.py`, 채점 `scripts/bench_score.py`, 대기열 `scripts/bench_queue.sh`(`data/bench/queue.txt`; `logs/pause`가 있으면 다음 문항에서 멈추고 GPU를 비움).
 - 채팅이 답하는 그대로: 생각 켬, temperature 1.0, top_p 0.95, top_k 64, 드래프터, 문항마다 답 하나(seed는 문항에서 정함). 가중치는 채팅이 올리는 것(`fit_own_v1_11.9`, 3.49bit, int8 키·값), **문맥만 16,384**(채팅 기본은 8,192): 생각이 8,192를 넘는 문항이 MMLU-Pro에서 10%, AIME에서는 13,000토큰짜리도 있다. 요약에는 8,192였다면 받았을 점수도 나온다.
 - 구간은 Wilson 95%. MMLU류는 과목별로 고르게 뽑은 순서의 앞에서부터.
-- 얼린 사본(`.claude/worktrees/bench`)에서 돈다. 00:38~02:07의 첫 90분은 그때의 엔진(3.29bit, 문맥 8,192)이었고 따로 둠(`data/bench_summary_3.29bit_fp16.json`).
+- 얼린 사본(`.claude/worktrees/bench`)에서 돈다(자기 `engine/build/sclmd.dll`을 가짐: 그 DLL과 그 `sclmd/engine.py`는 짝이므로, 사본을 새로 맞출 때는 병합과 DLL 복사를 함께 한다. 03:10 이후의 DLL은 `fps` 버퍼에 96칸을 기대한다). 00:38~02:07의 첫 90분은 그때의 엔진(3.29bit, 문맥 8,192)이었고 따로 둠(`data/bench_summary_3.29bit_fp16.json`).
 
 ### 7.2 채점기에서 확인한 것
 
