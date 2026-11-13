@@ -1,4 +1,6 @@
 // The engine: one pass of the Gemma 4 decoder over up to eight new tokens, on the GPU, from pair codes.
+// The eight may belong to several sequences (conversations): a pass is made of segments, each a run of rows that are
+// consecutive positions of one sequence, and a row attends only to its own sequence.
 //
 // All memory is PyTorch's (the caller allocates it and hands over addresses); the kernels run in its CUDA context on
 // the default stream. A pass is one call (sclmd_pass): no Python between the layers.
@@ -17,6 +19,22 @@
 #define API extern "C" __declspec(dllexport)
 
 static const int MAX_TOKENS = 8;  // the eight columns of the tensor-core instruction
+static const int MAX_SEGS = 8;    // segments of a pass: at most a sequence a row
+
+// The rows of a pass by sequence: segment i is rows row0[i] .. row0[i] + cnt[i] - 1 (the segments follow each other
+// and cover every row), positions pos0[i] .. of sequence seq[i].
+struct Segs {
+    int n;
+    int row0[MAX_SEGS], cnt[MAX_SEGS], pos0[MAX_SEGS], seq[MAX_SEGS];
+};
+
+// What the attention kernels of a layer are told of each segment besides: the positions its rows read, in whole
+// tiles of 16 (from `base`, `stride` positions), where its tiles start among scores_k's blocks, and where its scores
+// start in the scores' memory. most: the rows of the largest segment.
+struct Att {
+    int n, most;
+    int row0[MAX_SEGS], cnt[MAX_SEGS], pos0[MAX_SEGS], seq[MAX_SEGS], base[MAX_SEGS], stride[MAX_SEGS], tile0[MAX_SEGS], off[MAX_SEGS];
+};
 
 // A matrix as pair codes. codes: the stored order (bench/mma_gemm.cu); lut[code]: the pair as two fp16 in one word;
 // scale[row]. bits: 6 or 8 a pair. rows is a multiple of 16, cols of 64.
@@ -39,11 +57,15 @@ struct Layer {
     const float *in_ln, *post_attn_ln, *pre_ff_ln, *post_ff_ln;  // [hidden]
     const float *q_norm, *k_norm;                                 // [head_dim]
     const float* inv_freq;                                        // [head_dim / 2], zero past the rotated pairs
-    uint16_t *keys, *values;  // [slots][kv_heads * head_dim] fp16: this layer's keys and values by position
+    // This layer's keys and values, fp16, in tiles of 16 positions: [pool tiles][16][kv_heads * head_dim]. A sequence
+    // is given tiles from the pool as it grows: tiles[sequence * ring + j] is the pool tile that holds its positions
+    // 16j .. 16j + 15, j taken modulo `ring` (the table is shared by the layers of a kind).
+    uint16_t *keys, *values;
+    const int32_t* tiles;
     float scalar;
     int full;      // 1: attends to every earlier position; 0: to the last `window`
     int head_dim, kv_heads;
-    int slots;     // sliding: positions are kept modulo this; full: the capacity
+    int ring;      // sliding: (window + spare) / 16, so positions go round; full: capacity / 16
     int pad;
 };
 
@@ -73,6 +95,19 @@ __device__ __forceinline__ void mma(float c[4], uint32_t a0, uint32_t a1, uint32
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
                  : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+}
+
+// The segment a row belongs to (the segments are in row order).
+__device__ __forceinline__ int seg_of_row(const Att& a, int row) {
+    int s = 0;
+    for (int i = 1; i < a.n; ++i)
+        if (row >= a.row0[i]) s = i;
+    return s;
+}
+
+// The slot (position in the pool) of a sequence's position `pos`.
+__device__ __forceinline__ size_t slot_of(const int32_t* tiles, int ring, int seq, int pos) {
+    return size_t(tiles[size_t(seq) * ring + (pos >> 4) % ring]) * 16 + (pos & 15);
 }
 
 // The sum of v over the block's threads (a multiple of 32, at most 1024), returned to every thread.
@@ -224,9 +259,10 @@ __global__ void gemm_k(Mat m0, Mat m1, Mat m2, float* y0, float* y1, float* y2, 
 //   query: RMS norm times q_norm, rotary position -> qhat[token][head][head_dim] (fp16)
 //   key:   RMS norm times k_norm, rotary position -> keys[slot of the position][head] (fp16)
 //   value: RMS norm                               -> values[slot][head] (fp16); the value's source is yv (or yk when null)
-// The rotary position turns pair (d, d + head_dim / 2) by pos * inv_freq[d].
+// The rotary position turns pair (d, d + head_dim / 2) by pos * inv_freq[d]. The token's position and sequence are
+// its segment's (a.pos0: the position of the segment's first row).
 __global__ void heads_k(const float* yq, const float* yk, const float* yv, const float* q_norm, const float* k_norm, const float* inv_freq,
-                        uint16_t* qhat, uint16_t* keys, uint16_t* values, int heads, int kvh, int pos0, int slots, float eps) {
+                        uint16_t* qhat, uint16_t* keys, uint16_t* values, const int32_t* tiles, Att a, int heads, int kvh, int ring, float eps) {
     const int hd = blockDim.x, v = blockIdx.x, token = blockIdx.y, d = threadIdx.x, half = hd / 2;
     const int kind = v < heads ? 0 : v < heads + kvh ? 1 : 2, head = kind == 0 ? v : kind == 1 ? v - heads : v - heads - kvh;
     const float* src = kind == 0 ? yq + (size_t(token) * heads + head) * hd
@@ -234,59 +270,70 @@ __global__ void heads_k(const float* yq, const float* yk, const float* yv, const
     __shared__ float buf[1024];
     const float val = src[d];
     const float r = powf(block_sum(val * val) / hd + eps, -0.5f);
-    const int slot = (pos0 + token) % slots;
+    const int seg = seg_of_row(a, token), pos = a.pos0[seg] + token - a.row0[seg];
+    const size_t slot = kind == 0 ? 0 : slot_of(tiles, ring, a.seq[seg], pos);
     if (kind == 2) {
-        values[(size_t(slot) * kvh + head) * hd + d] = __half_as_ushort(__float2half(val * r));
+        values[(slot * kvh + head) * hd + d] = __half_as_ushort(__float2half(val * r));
         return;
     }
     buf[d] = val * r * (kind == 0 ? q_norm[d] : k_norm[d]);
     __syncthreads();
-    const float ang = float(pos0 + token) * inv_freq[d % half];
+    const float ang = float(pos) * inv_freq[d % half];
     const float turned = d < half ? -buf[d + half] : buf[d - half];
     const float out = buf[d] * cosf(ang) + turned * sinf(ang);
     if (kind == 0)
         qhat[(size_t(token) * heads + head) * hd + d] = __half_as_ushort(__float2half(out));
     else
-        keys[(size_t(slot) * kvh + head) * hd + d] = __half_as_ushort(__float2half(out));
+        keys[(slot * kvh + head) * hd + d] = __half_as_ushort(__float2half(out));
 }
 
-// Attention runs on the tensor cores too, in three kernels. The positions a pass reads are taken in tiles of 16 that
-// start at multiples of 16 (`base` is the first tile's position, `stride` the number of positions in the tiles), so a
-// query's sums are made of the same tiles in the same order whichever pass it is computed in (alone, or among
-// eight). Positions in the tiles that a query may not read, or that hold nothing yet, get weight zero.
-// A key head's queries are numbered query = token * rep + (head within the key head's `rep` query heads); eight of
-// them are the eight columns of the instruction, and each group of eight has a warp.
+// Attention runs on the tensor cores too, in three kernels. The positions a segment's rows read are taken in tiles of
+// 16 that start at multiples of 16 (`base` is the first tile's position, `stride` the number of positions in the
+// tiles), so a query's sums are made of the same tiles in the same order whichever pass it is computed in (alone,
+// among eight, or beside other sequences). Positions in the tiles that a query may not read, or that hold nothing
+// yet, get weight zero.
+// A key head's queries are numbered, within a segment, query = row * rep + (head within the key head's `rep` query
+// heads); eight of them are the eight columns of the instruction, and each group of eight has a warp.
+// A segment's scores: scores[off + (key head * nq + query) * stride + (position - base)], nq its queries a key head.
 
-// Scores: block (position tile, key head). scores[(key head * nq + query) * stride + (position - base)] = query . key.
-__global__ void scores_k(const uint16_t* qhat, const uint16_t* keys, float* scores, int heads, int kvh, int hd, int tokens, int base,
-                         int stride, int slots) {
-    const int rep = heads / kvh, nq = rep * tokens;
-    const int tile = blockIdx.x, kh = blockIdx.y, group = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
-    const int p0 = base + 16 * tile;
+// Scores = query . key: block (position tile of a segment, key head).
+__global__ void scores_k(const uint16_t* qhat, const uint16_t* keys, float* scores, const int32_t* tiles, Att a, int heads, int kvh, int hd,
+                         int ring) {
+    int seg = 0;
+    for (int i = 1; i < a.n; ++i)
+        if (int(blockIdx.x) >= a.tile0[i]) seg = i;
+    const int rep = heads / kvh, nq = rep * a.cnt[seg], stride = a.stride[seg];
+    const int tile = blockIdx.x - a.tile0[seg], kh = blockIdx.y, group = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    if (group * 8 >= nq) return;
     // the left operand: rows are the tile's positions (this lane: g and g + 8), columns sixteen of the head's values
-    const uint16_t* ka = keys + (size_t((p0 + g) % slots) * kvh + kh) * hd + 2 * t;
-    const uint16_t* kb = keys + (size_t((p0 + g + 8) % slots) * kvh + kh) * hd + 2 * t;
+    const size_t slot = slot_of(tiles, ring, a.seq[seg], a.base[seg] + 16 * tile);
+    const uint16_t* ka = keys + ((slot + g) * kvh + kh) * hd + 2 * t;
+    const uint16_t* kb = keys + ((slot + g + 8) * kvh + kh) * hd + 2 * t;
     // the right operand: column g is query group * 8 + g
     const int query = group * 8 + g;
     const bool has = query < nq;
-    const uint16_t* qa = qhat + (size_t(has ? query / rep : 0) * heads + kh * rep + (has ? query % rep : 0)) * hd + 2 * t;
+    const uint16_t* qa = qhat + (size_t(a.row0[seg] + (has ? query / rep : 0)) * heads + kh * rep + (has ? query % rep : 0)) * hd + 2 * t;
     float c[4] = {0, 0, 0, 0};
     for (int j = 0; j < hd; j += 16) {
         const uint32_t b0 = has ? *(const uint32_t*)(qa + j) : 0, b1 = has ? *(const uint32_t*)(qa + j + 8) : 0;
         mma(c, *(const uint32_t*)(ka + j), *(const uint32_t*)(kb + j), *(const uint32_t*)(ka + j + 8), *(const uint32_t*)(kb + j + 8), b0, b1);
     }
-    for (int i = 0; i < 4; ++i) {  // c[i]: position p0 + g (+ 8), query group * 8 + 2t (+ 1)
+    float* out = scores + a.off[seg];
+    for (int i = 0; i < 4; ++i) {  // c[i]: position of the tile g (+ 8), query group * 8 + 2t (+ 1)
         const int q = group * 8 + 2 * t + (i & 1), r = 16 * tile + g + (i >= 2 ? 8 : 0);
-        if (q < nq) scores[(size_t(kh) * nq + q) * stride + r] = c[i];
+        if (q < nq) out[(size_t(kh) * nq + q) * stride + r] = c[i];
     }
 }
 
-// The softmax of a query's scores over the positions it may read, as fp16 in the same layout: block (query, key head).
-// Token t at position pos0 + t reads positions up to its own, and in a sliding layer the last `window` of them.
-__global__ void softmax_k(const float* scores, uint16_t* probs, int heads, int kvh, int tokens, int pos0, int base, int stride, int window) {
-    const int n = blockDim.x, rep = heads / kvh, nq = rep * tokens, query = blockIdx.x, kh = blockIdx.y, pos = pos0 + query / rep;
-    const float* s = scores + (size_t(kh) * nq + query) * stride;
-    uint16_t* p = probs + (size_t(kh) * nq + query) * stride;
+// The softmax of a query's scores over the positions it may read, as fp16 in the same layout: block (query of the
+// pass, key head). A row at position pos reads positions up to its own, and with a window the last `window` of them.
+__global__ void softmax_k(const float* scores, uint16_t* probs, Att a, int heads, int kvh, int window) {
+    const int n = blockDim.x, rep = heads / kvh, kh = blockIdx.y, row = blockIdx.x / rep, seg = seg_of_row(a, row);
+    const int nq = rep * a.cnt[seg], query = blockIdx.x - rep * a.row0[seg], pos = a.pos0[seg] + row - a.row0[seg];
+    const int base = a.base[seg], stride = a.stride[seg];
+    const size_t at = a.off[seg] + (size_t(kh) * nq + query) * stride;
+    const float* s = scores + at;
+    uint16_t* p = probs + at;
     const int first = (window > 0 && pos - window + 1 > 0 ? pos - window + 1 : 0) - base, last = pos - base;  // inclusive, as indices
     // a thread takes the positions that are its own number modulo the block, so the sums add up in the same order in any pass
     const int mine = first + ((int(threadIdx.x) - (base + first) % n + n) % n);
@@ -300,33 +347,30 @@ __global__ void softmax_k(const float* scores, uint16_t* probs, int heads, int k
         p[r] = r >= first && r <= last ? __half_as_ushort(__float2half(expf(s[r] - mx) / sum)) : 0;
 }
 
-// The weighted sum of the values: block (sixteen of the head's values, key head); a warp walks the position tiles.
-// -> out[token][head][head_dim]
-__global__ void attend_k(const uint16_t* probs, const uint16_t* values, float* out, int heads, int kvh, int hd, int tokens, int base,
-                         int stride, int slots) {
-    const int rep = heads / kvh, nq = rep * tokens;
+// The weighted sum of the values: block (sixteen of the head's values, key head, segment); a warp walks the position
+// tiles. -> out[row][head][head_dim]
+__global__ void attend_k(const uint16_t* probs, const uint16_t* values, float* out, const int32_t* tiles, Att a, int heads, int kvh, int hd,
+                         int ring) {
+    const int seg = blockIdx.z, rep = heads / kvh, nq = rep * a.cnt[seg], stride = a.stride[seg], base = a.base[seg];
     const int dt = blockIdx.x, kh = blockIdx.y, group = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    if (group * 8 >= nq) return;
     // the right operand: rows are the tile's positions, column g is query group * 8 + g
     const int query = group * 8 + g;
     const bool has = query < nq;
-    const uint16_t* pq = probs + (size_t(kh) * nq + (has ? query : 0)) * stride + 2 * t;
+    const uint16_t* pq = probs + a.off[seg] + (size_t(kh) * nq + (has ? query : 0)) * stride + 2 * t;
     // the left operand: rows are values 16 dt + g and + 8 of the head, columns the tile's positions 2t, 2t + 1, 2t + 8, 2t + 9
     const size_t col = size_t(kh) * hd + 16 * dt + g, row = size_t(kvh) * hd;
-    int sa = (base + 2 * t) % slots;  // the slot of position 2t of the tile; a sliding layer's slots go round
     float c[4] = {0, 0, 0, 0};
     for (int r = 0; r < stride; r += 16) {
-        const int sb = sa + 1 < slots ? sa + 1 : sa + 1 - slots, sc = sa + 8 < slots ? sa + 8 : sa + 8 - slots,
-                  sd = sc + 1 < slots ? sc + 1 : sc + 1 - slots;
-        const uint16_t *va = values + sa * row + col, *vb = values + sb * row + col, *vc = values + sc * row + col, *vd = values + sd * row + col;
+        const uint16_t* va = values + (slot_of(tiles, ring, a.seq[seg], base + r) + 2 * t) * row + col;  // position 2t of the tile
+        const uint16_t *vb = va + row, *vc = va + 8 * row, *vd = va + 9 * row;
         const uint32_t b0 = has ? *(const uint32_t*)(pq + r) : 0, b1 = has ? *(const uint32_t*)(pq + r + 8) : 0;
         mma(c, uint32_t(va[0]) | uint32_t(vb[0]) << 16, uint32_t(va[8]) | uint32_t(vb[8]) << 16, uint32_t(vc[0]) | uint32_t(vd[0]) << 16,
             uint32_t(vc[8]) | uint32_t(vd[8]) << 16, b0, b1);
-        sa += 16;
-        while (sa >= slots) sa -= slots;
     }
     for (int i = 0; i < 4; ++i) {  // c[i]: value 16 dt + g (+ 8), query group * 8 + 2t (+ 1)
         const int q = group * 8 + 2 * t + (i & 1), d = 16 * dt + g + (i >= 2 ? 8 : 0);
-        if (q < nq) out[(size_t(q / rep) * heads + kh * rep + q % rep) * hd + d] = c[i];
+        if (q < nq) out[(size_t(a.row0[seg] + q / rep) * heads + kh * rep + q % rep) * hd + d] = c[i];
     }
 }
 
@@ -362,6 +406,26 @@ static void prep(const Model& m, const float* a, const float* b, const float* w,
     prep_k<<<dim3(n / rot.block, tokens), rot.block>>>(a, b, w, owed.y, owed.post, owed.scalar, h_out, v_out, rot.signs, m.fps, m.xf, n, m.eps, mode);
 }
 
+// What a layer's attention kernels are told of a pass's segments. A row reads the positions up to its own (the
+// drafter: up to `pos0`, the last the main model has run) and in a sliding layer `back` positions before the
+// segment's first.
+static Att att_for(const Segs& g, bool full, int heads, int back) {
+    Att a{};
+    a.n = g.n, a.most = 1;
+    int tiles = 0, off = 0;
+    for (int i = 0; i < g.n; ++i) {
+        const int last = g.pos0[i] + g.cnt[i] - 1, lo = full ? 0 : (g.pos0[i] - back > 0 ? g.pos0[i] - back : 0);
+        a.row0[i] = g.row0[i], a.cnt[i] = g.cnt[i], a.pos0[i] = g.pos0[i], a.seq[i] = g.seq[i];
+        a.base[i] = lo & ~15, a.stride[i] = ((last >> 4) + 1) * 16 - a.base[i];
+        a.tile0[i] = tiles, a.off[i] = off;
+        tiles += a.stride[i] / 16, off += heads * g.cnt[i] * a.stride[i];
+        if (g.cnt[i] > a.most) a.most = g.cnt[i];
+    }
+    return a;
+}
+
+static int tiles_of(const Att& a) { return a.tile0[a.n - 1] + a.stride[a.n - 1] / 16; }
+
 // Where a pass's time goes (sclmd_profile): with a table set, the pass waits for the GPU after every launch and adds
 // the time to the launch's kind. The waits make the pass slower as a whole; the shares are what is looked at.
 enum { P_INPUT, P_QKV, P_HEADS, P_SCORES, P_SOFTMAX, P_ATTEND, P_O, P_GATE_UP, P_DOWN, P_HEAD, P_KINDS };
@@ -391,12 +455,12 @@ API int sclmd_linear(const Model* m, const Mat* mat, const Rot* rot, const float
     return int(cudaGetLastError());
 }
 
-// The pass: m.h holds the scaled embeddings of `tokens` tokens at positions pos0.. ; afterwards it holds the last
-// layer's output, m.hn that output after the final norm, m.logits the logits, and every layer's keys and values have
-// the new positions. Launches only; nothing waits.
+// The pass: m.h holds the scaled embeddings of `tokens` tokens, which are the rows of `segs`; afterwards it holds the
+// last layer's output, m.hn that output after the final norm, m.logits the logits, and every layer's keys and
+// values have the new positions of each sequence (whose tiles the caller has provided). Launches only; nothing waits.
 // A layer's two residual steps are not kernels of their own: each is taken by the kernel that prepares the next
 // matrix input from the residual stream, which writes the stream's next state to the other of m.h and m.h2.
-API int sclmd_pass(const Model* mp, int tokens, int pos0) {
+API int sclmd_pass(const Model* mp, int tokens, const Segs* segs) {
     const Model& m = *mp;
     const int n = m.hidden;
     float *h = m.h, *spare = m.h2;
@@ -411,17 +475,16 @@ API int sclmd_pass(const Model* mp, int tokens, int pos0) {
         float *yq = m.y, *yk = m.y + size_t(MAX_TOKENS) * nqo, *yv = yk + size_t(MAX_TOKENS) * nkv;
         gemm(m.xf, m.fps, tokens, l.q, yq, l.k, yk, l.v, yv);  // a full-attention layer's v has no rows
         tick(P_QKV);
+        const Att a = att_for(*segs, l.full, m.heads, m.window - 1);
+        const int rep = m.heads / kvh, groups = (rep * a.most + 7) / 8;
         heads_k<<<dim3(m.heads + 2 * kvh, tokens), hd>>>(yq, yk, l.v.rows ? yv : nullptr, l.q_norm, l.k_norm, l.inv_freq, m.qhat, l.keys,
-                                                       l.values, m.heads, kvh, pos0, l.slots, m.eps);
+                                                       l.values, l.tiles, a, m.heads, kvh, l.ring, m.eps);
         tick(P_HEADS);
-        const int last = pos0 + tokens - 1, lo = l.full ? 0 : (pos0 - m.window + 1 > 0 ? pos0 - m.window + 1 : 0);
-        const int base = lo & ~15, stride = ((last >> 4) + 1) * 16 - base;  // the positions read, in whole tiles of 16
-        const int nq = m.heads / kvh * tokens, groups = (nq + 7) / 8;
-        scores_k<<<dim3(stride / 16, kvh), 32 * groups>>>(m.qhat, l.keys, m.scores, m.heads, kvh, hd, tokens, base, stride, l.slots);
+        scores_k<<<dim3(tiles_of(a), kvh), 32 * groups>>>(m.qhat, l.keys, m.scores, l.tiles, a, m.heads, kvh, hd, l.ring);
         tick(P_SCORES);
-        softmax_k<<<dim3(nq, kvh), 256>>>(m.scores, m.probs, m.heads, kvh, tokens, pos0, base, stride, l.full ? 0 : m.window);
+        softmax_k<<<dim3(rep * tokens, kvh), 256>>>(m.scores, m.probs, a, m.heads, kvh, l.full ? 0 : m.window);
         tick(P_SOFTMAX);
-        attend_k<<<dim3(hd / 16, kvh), 32 * groups>>>(m.probs, l.values, m.attn, m.heads, kvh, hd, tokens, base, stride, l.slots);
+        attend_k<<<dim3(hd / 16, kvh, a.n), 32 * groups>>>(m.probs, l.values, m.attn, l.tiles, a, m.heads, kvh, hd, l.ring);
         tick(P_ATTEND);
         prep(m, m.attn, nullptr, nullptr, nqo, l.rot_o, 1, tokens);
         tick(P_INPUT);
@@ -471,13 +534,13 @@ struct Drafter {
     Mat pre, post, head;
     Rot rot_pre, rot_out;  // of the joined input, and of the final norm's output (the head's and post's input)
     const float* norm;
-    // work memory
-    float* in;      // [2 * backbone] the token's embedding in the main model, then a hidden state: the main model's last output, or `next`
-    float* h;       // [hidden]
-    float* hn;      // [hidden] after the final norm
-    float* logits;  // [vocab]
-    float* next;    // [backbone] the hidden state for the guess after this one
-    float* h2;      // [hidden] the residual stream's other state (see sclmd_pass)
+    // work memory, a row a sequence (up to eight)
+    float* in;      // [8][2 * backbone] the token's embedding in the main model, then a hidden state: the main model's last output, or `next`
+    float* h;       // [8][hidden]
+    float* hn;      // [8][hidden] after the final norm
+    float* logits;  // [8][vocab]
+    float* next;    // [8][backbone] the hidden state for the guess after this one
+    float* h2;      // [8][hidden] the residual stream's other state (see sclmd_pass)
     float* fps;     // the rest as in Model (it may be the main model's own work memory)
     uint64_t* xf;
     float *y, *y2;
@@ -487,51 +550,57 @@ struct Drafter {
     float* attn;
 };
 
-// The input of one of the drafter's matrices with n columns from a (and b, w: see prep_k), in d.xf with its scale in d.fps.
-static void prep(const Drafter& d, const float* a, const float* b, const float* w, int n, const Rot& rot, int mode, const Owed& owed = Owed{},
-                 float* h_out = nullptr, float* v_out = nullptr) {
-    prep_k<<<dim3(n / rot.block, 1), rot.block>>>(a, b, w, owed.y, owed.post, owed.scalar, h_out, v_out, rot.signs, d.fps, d.xf, n, d.eps, mode);
+// The input of one of the drafter's matrices with n columns from a (and b, w: see prep_k), in d.xf with its scales in d.fps.
+static void prep(const Drafter& d, int rows, const float* a, const float* b, const float* w, int n, const Rot& rot, int mode,
+                 const Owed& owed = Owed{}, float* h_out = nullptr, float* v_out = nullptr) {
+    prep_k<<<dim3(n / rot.block, rows), rot.block>>>(a, b, w, owed.y, owed.post, owed.scalar, h_out, v_out, rot.signs, d.fps, d.xf, n, d.eps, mode);
 }
 
-// One guess: d.in holds the embedding of the token at position `length` and a hidden state; the main model has run
-// the positions before it, and `sliding` and `full` are its last layers of each kind (their keys and values are
-// read: in a sliding layer the last window + 1 of them, as upstream lets the drafter). Afterwards d.logits holds the
-// guess for position length + 1 and d.next the hidden state for the guess after it. Launches only.
-API int sclmd_draft(const Drafter* dp, const Layer* sliding, const Layer* full, int window, int length) {
+// One guess for each of `rows` sequences (row r: sequence seqs[r]): d.in[r] holds the embedding of the token at
+// position lengths[r] and a hidden state; the main model has run the positions before it, and `sliding` and `full`
+// are its last layers of each kind (their keys and values are read: in a sliding layer the last window + 1 of them,
+// as upstream lets the drafter). Afterwards d.logits[r] holds the guess for position lengths[r] + 1 and d.next[r]
+// the hidden state for the guess after it. Launches only.
+API int sclmd_draft(const Drafter* dp, const Layer* sliding, const Layer* full, int window, int rows, const int* lengths, const int* seqs) {
     const Drafter& d = *dp;
-    const int n = d.hidden, last = length - 1;
-    prep(d, d.in, nullptr, nullptr, 2 * d.backbone, d.rot_pre, 1);
-    gemm(d.xf, d.fps, 1, d.pre, d.h);
+    const int n = d.hidden;
+    Segs at{}, read{};  // where the queries sit, and the last position each may read
+    at.n = read.n = rows;
+    for (int r = 0; r < rows; ++r) {
+        at.row0[r] = read.row0[r] = r, at.cnt[r] = read.cnt[r] = 1, at.seq[r] = read.seq[r] = seqs[r];
+        at.pos0[r] = lengths[r], read.pos0[r] = lengths[r] - 1;
+    }
+    prep(d, rows, d.in, nullptr, nullptr, 2 * d.backbone, d.rot_pre, 1);
+    gemm(d.xf, d.fps, rows, d.pre, d.h);
     float *h = d.h, *spare = d.h2;
     Owed owed;
     for (int i = 0; i < d.n_layers; ++i) {
         const DLayer& l = d.layers[i];
         const Layer& src = l.full ? *full : *sliding;
-        const int hd = l.head_dim, kvh = l.kv_heads;
+        const int hd = l.head_dim, kvh = l.kv_heads, rep = d.heads / kvh, groups = (rep + 7) / 8;
         // attention: the query sits at position `length` and reads the main model's keys up to length - 1
-        prep(d, h, nullptr, l.in_ln, n, l.rot_in, 0, owed, spare);
+        prep(d, rows, h, nullptr, l.in_ln, n, l.rot_in, 0, owed, spare);
         if (owed.y) std::swap(h, spare);
-        gemm(d.xf, d.fps, 1, l.q, d.y);
-        heads_k<<<dim3(d.heads, 1), hd>>>(d.y, nullptr, nullptr, l.q_norm, nullptr, l.inv_freq, d.qhat, nullptr, nullptr, d.heads, kvh, length, 1, d.eps);
-        const int lo = l.full ? 0 : (last - window > 0 ? last - window : 0);
-        const int base = lo & ~15, stride = ((last >> 4) + 1) * 16 - base;
-        const int nq = d.heads / kvh, groups = (nq + 7) / 8;
-        scores_k<<<dim3(stride / 16, kvh), 32 * groups>>>(d.qhat, src.keys, d.scores, d.heads, kvh, hd, 1, base, stride, src.slots);
-        softmax_k<<<dim3(nq, kvh), 256>>>(d.scores, d.probs, d.heads, kvh, 1, last, base, stride, l.full ? 0 : window + 1);
-        attend_k<<<dim3(hd / 16, kvh), 32 * groups>>>(d.probs, src.values, d.attn, d.heads, kvh, hd, 1, base, stride, src.slots);
-        prep(d, d.attn, nullptr, nullptr, d.heads * hd, l.rot_o, 1);
-        gemm(d.xf, d.fps, 1, l.o, d.y);
+        gemm(d.xf, d.fps, rows, l.q, d.y);
+        heads_k<<<dim3(d.heads, rows), hd>>>(d.y, nullptr, nullptr, l.q_norm, nullptr, l.inv_freq, d.qhat, nullptr, nullptr, nullptr,
+                                             att_for(at, true, d.heads, 0), d.heads, kvh, 1, d.eps);
+        const Att a = att_for(read, l.full, d.heads, window);
+        scores_k<<<dim3(tiles_of(a), kvh), 32 * groups>>>(d.qhat, src.keys, d.scores, src.tiles, a, d.heads, kvh, hd, src.ring);
+        softmax_k<<<dim3(rep * rows, kvh), 256>>>(d.scores, d.probs, a, d.heads, kvh, l.full ? 0 : window + 1);
+        attend_k<<<dim3(hd / 16, kvh, a.n), 32 * groups>>>(d.probs, src.values, d.attn, src.tiles, a, d.heads, kvh, hd, src.ring);
+        prep(d, rows, d.attn, nullptr, nullptr, d.heads * hd, l.rot_o, 1);
+        gemm(d.xf, d.fps, rows, l.o, d.y);
         owed = Owed{d.y, l.post_attn_ln, 1.0f};
         // feed-forward
-        prep(d, h, nullptr, l.pre_ff_ln, n, l.rot_mlp, 0, owed, spare);
+        prep(d, rows, h, nullptr, l.pre_ff_ln, n, l.rot_mlp, 0, owed, spare);
         std::swap(h, spare);
-        gemm(d.xf, d.fps, 1, l.gate, d.y, l.up, d.y2);
-        prep(d, d.y, d.y2, nullptr, d.mlp, l.rot_down, 2);
-        gemm(d.xf, d.fps, 1, l.down, d.y);
+        gemm(d.xf, d.fps, rows, l.gate, d.y, l.up, d.y2);
+        prep(d, rows, d.y, d.y2, nullptr, d.mlp, l.rot_down, 2);
+        gemm(d.xf, d.fps, rows, l.down, d.y);
         owed = Owed{d.y, l.post_ff_ln, l.scalar};
     }
-    prep(d, h, nullptr, d.norm, n, d.rot_out, 0, owed, spare, d.hn);
-    gemm(d.xf, d.fps, 1, d.head, d.logits, d.post, d.next);
+    prep(d, rows, h, nullptr, d.norm, n, d.rot_out, 0, owed, spare, d.hn);
+    gemm(d.xf, d.fps, rows, d.head, d.logits, d.post, d.next);
     return int(cudaGetLastError());
 }
 
@@ -540,7 +609,7 @@ API int sclmd_draft_sizes(int* dlayer, int* drafter) {
     return 0;
 }
 
-API int sclmd_sizes(int* mat, int* rot, int* layer, int* model) {
-    *mat = sizeof(Mat), *rot = sizeof(Rot), *layer = sizeof(Layer), *model = sizeof(Model);
+API int sclmd_sizes(int* mat, int* rot, int* layer, int* model, int* segs) {
+    *mat = sizeof(Mat), *rot = sizeof(Rot), *layer = sizeof(Layer), *model = sizeof(Model), *segs = sizeof(Segs);
     return MAX_TOKENS;
 }

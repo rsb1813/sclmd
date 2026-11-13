@@ -94,8 +94,8 @@ class Small:
         self.embed, self.norm = state["model.embed_tokens.weight"], state["model.norm.weight"]
         self.head = Stored(self.embed, 6)
 
-    def engine(self, capacity: int = 96) -> E.Engine:
-        return E.Engine(self.cfg, self.eng_layers, self.head.stored(), self.norm, self.embed, capacity=capacity)
+    def engine(self, capacity: int = 96, **more) -> E.Engine:
+        return E.Engine(self.cfg, self.eng_layers, self.head.stored(), self.norm, self.embed, capacity=capacity, **more)
 
     def reference(self) -> Reference:
         return Reference(self.cfg, self.ref_layers, self.head, self.norm, self.embed)
@@ -158,7 +158,7 @@ def test_attention_kernels_against_pytorch_on_the_engines_own_buffers(small_e):
         rep, pos = heads // kvh, 0
         for n in (1, 1, 8, 3, 8, 8, 8, 5):
             eng.h[:n] = (torch.randn(n, base.hidden, generator=g) * 3).to(DEV)
-            assert eng.lib.sclmd_pass(E.C.byref(eng.model), n, pos) == 0
+            eng.advance([(0, n)])
             lo = 0 if t == M.FULL else max(pos - cfg.window + 1, 0)
             first_tile = lo & ~15
             stride, nq = ((pos + n - 1 >> 4) + 1) * 16 - first_tile, rep * n
@@ -189,10 +189,10 @@ def test_each_layer_alone_matches_the_reference_on_the_same_inputs(small_e):
         cfg = M.Config(**{**vars(base), "n_layers": 1, "layer_types": [t]})
         eng = E.Engine(cfg, [small_e.eng_layers[i]], small_e.head.stored(), small_e.norm, small_e.embed, capacity=96)
         cache, taps, pos, width = M.Cache(), {}, 0, cfg.heads * cfg.head_dim[t]
-        for n in (1, 1, 8, 3, 8, 8, 8, 5):  # 42 positions: twice round a sliding layer's ring of 21
+        for n in (1, 1, 8, 3, 8, 8, 8, 5):  # 42 positions: past a sliding layer's ring of 32
             h = (torch.randn(n, base.hidden, generator=g) * 3).to(DEV)
             eng.h[:n] = h
-            assert eng.lib.sclmd_pass(E.C.byref(eng.model), n, pos) == 0
+            eng.advance([(0, n)])
             positions = torch.arange(pos, pos + n, device=DEV)
             want = M.layer_forward(cfg, 0, small_e.ref_layers[i], h[None], positions, cache, linear=lambda x, m: m(x), rounded=fp16,
                                    tap=lambda name, x: taps.__setitem__(name, x[0]))[0]
@@ -207,7 +207,7 @@ def test_each_layer_alone_matches_the_reference_on_the_same_inputs(small_e):
 
 def test_passes_match_the_reference_past_the_window_and_the_ring(small_e):
     eng, ref = small_e.engine(), small_e.reference()
-    ids = ids_of(60, 1)  # a sliding layer keeps window + SPARE = 21 positions: 60 go round the ring almost three times
+    ids = ids_of(60, 1)  # a sliding layer keeps window + SPARE positions in whole tiles, 32: 60 go round the ring almost twice
     want_logits, want_hidden = ref.feed(ids)
     got_logits, got_hidden = [], []
     for part in (ids[:13], ids[13:14], ids[14:15], ids[15:18], ids[18:26], ids[26:27], ids[27:60]):
@@ -257,7 +257,7 @@ def test_keys_for_the_drafter_match_the_reference(small_e):
 def test_going_back_further_than_the_ring_keeps_is_refused(small_e):
     eng = small_e.engine()
     eng.feed(ids_of(40, 6))
-    eng.crop(40 - E.SPARE - 2)
+    eng.crop(40 - eng.kept() - 2)
     with pytest.raises(AssertionError):
         eng.feed([5])
     eng.crop(0)  # from the start is always fine: every position is written again before it is read
@@ -357,7 +357,7 @@ def test_packing_a_part_of_the_rows_at_a_time_is_the_same():
 
 
 def test_restore_comes_back_from_further_than_the_ring_keeps(small_e):
-    a, b, c = ids_of(30, 9), ids_of(50, 10), ids_of(12, 11)  # 50 tokens: more than twice round a sliding layer's ring
+    a, b, c = ids_of(30, 9), ids_of(50, 10), ids_of(12, 11)  # 50 tokens: more than once round a sliding layer's ring
     straight = small_e.engine()
     straight.feed(a)
     want = straight.feed(c)[0]
@@ -367,3 +367,101 @@ def test_restore_comes_back_from_further_than_the_ring_keeps(small_e):
     assert eng.feed(b, keep="last")[0].shape[0] == 50 % E.MAX_TOKENS
     eng.restore()
     assert eng.length == 30 and torch.equal(eng.feed(c)[0], want)
+
+
+# ---- several sequences in one engine
+
+def alone(small_e, ids: list, parts: list) -> torch.Tensor:
+    """The logits of one sequence fed by itself, in the given parts."""
+    eng = small_e.engine()
+    return torch.cat([eng.feed(ids[a:b])[0] for a, b in zip([0] + parts, parts + [len(ids)])])
+
+
+def test_sequences_side_by_side_are_the_same_bits_as_each_alone(small_e):
+    a, b, c = ids_of(60, 21), ids_of(45, 22), ids_of(9, 23)  # a and b go round the sliding ring; c stays short
+    eng = small_e.engine(sequences=3)
+    got = {0: [], 1: [], 2: []}
+    # passes that mix the three in every way: (sequence, tokens) by row, eight rows at most
+    plan = [[(0, 3), (1, 5)], [(1, 1), (0, 1), (2, 6)], [(2, 3), (1, 2), (0, 3)], [(0, 8)], [(1, 4), (0, 4)], [(1, 8)], [(0, 1), (1, 7)],
+            [(0, 7), (1, 1)], [(0, 8)], [(1, 8)], [(0, 8)], [(1, 8)], [(0, 8)], [(1, 1), (0, 7)], [(0, 2)]]
+    at = {0: 0, 1: 0, 2: 0}
+    text = {0: a, 1: b, 2: c}
+    for parts in plan:
+        logits, _ = eng.run([(seq, text[seq][at[seq] : at[seq] + n]) for seq, n in parts])
+        row = 0
+        for seq, n in parts:
+            got[seq].append(logits[row : row + n].clone())
+            at[seq], row = at[seq] + n, row + n
+    assert at == {0: 60, 1: 45, 2: 9}
+    for seq, ids in text.items():
+        assert torch.equal(torch.cat(got[seq]), alone(small_e, ids, [])), seq
+
+
+def test_a_sequence_does_not_depend_on_what_the_others_hold(small_e):
+    a = ids_of(40, 24)
+    outs = []
+    for other in (ids_of(40, 25), ids_of(40, 26)):
+        eng = small_e.engine(sequences=2)
+        got = []
+        for i in range(0, 40, 4):
+            logits, _ = eng.run([(1, other[i : i + 4]), (0, a[i : i + 4])])
+            got.append(logits[4:].clone())
+        outs.append(torch.cat(got))
+    assert torch.equal(outs[0], outs[1]) and torch.equal(outs[0], alone(small_e, a, []))
+
+
+def test_tiles_are_given_back_and_used_again(small_e):
+    cfg = small_e.cfg
+    ring = {t: E.ring_tiles(cfg, t, 96) for t in (M.SLIDING, M.FULL)}
+    # a pool with room for one long sequence and a little more
+    eng = small_e.engine(sequences=3, pool={M.SLIDING: ring[M.SLIDING] + 1, M.FULL: ring[M.FULL] + 1})
+    a, b = ids_of(70, 27), ids_of(20, 28)
+    eng.feed(ids_of(10, 29), seq=1)  # takes the first tile of each kind: sequence 0 gets the ones after it
+    first = eng.feed(a[:30], seq=0)[0]
+    assert eng.tiles[M.FULL][0][:2] == [1, 2] and eng.free_tiles()[M.SLIDING] == 0
+    with pytest.raises(E.KVFull):
+        eng.feed(b, seq=2)  # nothing is left for a third
+    assert eng.lengths[2] == 0 and eng.free_tiles()[M.SLIDING] == 0
+    eng.release(1)
+    assert eng.free_tiles() == {M.SLIDING: 1, M.FULL: ring[M.FULL] - 1}
+    rest = eng.feed(a[30:], seq=0)[0]  # goes on over tiles that are not in order, and round its ring
+    assert torch.equal(torch.cat([first, rest]), alone(small_e, a, []))
+    eng.release(0)
+    assert eng.free_tiles() == {M.SLIDING: ring[M.SLIDING] + 1, M.FULL: ring[M.FULL] + 1}
+    assert torch.equal(eng.feed(b, seq=2)[0], alone(small_e, b, []))  # over tiles another sequence has written
+    # after a crop the tiles past the length can be given back
+    eng.crop(3, seq=2)
+    eng.trim(2)
+    assert eng.free_tiles() == {M.SLIDING: ring[M.SLIDING], M.FULL: ring[M.FULL]}
+    assert torch.equal(eng.feed(b[3:], seq=2)[0], alone(small_e, b, [])[3:])
+
+
+def test_snapshot_and_restore_of_one_sequence_among_others(small_e):
+    a, b, c, other = ids_of(30, 30), ids_of(50, 31), ids_of(12, 32), ids_of(64, 33)
+    want = alone(small_e, a + c, [])[30:]
+    eng = small_e.engine(sequences=2)
+    eng.feed(other[:5], seq=0)
+    eng.feed(a[:10], seq=1)
+    eng.feed(other[5:40], seq=0)  # the two sequences' tiles alternate in the pool
+    eng.feed(a[10:], seq=1)
+    eng.snapshot(1)
+    eng.feed(b, keep="last", seq=1)
+    eng.feed(other[40:], keep="last", seq=0)
+    eng.restore(1)
+    assert eng.lengths == [64, 30] and torch.equal(eng.feed(c, seq=1)[0], want)
+
+
+def test_the_drafter_guesses_for_several_sequences_at_once(small_e, drafter_e):
+    texts = [ids_of(44, 34), ids_of(23, 35), ids_of(37, 36)]
+    eng = small_e.engine(sequences=3)
+    nat = engine_drafter(eng, drafter_e)
+    hidden = [eng.feed(ids, seq=seq)[1][-1].clone() for seq, ids in enumerate(texts)]
+    asks = [(ids[-1], hidden[seq], len(ids), seq, depth) for (seq, ids), depth in zip(enumerate(texts), (6, 2, 4))]
+    one = [nat.guess(token, h, length, seq)[:depth] for token, h, length, seq, depth in asks]
+    assert nat.guess_many(asks) == one
+    assert nat.guess_many(asks[::-1]) == one[::-1]
+    # and the same as a drafter beside an engine that holds only that sequence
+    for seq, ids in enumerate(texts):
+        solo = small_e.engine()
+        h = solo.feed(ids)[1][-1]
+        assert engine_drafter(solo, drafter_e).guess(ids[-1], h, len(ids)) [: len(one[seq])] == one[seq]

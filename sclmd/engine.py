@@ -10,14 +10,32 @@ from . import model as M
 
 DLL = os.path.join(os.path.dirname(__file__), "..", "engine", "build", "sclmd.dll")
 MAX_TOKENS = 8
+TILE = 16   # positions of keys and values a sequence is given at a time
 SPARE = 16  # positions a sliding layer keeps past its window: a pass writes up to 8, the drafter reads window + 1
 DRAFTER_BYTES = 240 << 20  # the drafter at 4 bits a weight (0.47B weights) and its work memory
 
 
-def fixed_bytes(cfg: M.Config, head_bits: int, capacity: int) -> int:
-    """VRAM an Engine takes besides the layers' codes: the head's codes, the keys and values, the work memory."""
+class KVFull(Exception):
+    """The pool of keys and values has no tile left for a sequence's next positions."""
+
+
+def ring_tiles(cfg: M.Config, kind: str, capacity: int) -> int:
+    """Tiles a sequence can hold of a kind of layer: a sliding layer keeps the last window + SPARE positions (in
+    whole tiles), a full-attention layer every position up to the capacity."""
+    return capacity // TILE if kind == M.FULL else -(-(cfg.window + SPARE) // TILE)
+
+
+def tile_bytes(cfg: M.Config, kind: str) -> int:
+    """VRAM of one tile of a kind: 16 positions of keys and values (fp16) in every layer of the kind."""
+    return cfg.layer_types.count(kind) * TILE * cfg.kv_heads[kind] * cfg.head_dim[kind] * 2 * 2
+
+
+def fixed_bytes(cfg: M.Config, head_bits: int, capacity: int, pool: dict | None = None) -> int:
+    """VRAM an Engine takes besides the layers' codes: the head's codes, the keys and values, the work memory.
+    pool: tiles of keys and values by kind of layer (default: what one sequence of `capacity` positions can hold)."""
     head = cfg.vocab * cfg.hidden * head_bits // 16
-    kv = sum((capacity if t == M.FULL else cfg.window + SPARE) * cfg.kv_heads[t] * cfg.head_dim[t] * 2 * 2 for t in cfg.layer_types)
+    kinds = dict.fromkeys(cfg.layer_types)
+    kv = sum(tile_bytes(cfg, t) * (ring_tiles(cfg, t, capacity) if pool is None else pool[t]) for t in kinds)
     work = MAX_TOKENS * cfg.vocab * 4 + cfg.heads * MAX_TOKENS * (max(capacity, cfg.window + MAX_TOKENS) + 32) * 6 + (32 << 20)
     return head + kv + work
 
@@ -34,8 +52,13 @@ class Rot(C.Structure):
 class Layer(C.Structure):
     _fields_ = ([(m, Mat) for m in ("q", "k", "v", "o", "gate", "up", "down")] +
                 [(r, Rot) for r in ("rot_in", "rot_o", "rot_mlp", "rot_down")] +
-                [(p, C.c_void_p) for p in ("in_ln", "post_attn_ln", "pre_ff_ln", "post_ff_ln", "q_norm", "k_norm", "inv_freq", "keys", "values")] +
-                [("scalar", C.c_float), ("full", C.c_int), ("head_dim", C.c_int), ("kv_heads", C.c_int), ("slots", C.c_int), ("pad", C.c_int)])
+                [(p, C.c_void_p) for p in ("in_ln", "post_attn_ln", "pre_ff_ln", "post_ff_ln", "q_norm", "k_norm", "inv_freq", "keys", "values", "tiles")] +
+                [("scalar", C.c_float), ("full", C.c_int), ("head_dim", C.c_int), ("kv_heads", C.c_int), ("ring", C.c_int), ("pad", C.c_int)])
+
+
+class Segs(C.Structure):
+    """The rows of a pass by sequence (engine/sclmd.cu)."""
+    _fields_ = [("n", C.c_int)] + [(name, C.c_int * MAX_TOKENS) for name in ("row0", "cnt", "pos0", "seq")]
 
 
 class Model(C.Structure):
@@ -51,10 +74,10 @@ def lib():
     global _lib
     if _lib is None:
         _lib = C.CDLL(os.path.abspath(DLL))  # finds the CUDA runtime torch has already loaded
-        sizes = [C.c_int() for _ in range(4)]
+        sizes = [C.c_int() for _ in range(5)]
         assert _lib.sclmd_sizes(*[C.byref(s) for s in sizes]) == MAX_TOKENS
-        assert [s.value for s in sizes] == [C.sizeof(Mat), C.sizeof(Rot), C.sizeof(Layer), C.sizeof(Model)], "struct layouts differ"
-        _lib.sclmd_pass.argtypes = [C.c_void_p, C.c_int, C.c_int]
+        assert [s.value for s in sizes] == [C.sizeof(Mat), C.sizeof(Rot), C.sizeof(Layer), C.sizeof(Model), C.sizeof(Segs)], "struct layouts differ"
+        _lib.sclmd_pass.argtypes = [C.c_void_p, C.c_int, C.c_void_p]
         _lib.sclmd_linear.argtypes = [C.c_void_p] * 5 + [C.c_int]
     return _lib
 
@@ -119,6 +142,11 @@ def lut(book: torch.Tensor) -> torch.Tensor:
 class Engine:
     """The main model on the GPU kernels. The same four things generation asks of RefTarget (sclmd/generate.py).
 
+    It holds `sequences` sequences (conversations) side by side; a pass may carry tokens of several (run). A
+    sequence's keys and values sit in tiles of 16 positions handed out from a pool as it grows (KVFull when the pool
+    is empty); `pool` is the tiles by kind of layer, by default what `sequences` sequences of `capacity` positions
+    can hold at most. Where a method takes `seq`, it is the sequence's number, 0 by default.
+
     layers: per layer a dict with
       "mats": matrix -> (codes uint8 [rows, cols / 2], scales [rows], book [2**bits, 2], bits)
       and the layer's small weights by the names of model.LAYER_KEYS (in_ln, q_norm, ..., scalar)
@@ -126,20 +154,32 @@ class Engine:
     embed: the input embedding table [vocab, hidden] (any device and type; rows are fetched as needed)"""
 
     def __init__(self, cfg: M.Config, layers: list, head: tuple, norm: torch.Tensor, embed: torch.Tensor, capacity: int = 8192,
-                 device: str = "cuda"):
-        self.cfg, self.device, self.capacity, self.length = cfg, device, capacity, 0
-        self.high = 0  # one past the furthest position written since the start: what a sliding layer's ring has lost follows from it
-        self._snap, self._snap_at = None, None
+                 device: str = "cuda", sequences: int = 1, pool: dict | None = None):
+        assert capacity % TILE == 0, "the capacity is a multiple of 16"
+        self.cfg, self.device, self.capacity, self.sequences = cfg, device, capacity, sequences
+        self.lengths = [0] * sequences  # positions each sequence holds
+        self.highs = [0] * sequences  # one past the furthest position written since its start: what a sliding layer's ring has lost follows from it
+        self._snaps = {}
         self.embed_table, self.embed_scale = embed, float(M.embed_scale(cfg, embed.dtype))
         self.keep = []  # every tensor the DLL has the address of
         self.rots = {}
         f32 = lambda t: self._own(t.to(device=device, dtype=torch.float32).contiguous())  # noqa: E731
         self.c_layers = (Layer * cfg.n_layers)()
+        kinds = list(dict.fromkeys(cfg.layer_types))
+        # The tiles: per kind of layer, how many a sequence's table has (ring), how many there are (pool), which are
+        # free, which each sequence holds (tiles[kind][seq][j]: its positions 16j.., j modulo ring; -1: none), and
+        # the same table on the GPU for the kernels. Tiles are handed out lowest first: one sequence alone has
+        # tile j for its positions 16j..
+        self.ring = {t: ring_tiles(cfg, t, capacity) for t in kinds}
+        self.pool = {t: sequences * self.ring[t] for t in kinds} if pool is None else {t: int(pool[t]) for t in kinds}
+        self.free = {t: list(range(self.pool[t] - 1, -1, -1)) for t in kinds}
+        self.tiles = {t: [[-1] * self.ring[t] for _ in range(sequences)] for t in kinds}
+        self.tables = {t: self._own(torch.zeros(sequences, self.ring[t], dtype=torch.int32, device=device)) for t in kinds}
         # Few, large allocations: PyTorch rounds each up to 2 MiB, and a tensor a matrix and a layer's keys wasted 0.57 GiB.
-        # The keys and values of all layers of a kind are one tensor each: [layers of the kind, slots, heads, head_dim]
-        self.kv_all = {t: tuple(self._own(torch.zeros(cfg.layer_types.count(t), capacity if t == M.FULL else cfg.window + SPARE,
-                                                      cfg.kv_heads[t], cfg.head_dim[t], dtype=torch.float16, device=device)) for _ in range(2))
-                       for t in dict.fromkeys(cfg.layer_types)}
+        # The keys and values of all layers of a kind are one tensor each: [layers of the kind, pool slots, heads, head_dim]
+        self.kv_all = {t: tuple(self._own(torch.zeros(cfg.layer_types.count(t), self.pool[t] * TILE, cfg.kv_heads[t], cfg.head_dim[t],
+                                                      dtype=torch.float16, device=device)) for _ in range(2))
+                       for t in kinds}
         self.kv = []
         for i, (lay, cl) in enumerate(zip(layers, self.c_layers)):
             t = cfg.layer_types[i]
@@ -158,12 +198,11 @@ class Engine:
             inv = torch.zeros(hd // 2)
             inv[:rotated] = 1.0 / (theta ** (torch.arange(0, 2 * rotated, 2).float() / hd))
             cl.inv_freq = f32(inv).data_ptr()
-            slots = capacity if t == M.FULL else cfg.window + SPARE
             nth = cfg.layer_types[:i].count(t)
             keys, values = self.kv_all[t][0][nth], self.kv_all[t][1][nth]
             self.kv.append((keys, values))
-            cl.keys, cl.values = keys.data_ptr(), values.data_ptr()
-            cl.scalar, cl.full, cl.head_dim, cl.kv_heads, cl.slots = float(lay["scalar"]), int(t == M.FULL), hd, kvh, slots
+            cl.keys, cl.values, cl.tiles = keys.data_ptr(), values.data_ptr(), self.tables[t].data_ptr()
+            cl.scalar, cl.full, cl.head_dim, cl.kv_heads, cl.ring = float(lay["scalar"]), int(t == M.FULL), hd, kvh, self.ring[t]
             if device != "cpu":
                 torch.cuda.empty_cache()  # packing's temporaries, or the allocator keeps them beside the codes
         widest_head = cfg.heads * max(cfg.head_dim.values())
@@ -188,7 +227,8 @@ class Engine:
         self.lib = lib()
 
     @classmethod
-    def load(cls, name: str, plan: dict, head: int, capacity: int = 8192, device: str = "cuda") -> "Engine":
+    def load(cls, name: str, plan: dict, head: int, capacity: int = 8192, device: str = "cuda", sequences: int = 1,
+             pool: dict | None = None) -> "Engine":
         """The original model with the stored codes `name`: plan is layer -> {matrix: bits a pair}, head the output
         head's bits. The layers come off the disk one at a time; the embedding table stays in RAM."""
         from . import ckpt
@@ -202,7 +242,8 @@ class Engine:
                 has = [m for m in M.LINEARS if not (m == "v" and cfg.layer_types[i] == M.FULL)]
                 yield ck.layer(i, "cpu", skip=M.LINEARS) | {"mats": CD.stored(name, i, {m: plan[i][m] for m in has})}
 
-        eng = cls(cfg, layers(), CD.stored(name, "head", {"head": head})["head"], ck.norm("cpu"), ck.embed("cpu"), capacity, device)
+        eng = cls(cfg, layers(), CD.stored(name, "head", {"head": head})["head"], ck.norm("cpu"), ck.embed("cpu"), capacity, device,
+                  sequences, pool)
         torch.cuda.empty_cache()  # packing left about 1 GiB reserved and unused: whatever loads next needs it
         return eng
 
@@ -241,70 +282,178 @@ class Engine:
 
     # what generation needs (sclmd/generate.py)
 
+    @property
+    def length(self) -> int:
+        return self.lengths[0]
+
+    @length.setter
+    def length(self, value: int):
+        self.lengths[0] = value
+
+    @property
+    def high(self) -> int:
+        return self.highs[0]
+
     def embed(self, ids: list) -> torch.Tensor:
         rows = self.embed_table[torch.as_tensor(ids, device=self.embed_table.device)]
         return rows.to(device=self.device, dtype=torch.float32) * self.embed_scale
 
-    def feed(self, ids: list, keep: str = "all") -> tuple[torch.Tensor, torch.Tensor]:
-        """Run tokens at the next positions, eight a pass -> (logits [n, vocab], last outputs after the final norm).
+    def _provide(self, need: list):
+        """Tiles for the positions a pass is about to write: need is [(sequence, first position, count)]. All or none."""
+        want = {t: [] for t in self.ring}
+        for t, ring in self.ring.items():
+            for seq, pos, n in need:
+                for j in dict.fromkeys((q >> 4) % ring for q in range(pos, pos + n)):
+                    if self.tiles[t][seq][j] < 0:
+                        want[t].append((seq, j))
+        for t in want:
+            if len(want[t]) > len(self.free[t]):
+                raise KVFull(f"no tile of {t} keys and values is free ({self.pool[t]} in all)")
+        for t in want:
+            for seq, j in want[t]:
+                tile = self.free[t].pop()
+                self.tiles[t][seq][j] = tile
+                self.tables[t][seq, j] = tile
+
+    def advance(self, parts: list) -> tuple[torch.Tensor, torch.Tensor]:
+        """One pass over the rows that are in self.h: parts is [(sequence, rows)] in row order, each sequence once,
+        up to MAX_TOKENS rows in all; a sequence's rows are its next positions. -> (logits [rows, vocab], outputs
+        after the final norm): views of the engine's memory, which the next pass writes over."""
+        total = sum(n for _, n in parts)
+        assert 0 < total <= MAX_TOKENS and len({seq for seq, _ in parts}) == len(parts) and all(n > 0 for _, n in parts)
+        segs, row = Segs(), 0
+        for i, (seq, n) in enumerate(parts):
+            at = self.lengths[seq]
+            assert at + n <= self.capacity, "past the engine's capacity"
+            assert self._kept(at - self.cfg.window + 1, seq), "cropped further back than the sliding layers keep"
+            segs.row0[i], segs.cnt[i], segs.pos0[i], segs.seq[i] = row, n, at, seq
+            row += n
+        segs.n = len(parts)
+        self._provide([(seq, self.lengths[seq], n) for seq, n in parts])
+        self._check(self.lib.sclmd_pass(C.byref(self.model), total, C.byref(segs)))
+        for seq, n in parts:
+            self.lengths[seq] += n
+            self.highs[seq] = max(self.highs[seq], self.lengths[seq])
+        return self.logits[:total], self.hn[:total]
+
+    def run(self, parts: list) -> tuple[torch.Tensor, torch.Tensor]:
+        """One pass over tokens of several sequences: parts is [(sequence, token ids)] (see advance)."""
+        flat = [t for _, ids in parts for t in ids]
+        self.h[: len(flat)] = self.embed(flat)
+        return self.advance([(seq, len(ids)) for seq, ids in parts])
+
+    def feed(self, ids: list, keep: str = "all", seq: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run tokens at a sequence's next positions, eight a pass -> (logits [n, vocab], last outputs after the final norm).
         keep="last": only the last pass's rows (a long prompt's logits would not fit: 1 MB a token)."""
-        assert self.length + len(ids) <= self.capacity, "past the engine's capacity"
-        assert self._kept(self.length - self.cfg.window + 1), "cropped further back than the sliding layers keep"
+        assert self.lengths[seq] + len(ids) <= self.capacity, "past the engine's capacity"
         logits, hidden = [], []
         for a in range(0, len(ids), MAX_TOKENS):
-            part = ids[a : a + MAX_TOKENS]
-            self.h[: len(part)] = self.embed(part)
-            self._check(self.lib.sclmd_pass(C.byref(self.model), len(part), self.length))
-            self.length += len(part)
-            self.high = max(self.high, self.length)
+            lg, hn = self.run([(seq, ids[a : a + MAX_TOKENS])])
             if keep == "all" or a + MAX_TOKENS >= len(ids):
-                logits.append(self.logits[: len(part)].clone())
-                hidden.append(self.hn[: len(part)].clone())
+                logits.append(lg.clone())
+                hidden.append(hn.clone())
         return torch.cat(logits), torch.cat(hidden)
 
-    def snapshot(self):
-        """Remembers the present length so that restore() can come back to it however far the text goes on.
+    def _tiles_view(self, t: torch.Tensor, kind: str) -> torch.Tensor:
+        """[layers, pool slots, heads, head_dim] as [layers, pool tiles, 16, heads, head_dim]."""
+        return t.view(t.shape[0], self.pool[kind], TILE, t.shape[2], t.shape[3])
+
+    def snapshot(self, seq: int = 0):
+        """Remembers a sequence's present length so that restore() can come back to it however far the text goes on.
         (crop() cannot: a sliding layer's ring is written over as the text goes on. Its keys and values are copied
-        to RAM here, 0.85 GB for the real model; one snapshot at a time.)"""
-        sliding = self.kv_all.get(M.SLIDING, ())
-        if self._snap is None:
-            self._snap = [torch.empty(t.shape, dtype=t.dtype).pin_memory() for t in sliding]
-        for t, to in zip(sliding, self._snap):
-            to.copy_(t)
-        self._snap_at = (self.length, self.high)
+        to RAM here, 0.85 GB for the real model; one snapshot a sequence.)"""
+        if M.SLIDING not in self.kv_all:
+            self._snaps[seq] = {"at": (self.lengths[seq], self.highs[seq]), "tiles": [], "data": []}
+            return
+        own = [x for x in self.tiles[M.SLIDING][seq] if x >= 0]
+        snap = self._snaps.get(seq)
+        if snap is None or not snap["data"]:
+            shape = lambda t: (t.shape[0], self.ring[M.SLIDING], TILE, t.shape[2], t.shape[3])  # noqa: E731
+            snap = self._snaps[seq] = {"data": [torch.empty(shape(t), dtype=t.dtype).pin_memory() for t in self.kv_all[M.SLIDING]]}
+        self._copy_tiles(own, snap["data"], out=True)
+        snap["tiles"], snap["at"] = own, (self.lengths[seq], self.highs[seq])
 
-    def restore(self):
+    def _copy_tiles(self, own: list, data: list, out: bool):
+        """A sequence's sliding tiles `own` to (out) or from the RAM copies `data`, a layer at a time (a copy of
+        all layers at once would need its size again in VRAM when the tiles are not next to each other)."""
+        if not own:
+            return
+        run = own == list(range(own[0], own[0] + len(own)))  # next to each other in the pool: a slice
+        idx = None if run else torch.tensor(own, device=self.device)
+        for t, ram in zip(self.kv_all[M.SLIDING], data):
+            v = self._tiles_view(t, M.SLIDING)
+            for lay in range(v.shape[0]):
+                if out:
+                    ram[lay, : len(own)].copy_(v[lay, own[0] : own[0] + len(own)] if run else v[lay, idx])
+                elif run:
+                    v[lay, own[0] : own[0] + len(own)].copy_(ram[lay, : len(own)])
+                else:
+                    v[lay, idx] = ram[lay, : len(own)].to(self.device)
+
+    def restore(self, seq: int = 0):
         """Back to the snapshot's length: every position from there on is forgotten."""
-        for t, src in zip(self.kv_all.get(M.SLIDING, ()), self._snap):
-            t.copy_(src)
-        self.length, self.high = self._snap_at
+        snap = self._snaps[seq]
+        self._copy_tiles(snap["tiles"], snap["data"], out=False)
+        self.lengths[seq], self.highs[seq] = snap["at"]
 
-    def _kept(self, first: int) -> bool:
-        """Whether the sliding layers still hold every position from `first` on: their ring of window + SPARE slots has
-        been written up to position high - 1, so it holds the positions from high - slots."""
-        return max(first, 0) >= self.high - (self.cfg.window + SPARE)
+    def kept(self) -> int:
+        """Positions a sliding layer keeps of a sequence (its ring); without sliding layers, every position."""
+        return self.ring[M.SLIDING] * TILE if M.SLIDING in self.ring else self.capacity
 
-    def crop(self, length: int):
+    def _kept(self, first: int, seq: int = 0) -> bool:
+        """Whether the sliding layers still hold every position of the sequence from `first` on: their ring has been
+        written up to position high - 1, so it holds the positions from high - its size."""
+        return max(first, 0) >= self.highs[seq] - self.kept()
+
+    def crop(self, length: int, seq: int = 0):
         """Forget every position from `length` on (a later pass writes over them before anything reads them)."""
-        self.length = length
+        self.lengths[seq] = length
         if length == 0:
-            self.high = 0
+            self.highs[seq] = 0
 
-    def keys(self, length: int) -> dict:
+    def release(self, seq: int):
+        """The sequence is over: its tiles go back to the pool."""
+        for t in self.ring:
+            self.free[t] += sorted((x for x in self.tiles[t][seq] if x >= 0), reverse=True)
+            self.tiles[t][seq] = [-1] * self.ring[t]
+        self.lengths[seq] = self.highs[seq] = 0
+        self._snaps.pop(seq, None)
+
+    def trim(self, seq: int):
+        """Gives back the tiles past the sequence's present length (after a crop): those of the full-attention
+        layers, and those of the sliding layers while their ring has not gone round."""
+        last = (self.lengths[seq] - 1) >> 4  # the last tile still in use (-1: none)
+        for t in self.ring:
+            if t != M.FULL and self.highs[seq] > self.kept():
+                continue
+            own = self.tiles[t][seq]
+            for j in range(last + 1, self.ring[t]):
+                if own[j] >= 0:
+                    self.free[t].append(own[j])
+                    own[j] = -1
+            self.free[t].sort(reverse=True)
+            if t != M.FULL:
+                self.highs[seq] = self.lengths[seq]
+
+    def free_tiles(self) -> dict:
+        return {t: len(f) for t, f in self.free.items()}
+
+    def slots(self, kind: str, positions: torch.Tensor, seq: int = 0) -> torch.Tensor:
+        """Where a sequence's positions sit in the pool of a kind of layer."""
+        own = torch.tensor(self.tiles[kind][seq], device=positions.device)
+        return own[(positions >> 4) % self.ring[kind]] * TILE + (positions & 15)
+
+    def keys(self, length: int, seq: int = 0) -> dict:
         """What the drafter attends to: per layer type the keys and values of the last layer of that type, for the
-        positions the drafter may read, as (keys [1, heads, m, head_dim], values, positions), in fp16 as they are kept
-        (the full-attention layer's are views of the engine's memory, not copies)."""
-        assert length <= self.length and self._kept(length - (self.cfg.window + 1)), "further back than the sliding layers keep"
+        positions the drafter may read, as (keys [1, heads, m, head_dim], values, positions), in fp16 as they are kept."""
+        assert length <= self.lengths[seq] and self._kept(length - (self.cfg.window + 1), seq), "further back than the sliding layers keep"
         out = {}
         for t in (M.SLIDING, M.FULL):
             k, v = self.kv[self.cfg.last_of(t)]
             first = 0 if t == M.FULL else max(0, length - (self.cfg.window + 1))
             pos = torch.arange(first, length, device=self.device)
-            if t == M.FULL:
-                out[t] = (k[:length].transpose(0, 1)[None], v[:length].transpose(0, 1)[None], pos)
-            else:
-                slot = pos % k.shape[0]
-                out[t] = (k[slot].transpose(0, 1)[None], v[slot].transpose(0, 1)[None], pos)
+            slot = self.slots(t, pos, seq)
+            out[t] = (k[slot].transpose(0, 1)[None], v[slot].transpose(0, 1)[None], pos)
         return out
 
 
@@ -355,7 +504,7 @@ class EngineDrafter:
             inv[:rotated] = 1.0 / (theta ** (torch.arange(0, 2 * rotated, 2).float() / hd))
             cl.inv_freq = f32(inv).data_ptr()
             cl.scalar, cl.full, cl.head_dim, cl.kv_heads = float(lay["scalar"]), int(t == M.FULL), hd, cfg.kv_heads[t]
-        z = lambda *shape: self._own(torch.zeros(*shape, dtype=torch.float32, device=dev))  # noqa: E731
+        z = lambda *shape: self._own(torch.zeros(MAX_TOKENS, *shape, dtype=torch.float32, device=dev))  # noqa: E731  (a row a sequence)
         self.inp, self.h, self.hn, self.logits, self.next = z(2 * main.hidden), z(cfg.hidden), z(cfg.hidden), z(cfg.vocab), z(main.hidden)
         self.h2 = z(cfg.hidden)
         c = self.c = DrafterC()
@@ -377,7 +526,7 @@ class EngineDrafter:
         sizes = [C.c_int() for _ in range(2)]
         self.lib.sclmd_draft_sizes(*[C.byref(s) for s in sizes])
         assert [s.value for s in sizes] == [C.sizeof(DLayer), C.sizeof(DrafterC)], "struct layouts differ"
-        self.lib.sclmd_draft.argtypes = [C.c_void_p, C.c_void_p, C.c_void_p, C.c_int, C.c_int]
+        self.lib.sclmd_draft.argtypes = [C.c_void_p, C.c_void_p, C.c_void_p, C.c_int, C.c_int, C.c_void_p, C.c_void_p]
 
     @classmethod
     def load(cls, eng: Engine, folder: str, name: str, bits: int = 8, depth: int = 6) -> "EngineDrafter":
@@ -408,23 +557,43 @@ class EngineDrafter:
     def _rot(self, cols: int) -> Rot:
         return self.eng._rot(cols)  # the same rotation as any matrix of the main model with that many columns
 
-    def step(self, token_embed: torch.Tensor, hidden: torch.Tensor, length: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """One guess for position length + 1 from the token at `length` (its embedding in the main model) and a hidden
-        state -> (logits [vocab], the hidden state for the guess after it). Both are the drafter's own memory:
-        the next step writes over them."""
-        eng = self.eng
-        assert length <= eng.length and eng._kept(length - (eng.cfg.window + 1)), "further back than the sliding layers keep"
+    def steps(self, token_embeds: torch.Tensor, hiddens: torch.Tensor, lengths: list, seqs: list) -> tuple[torch.Tensor, torch.Tensor]:
+        """One guess for each of up to eight sequences: row r guesses position lengths[r] + 1 of sequence seqs[r] from the
+        token at lengths[r] (its embedding in the main model) and a hidden state -> (logits [rows, vocab], the hidden
+        states for the guesses after). Both are the drafter's own memory: the next step writes over them."""
+        eng, rows = self.eng, len(lengths)
+        for length, seq in zip(lengths, seqs):
+            assert length <= eng.lengths[seq] and eng._kept(length - (eng.cfg.window + 1), seq), "further back than the sliding layers keep"
         n = eng.cfg.hidden
-        self.inp[:n], self.inp[n:] = token_embed, hidden
-        status = self.lib.sclmd_draft(C.byref(self.c), C.byref(self.sliding), C.byref(self.full), eng.cfg.window, length)
+        self.inp[:rows, :n], self.inp[:rows, n:] = token_embeds, hiddens
+        ints = C.c_int * rows
+        status = self.lib.sclmd_draft(C.byref(self.c), C.byref(self.sliding), C.byref(self.full), eng.cfg.window, rows, ints(*lengths), ints(*seqs))
         assert status == 0, f"GPU kernel launch failed ({status})"
-        return self.logits, self.next
+        return self.logits[:rows], self.next[:rows]
 
-    def guess(self, token: int, hidden: torch.Tensor, length: int) -> list:
+    def step(self, token_embed: torch.Tensor, hidden: torch.Tensor, length: int, seq: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+        """One guess for position length + 1 of a sequence (see steps)."""
+        logits, nxt = self.steps(token_embed[None], hidden[None], [length], [seq])
+        return logits[0], nxt[0]
+
+    def guess(self, token: int, hidden: torch.Tensor, length: int, seq: int = 0) -> list:
         """Up to `depth` tokens after `token`, which sits at position `length` (generate.py's guess)."""
         out = []
         for _ in range(self.depth):
-            logits, hidden = self.step(self.eng.embed([token])[0], hidden, length)
+            logits, hidden = self.step(self.eng.embed([token])[0], hidden, length, seq)
             token = int(logits.argmax())
             out.append(token)
+        return out
+
+    def guess_many(self, asks: list) -> list:
+        """Guesses for up to eight sequences at once: asks is [(token, hidden, length, sequence, how many)] -> each
+        one's tokens. A step costs the same for eight sequences as for one."""
+        tokens, hidden = [a[0] for a in asks], torch.stack([a[1] for a in asks])
+        lengths, seqs, out = [a[2] for a in asks], [a[3] for a in asks], [[] for _ in asks]
+        for step in range(max(a[4] for a in asks)):
+            logits, hidden = self.steps(self.eng.embed(tokens), hidden, lengths, seqs)
+            tokens = logits.argmax(-1).tolist()
+            for r, a in enumerate(asks):
+                if step < a[4]:
+                    out[r].append(tokens[r])
         return out
