@@ -98,8 +98,8 @@ def main():
                 wm = w[mat].to(DEV).float()
                 for b in bits:
                     f = C.fit(wm, factor, b)
-                    errors[f"{mat}.c{b}"] = f.pop("error")
-                    fits[(mat, b)] = {k: v.cpu() for k, v in f.items()}
+                    errors[f"{mat}.c{b}"] = f["error"]
+                    fits[(mat, b)] = {k: f[k].cpu() for k in ("codes", "scales", "book")}
                 del wm
             del factor
             torch.cuda.empty_cache()

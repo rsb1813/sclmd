@@ -55,11 +55,14 @@ def drafter_guess(drafter, target, depth: int):
     """guess(token, hidden, length) -> up to `depth` tokens after `token`, which sits at position `length` (the main model
     has run the positions before it; `hidden` is its last output at length - 1)."""
 
+    dtype = drafter.pre.dtype  # the main model hands over its own types (the engine: float32 outputs, fp16 keys)
+
     def guess(token: int, hidden: torch.Tensor, length: int) -> list:
-        keys, out, h = target.keys(length), [], hidden[None, None]
+        keys = {t: (k.to(dtype), v.to(dtype), pos) for t, (k, v, pos) in target.keys(length).items()}
+        out, h = [], hidden[None, None].to(dtype)
         last = torch.tensor([length - 1], device=hidden.device)
         for _ in range(depth):
-            logits, h = drafter.step(target.embed([token])[None], h, last, keys)
+            logits, h = drafter.step(target.embed([token])[None].to(dtype), h, last, keys)
             token = int(logits[0, 0].argmax())
             out.append(token)
         return out

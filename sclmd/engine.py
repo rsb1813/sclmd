@@ -56,10 +56,21 @@ _ROW = (_LANE // 4)[:, None] + torch.tensor([0, 8, 0, 8])[None, :]
 _PAIR = (_LANE % 4)[:, None] + torch.tensor([0, 0, 4, 4])[None, :]
 
 
-def pack(codes: torch.Tensor, bits: int) -> torch.Tensor:
-    """codes (uint8 [rows, cols / 2], a code per pair of columns) in the order the kernel reads them (int32)."""
+def pack(codes: torch.Tensor, bits: int, strips_at_once: int = 256) -> torch.Tensor:
+    """codes (uint8 [rows, cols / 2], a code per pair of columns) in the order the kernel reads them (int32).
+    Done a part of the rows at a time: the temporaries are 16 times the codes."""
     rows, pairs = codes.shape
     assert rows % 16 == 0 and pairs % 32 == 0 and bits in (6, 8)
+    per_strip = pairs * 16 // 4 if bits == 8 else pairs * 16 * 3 // 16  # words: four codes each, or sixteen in three
+    out = torch.empty(rows // 16 * per_strip, dtype=torch.int32, device=codes.device)
+    step = 16 * strips_at_once
+    for a in range(0, rows, step):
+        out[a // 16 * per_strip : (a + step) // 16 * per_strip] = _pack(codes[a : a + step], bits)
+    return out
+
+
+def _pack(codes: torch.Tensor, bits: int) -> torch.Tensor:
+    rows, pairs = codes.shape
     strips, tiles = rows // 16, pairs // 8
     c = codes.view(strips, 16, tiles, 8).permute(0, 2, 1, 3)  # [strip, tile, row in strip, pair in tile]
     sel = c[:, :, _ROW.to(codes.device), _PAIR.to(codes.device)].long()  # [strip, tile, lane, 4]
@@ -145,6 +156,27 @@ class Engine:
             setattr(m, name, t.data_ptr())
         self.lib = lib()
 
+    @classmethod
+    def load(cls, name: str, plan: dict, head: int, capacity: int = 8192, device: str = "cuda") -> "Engine":
+        """The original model with the stored codes `name`: plan is layer -> {matrix: bits a pair}, head the output
+        head's bits. The layers come off the disk one at a time; the embedding table stays in RAM."""
+        from . import ckpt
+        from .checkpoint import Checkpoint
+
+        ck = Checkpoint(ckpt("orig"))
+        cfg = ck.cfg
+
+        def layers():
+            for i in range(cfg.n_layers):
+                has = [m for m in M.LINEARS if not (m == "v" and cfg.layer_types[i] == M.FULL)]
+                yield ck.layer(i, "cpu", skip=M.LINEARS) | {"mats": CD.stored(name, i, {m: plan[i][m] for m in has})}
+
+        return cls(cfg, layers(), CD.stored(name, "head", {"head": head})["head"], ck.norm("cpu"), ck.embed("cpu"), capacity, device)
+
+    def bytes(self) -> int:
+        """VRAM held: the codes, the keys and values, the work memory."""
+        return sum(t.numel() * t.element_size() for t in self.keep + list(self.work.values()) if t.is_cuda)
+
     def _own(self, t: torch.Tensor) -> torch.Tensor:
         self.keep.append(t)
         return t
@@ -208,13 +240,17 @@ class Engine:
 
     def keys(self, length: int) -> dict:
         """What the drafter attends to: per layer type the keys and values of the last layer of that type, for the
-        positions the drafter may read, as (keys [1, heads, m, head_dim], values, positions)."""
+        positions the drafter may read, as (keys [1, heads, m, head_dim], values, positions), in fp16 as they are kept
+        (the full-attention layer's are views of the engine's memory, not copies)."""
         assert length <= self.length and self._kept(length - (self.cfg.window + 1)), "further back than the sliding layers keep"
         out = {}
         for t in (M.SLIDING, M.FULL):
             k, v = self.kv[self.cfg.last_of(t)]
             first = 0 if t == M.FULL else max(0, length - (self.cfg.window + 1))
             pos = torch.arange(first, length, device=self.device)
-            slot = pos % k.shape[0]
-            out[t] = (k[slot].transpose(0, 1)[None].float(), v[slot].transpose(0, 1)[None].float(), pos)
+            if t == M.FULL:
+                out[t] = (k[:length].transpose(0, 1)[None], v[:length].transpose(0, 1)[None], pos)
+            else:
+                slot = pos % k.shape[0]
+                out[t] = (k[slot].transpose(0, 1)[None], v[slot].transpose(0, 1)[None], pos)
         return out

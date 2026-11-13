@@ -250,3 +250,9 @@ def test_with_the_drafter_the_text_is_unchanged(small_e):
     eng = small_e.engine()
     (_, he), (_, hr) = eng.feed(PROMPT), ref.feed(PROMPT)
     assert drafter_guess(drafter, eng, 6)(truth[0], he[-1], len(PROMPT)) == drafter_guess(drafter, ref, 6)(truth[0], hr[-1], len(PROMPT))
+
+
+def test_packing_a_part_of_the_rows_at_a_time_is_the_same():
+    codes = torch.randint(0, 64, (48, 96), generator=torch.Generator().manual_seed(8)).to(torch.uint8)
+    for bits in (6, 8):
+        assert torch.equal(E.pack(codes, bits, strips_at_once=1), E.pack(codes, bits))

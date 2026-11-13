@@ -16,3 +16,5 @@ data/*
 *.npz
 *.npy
 .claude/worktrees/
+!data/plans/
+!data/plans/*.json

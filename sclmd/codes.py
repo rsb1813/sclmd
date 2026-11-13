@@ -7,6 +7,7 @@ import json
 import os
 
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
 from . import MODELS
@@ -36,19 +37,22 @@ def pair_codebook(w: torch.Tensor, bits: int) -> torch.Tensor:
     return Q.kmeans(sample, 1 << bits, iters=25)
 
 
-def fit(w: torch.Tensor, factor: tuple, bits: int) -> dict:
+def fit(w: torch.Tensor, factor: tuple, bits: int, book: torch.Tensor | None = None) -> dict:
     """Pair codes of w [rows, cols] under a rotated Hessian given as Q.gptq_factor's result (shared by the matrices
-    with that input).
-    Returns codes (uint8 [rows, cols / 2]), scales (fp32 [rows]), book (fp32 [2**bits, 2]) and error: the share of the
-    output's energy that is lost, tr(D H D^T) / tr(W H W^T) with D the difference."""
+    with that input). book: the codebook to use (a matrix fitted a part of its rows at a time has one for all of them).
+    Returns codes (uint8 [rows, cols / 2]), scales (fp32 [rows]), book (fp32 [2**bits, 2]), error: the share of the
+    output's energy that is lost, tr(D H D^T) / tr(W H W^T) with D the difference, and energy: tr(W H W^T). Both are
+    under the damped Hessian the fit used and on the inputs it was fitted to: good for ranking, not a held-out error."""
     rows, cols = w.shape
     hr = factor[1]
     wr = rotation(cols, w.device).rotate(w)
-    book = pair_codebook(wr, bits)
+    if book is None:
+        book = pair_codebook(wr, bits)
     codes, scales = Q.gptq_vq(wr, None, book, cols, refit=True, factor=factor)
     d = Q.vq_codes_dequant(codes, scales, book) - wr
-    error = ((d @ hr) * d).sum().item() / ((wr @ hr) * wr).sum().item()
-    return {"codes": codes.to(torch.uint8), "scales": scales.reshape(rows).float(), "book": book.float(), "error": error}
+    energy = ((wr @ hr) * wr).sum().item()
+    error = ((d @ hr) * d).sum().item() / energy
+    return {"codes": codes.to(torch.uint8), "scales": scales.reshape(rows).float(), "book": book.float(), "error": error, "energy": energy}
 
 
 def weight(codes: torch.Tensor, scales: torch.Tensor, book: torch.Tensor) -> torch.Tensor:
@@ -87,3 +91,39 @@ def layer_info(name: str, layer: int) -> dict | None:
         return None
     with open(path[: -len(".safetensors")] + ".json", encoding="utf-8") as fh:
         return json.load(fh)
+
+
+def stored(name: str, layer: int | str, mats: dict, device="cpu") -> dict:
+    """A layer's (or with layer "head", the output head's) matrices as stored: matrix -> (codes, scales, book, bits),
+    for mats: matrix -> bits. The head is the one matrix "head"."""
+    path = head_path(name) if layer == "head" else layer_path(name, layer)
+    with safe_open(path, framework="pt", device=device) as f:
+        key = (lambda m, b: f"c{b}") if layer == "head" else (lambda m, b: f"{m}.c{b}")
+        return {m: (f.get_tensor(key(m, b) + ".codes"), f.get_tensor(key(m, b) + ".scales"), f.get_tensor(key(m, b) + ".book"), b)
+                for m, b in mats.items()}
+
+
+# The output head (the embedding table used as a matrix): one file, both rates.
+
+def head_path(name: str) -> str:
+    return os.path.join(CODES, name, "head.safetensors")
+
+
+def save_head(name: str, fits: dict, info: dict):
+    """fits: bits -> {codes, scales, book}."""
+    path = head_path(name)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    save_file({f"c{bits}.{key}": f[key].cpu().contiguous() for bits, f in fits.items() for key in ("codes", "scales", "book")}, path + ".tmp")
+    with open(path[: -len(".safetensors")] + ".json", "w", encoding="utf-8") as fh:
+        json.dump(info, fh, indent=2)
+    os.replace(path + ".tmp", path)
+
+
+def load_head(name: str, bits: int, device="cuda", dtype=torch.float32, rows: int = 32768) -> torch.Tensor:
+    """The head's weight as its codes give it, in the model's own basis ([vocab, hidden]; built a part at a time: the
+    float32 matrix alone is 5.6 GB)."""
+    codes, scales, book, _ = stored(name, "head", {"head": bits})["head"]
+    out = torch.empty(codes.shape[0], codes.shape[1] * 2, dtype=dtype, device=device)
+    for a in range(0, codes.shape[0], rows):
+        out[a : a + rows] = weight(codes[a : a + rows].to(device), scales[a : a + rows].to(device), book.to(device)).to(dtype)
+    return out

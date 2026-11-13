@@ -29,9 +29,9 @@ class Checkpoint:
             self.files[file] = safe_open(os.path.join(self.folder, file), framework="pt")
         return self.files[file].get_tensor(name).to(device)
 
-    def layer(self, i: int, device="cpu") -> dict:
-        """Layer i's weights by the short names of model.LAYER_KEYS."""
-        names = {short: f"{self.prefix}layers.{i}.{name}" for short, name in M.LAYER_KEYS.items()}
+    def layer(self, i: int, device="cpu", skip: tuple = ()) -> dict:
+        """Layer i's weights by the short names of model.LAYER_KEYS, without those in `skip`."""
+        names = {short: f"{self.prefix}layers.{i}.{name}" for short, name in M.LAYER_KEYS.items() if short not in skip}
         return {short: self.get(name, device) for short, name in names.items() if name in self.where}
 
     def embed(self, device="cpu") -> torch.Tensor:
