@@ -282,7 +282,7 @@ class Server:
     def reset(self) -> None:
         """Forgets every conversation and job: the engine as it was when it was loaded."""
         self.active, self.waiting, self.kept, self.parked = [], [], {}, []
-        self.batch.jobs = []
+        self.batch.jobs, self.batch.starved = [], 0
         for seq in range(self.eng.sequences):
             self.eng.release(seq)
         self.unused = list(range(self.eng.sequences - 1, -1, -1))
