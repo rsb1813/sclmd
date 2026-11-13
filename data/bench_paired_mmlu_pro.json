@@ -1,0 +1,27 @@
+{
+  "task": "mmlu_pro",
+  "plan": "fit_own_v1_11.9",
+  "prompt": "no thinking, the answer is the letter after 'The answer is ('",
+  "orig_vs_ours": {
+    "questions": 64,
+    "original": 60.94,
+    "ours": 56.25,
+    "difference": -4.69,
+    "interval": 10.16,
+    "right_to_wrong": 7,
+    "wrong_to_right": 4,
+    "answers_that_differ": 13,
+    "largest_logit_is_a_letter": 0.984
+  },
+  "orig_vs_orig_fp32": {
+    "questions": 64,
+    "original": 60.94,
+    "original_fp32": 62.5,
+    "difference": 1.56,
+    "interval": 6.85,
+    "right_to_wrong": 2,
+    "wrong_to_right": 3,
+    "answers_that_differ": 5,
+    "largest_logit_is_a_letter": 0.984
+  }
+}
