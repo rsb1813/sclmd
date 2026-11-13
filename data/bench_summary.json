@@ -8,24 +8,672 @@
     {
       "task": "aime_2026",
       "runs": 1,
-      "items": 19,
+      "items": 30,
       "of": 30,
-      "correct": 19,
-      "score": 100.0,
-      "low": 83.2,
-      "high": 100.0,
+      "correct": 28,
+      "score": 93.3,
+      "low": 78.7,
+      "high": 98.2,
       "card": 89.2,
       "no_answer": 0,
       "cut": 0,
       "looped": 0,
       "errors": 0,
-      "over_8k": 11,
-      "score_at_8k": 42.1,
-      "mean_tokens": 7645,
-      "mean_thinking": 6734,
-      "tok_s": 144.1,
-      "hours": 0.28,
+      "over_8k": 17,
+      "score_at_8k": 43.3,
+      "mean_tokens": 8232,
+      "mean_thinking": 7221,
+      "tok_s": 147.5,
+      "hours": 0.47,
       "note": "the card's scores are counts out of 120: four runs of the 30 problems"
+    },
+    {
+      "task": "bbeh_mini",
+      "runs": 1,
+      "items": 23,
+      "of": 460,
+      "correct": 14,
+      "score": 60.9,
+      "low": 40.8,
+      "high": 77.8,
+      "card": 74.4,
+      "no_answer": 0,
+      "cut": 3,
+      "looped": 0,
+      "errors": 0,
+      "over_8k": 12,
+      "score_at_8k": 26.1,
+      "mean_tokens": 7778,
+      "mean_thinking": 6988,
+      "tok_s": 146.1,
+      "hours": 0.34,
+      "note": "the card's score is on all 4,520 items; this is the benchmark's own 460-item slice",
+      "by": {
+        "boardgame qa": [
+          1,
+          1
+        ],
+        "boolean expressions": [
+          1,
+          1
+        ],
+        "buggy tables": [
+          0,
+          1
+        ],
+        "causal understanding": [
+          1,
+          1
+        ],
+        "disambiguation qa": [
+          0,
+          1
+        ],
+        "dyck languages": [
+          1,
+          1
+        ],
+        "geometric shapes": [
+          1,
+          1
+        ],
+        "hyperbaton": [
+          0,
+          1
+        ],
+        "linguini": [
+          0,
+          1
+        ],
+        "movie recommendation": [
+          1,
+          1
+        ],
+        "multistep arithmetic": [
+          1,
+          1
+        ],
+        "nycc": [
+          0,
+          1
+        ],
+        "object counting": [
+          1,
+          1
+        ],
+        "object properties": [
+          1,
+          1
+        ],
+        "sarc triples": [
+          0,
+          1
+        ],
+        "shuffled objects": [
+          0,
+          1
+        ],
+        "spatial reasoning": [
+          0,
+          1
+        ],
+        "sportqa": [
+          0,
+          1
+        ],
+        "temporal sequence": [
+          1,
+          1
+        ],
+        "time arithmetic": [
+          1,
+          1
+        ],
+        "web of lies": [
+          1,
+          1
+        ],
+        "word sorting": [
+          1,
+          1
+        ],
+        "zebra puzzles": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "task": "gsm8k",
+      "runs": 1,
+      "items": 100,
+      "of": 1319,
+      "correct": 99,
+      "score": 99.0,
+      "low": 94.6,
+      "high": 99.8,
+      "card": null,
+      "no_answer": 0,
+      "cut": 0,
+      "looped": 0,
+      "errors": 0,
+      "over_8k": 0,
+      "score_at_8k": 99.0,
+      "mean_tokens": 1253,
+      "mean_thinking": 967,
+      "tok_s": 157.5,
+      "hours": 0.22
+    },
+    {
+      "task": "humaneval",
+      "runs": 1,
+      "items": 164,
+      "of": 164,
+      "correct": 163,
+      "score": 99.4,
+      "low": 96.6,
+      "high": 99.9,
+      "card": null,
+      "no_answer": 0,
+      "cut": 0,
+      "looped": 0,
+      "errors": 0,
+      "over_8k": 0,
+      "score_at_8k": 99.4,
+      "mean_tokens": 1252,
+      "mean_thinking": 985,
+      "tok_s": 158.1,
+      "hours": 0.36
+    },
+    {
+      "task": "kmmlu",
+      "runs": 1,
+      "items": 90,
+      "of": 35030,
+      "correct": 75,
+      "score": 83.3,
+      "low": 74.3,
+      "high": 89.6,
+      "card": null,
+      "no_answer": 0,
+      "cut": 0,
+      "looped": 0,
+      "errors": 0,
+      "over_8k": 2,
+      "score_at_8k": 83.3,
+      "mean_tokens": 1646,
+      "mean_thinking": 1247,
+      "tok_s": 126.3,
+      "hours": 0.33,
+      "by": {
+        "Accounting": [
+          2,
+          2
+        ],
+        "Agricultural-Sciences": [
+          1,
+          2
+        ],
+        "Aviation-Engineering-and-Maintenance": [
+          2,
+          2
+        ],
+        "Biology": [
+          2,
+          2
+        ],
+        "Chemical-Engineering": [
+          2,
+          2
+        ],
+        "Chemistry": [
+          2,
+          2
+        ],
+        "Civil-Engineering": [
+          1,
+          2
+        ],
+        "Computer-Science": [
+          2,
+          2
+        ],
+        "Construction": [
+          2,
+          2
+        ],
+        "Criminal-Law": [
+          1,
+          2
+        ],
+        "Ecology": [
+          1,
+          2
+        ],
+        "Economics": [
+          1,
+          2
+        ],
+        "Education": [
+          2,
+          2
+        ],
+        "Electrical-Engineering": [
+          2,
+          2
+        ],
+        "Electronics-Engineering": [
+          2,
+          2
+        ],
+        "Energy-Management": [
+          1,
+          2
+        ],
+        "Environmental-Science": [
+          1,
+          2
+        ],
+        "Fashion": [
+          1,
+          2
+        ],
+        "Food-Processing": [
+          1,
+          2
+        ],
+        "Gas-Technology-and-Engineering": [
+          2,
+          2
+        ],
+        "Geomatics": [
+          2,
+          2
+        ],
+        "Health": [
+          2,
+          2
+        ],
+        "Industrial-Engineer": [
+          2,
+          2
+        ],
+        "Information-Technology": [
+          2,
+          2
+        ],
+        "Interior-Architecture-and-Design": [
+          2,
+          2
+        ],
+        "Korean-History": [
+          0,
+          2
+        ],
+        "Law": [
+          1,
+          2
+        ],
+        "Machine-Design-and-Manufacturing": [
+          2,
+          2
+        ],
+        "Management": [
+          2,
+          2
+        ],
+        "Maritime-Engineering": [
+          2,
+          2
+        ],
+        "Marketing": [
+          2,
+          2
+        ],
+        "Materials-Engineering": [
+          2,
+          2
+        ],
+        "Math": [
+          2,
+          2
+        ],
+        "Mechanical-Engineering": [
+          1,
+          2
+        ],
+        "Nondestructive-Testing": [
+          2,
+          2
+        ],
+        "Patent": [
+          2,
+          2
+        ],
+        "Political-Science-and-Sociology": [
+          2,
+          2
+        ],
+        "Psychology": [
+          2,
+          2
+        ],
+        "Public-Safety": [
+          2,
+          2
+        ],
+        "Railway-and-Automotive-Engineering": [
+          2,
+          2
+        ],
+        "Real-Estate": [
+          1,
+          2
+        ],
+        "Refrigerating-Machinery": [
+          2,
+          2
+        ],
+        "Social-Welfare": [
+          2,
+          2
+        ],
+        "Taxation": [
+          1,
+          2
+        ],
+        "Telecommunications-and-Wireless-Technology": [
+          2,
+          2
+        ]
+      }
+    },
+    {
+      "task": "lcb_v6",
+      "runs": 1,
+      "items": 35,
+      "of": 175,
+      "correct": 29,
+      "score": 82.9,
+      "low": 67.3,
+      "high": 91.9,
+      "card": 80.0,
+      "no_answer": 3,
+      "cut": 3,
+      "looped": 0,
+      "errors": 0,
+      "over_8k": 16,
+      "score_at_8k": 54.3,
+      "mean_tokens": 6955,
+      "mean_thinking": 6109,
+      "tok_s": 136.6,
+      "hours": 0.49,
+      "note": "the 175 problems release 6 added, as the card's counts are out of 175",
+      "by": {
+        "easy": [
+          12,
+          12
+        ],
+        "hard": [
+          7,
+          12
+        ],
+        "medium": [
+          10,
+          11
+        ]
+      }
+    },
+    {
+      "task": "mmlu",
+      "runs": 1,
+      "items": 114,
+      "of": 14042,
+      "correct": 101,
+      "score": 88.6,
+      "low": 81.5,
+      "high": 93.2,
+      "card": null,
+      "no_answer": 0,
+      "cut": 0,
+      "looped": 0,
+      "errors": 0,
+      "over_8k": 1,
+      "score_at_8k": 87.7,
+      "mean_tokens": 1445,
+      "mean_thinking": 1061,
+      "tok_s": 125.5,
+      "hours": 0.36,
+      "by": {
+        "abstract_algebra": [
+          2,
+          2
+        ],
+        "anatomy": [
+          2,
+          2
+        ],
+        "astronomy": [
+          2,
+          2
+        ],
+        "business_ethics": [
+          2,
+          2
+        ],
+        "clinical_knowledge": [
+          1,
+          2
+        ],
+        "college_biology": [
+          2,
+          2
+        ],
+        "college_chemistry": [
+          2,
+          2
+        ],
+        "college_computer_science": [
+          2,
+          2
+        ],
+        "college_mathematics": [
+          2,
+          2
+        ],
+        "college_medicine": [
+          1,
+          2
+        ],
+        "college_physics": [
+          2,
+          2
+        ],
+        "computer_security": [
+          2,
+          2
+        ],
+        "conceptual_physics": [
+          2,
+          2
+        ],
+        "econometrics": [
+          1,
+          2
+        ],
+        "electrical_engineering": [
+          2,
+          2
+        ],
+        "elementary_mathematics": [
+          2,
+          2
+        ],
+        "formal_logic": [
+          2,
+          2
+        ],
+        "global_facts": [
+          0,
+          2
+        ],
+        "high_school_biology": [
+          2,
+          2
+        ],
+        "high_school_chemistry": [
+          2,
+          2
+        ],
+        "high_school_computer_science": [
+          2,
+          2
+        ],
+        "high_school_european_history": [
+          1,
+          2
+        ],
+        "high_school_geography": [
+          2,
+          2
+        ],
+        "high_school_government_and_politics": [
+          2,
+          2
+        ],
+        "high_school_macroeconomics": [
+          1,
+          2
+        ],
+        "high_school_mathematics": [
+          2,
+          2
+        ],
+        "high_school_microeconomics": [
+          2,
+          2
+        ],
+        "high_school_physics": [
+          1,
+          2
+        ],
+        "high_school_psychology": [
+          1,
+          2
+        ],
+        "high_school_statistics": [
+          2,
+          2
+        ],
+        "high_school_us_history": [
+          2,
+          2
+        ],
+        "high_school_world_history": [
+          2,
+          2
+        ],
+        "human_aging": [
+          2,
+          2
+        ],
+        "human_sexuality": [
+          2,
+          2
+        ],
+        "international_law": [
+          2,
+          2
+        ],
+        "jurisprudence": [
+          2,
+          2
+        ],
+        "logical_fallacies": [
+          2,
+          2
+        ],
+        "machine_learning": [
+          2,
+          2
+        ],
+        "management": [
+          2,
+          2
+        ],
+        "marketing": [
+          2,
+          2
+        ],
+        "medical_genetics": [
+          2,
+          2
+        ],
+        "miscellaneous": [
+          2,
+          2
+        ],
+        "moral_disputes": [
+          1,
+          2
+        ],
+        "moral_scenarios": [
+          2,
+          2
+        ],
+        "nutrition": [
+          2,
+          2
+        ],
+        "philosophy": [
+          1,
+          2
+        ],
+        "prehistory": [
+          2,
+          2
+        ],
+        "professional_accounting": [
+          2,
+          2
+        ],
+        "professional_law": [
+          2,
+          2
+        ],
+        "professional_medicine": [
+          2,
+          2
+        ],
+        "professional_psychology": [
+          2,
+          2
+        ],
+        "public_relations": [
+          2,
+          2
+        ],
+        "security_studies": [
+          1,
+          2
+        ],
+        "sociology": [
+          2,
+          2
+        ],
+        "us_foreign_policy": [
+          2,
+          2
+        ],
+        "virology": [
+          1,
+          2
+        ],
+        "world_religions": [
+          2,
+          2
+        ]
+      }
     },
     {
       "task": "mmlu_pro",
@@ -103,6 +751,258 @@
         "psychology": [
           5,
           5
+        ]
+      }
+    },
+    {
+      "task": "mmmlu_ko",
+      "runs": 1,
+      "items": 114,
+      "of": 14042,
+      "correct": 97,
+      "score": 85.1,
+      "low": 77.4,
+      "high": 90.5,
+      "card": 88.4,
+      "no_answer": 0,
+      "cut": 0,
+      "looped": 0,
+      "errors": 0,
+      "over_8k": 3,
+      "score_at_8k": 84.2,
+      "mean_tokens": 1476,
+      "mean_thinking": 1080,
+      "tok_s": 123.5,
+      "hours": 0.38,
+      "note": "the card's score is over all of MMMLU's languages; this is Korean only",
+      "by": {
+        "abstract_algebra": [
+          2,
+          2
+        ],
+        "anatomy": [
+          2,
+          2
+        ],
+        "astronomy": [
+          2,
+          2
+        ],
+        "business_ethics": [
+          2,
+          2
+        ],
+        "clinical_knowledge": [
+          1,
+          2
+        ],
+        "college_biology": [
+          2,
+          2
+        ],
+        "college_chemistry": [
+          2,
+          2
+        ],
+        "college_computer_science": [
+          2,
+          2
+        ],
+        "college_mathematics": [
+          1,
+          2
+        ],
+        "college_medicine": [
+          1,
+          2
+        ],
+        "college_physics": [
+          2,
+          2
+        ],
+        "computer_security": [
+          2,
+          2
+        ],
+        "conceptual_physics": [
+          2,
+          2
+        ],
+        "econometrics": [
+          0,
+          2
+        ],
+        "electrical_engineering": [
+          2,
+          2
+        ],
+        "elementary_mathematics": [
+          2,
+          2
+        ],
+        "formal_logic": [
+          2,
+          2
+        ],
+        "global_facts": [
+          0,
+          2
+        ],
+        "high_school_biology": [
+          2,
+          2
+        ],
+        "high_school_chemistry": [
+          2,
+          2
+        ],
+        "high_school_computer_science": [
+          2,
+          2
+        ],
+        "high_school_european_history": [
+          1,
+          2
+        ],
+        "high_school_geography": [
+          2,
+          2
+        ],
+        "high_school_government_and_politics": [
+          2,
+          2
+        ],
+        "high_school_macroeconomics": [
+          2,
+          2
+        ],
+        "high_school_mathematics": [
+          2,
+          2
+        ],
+        "high_school_microeconomics": [
+          1,
+          2
+        ],
+        "high_school_physics": [
+          1,
+          2
+        ],
+        "high_school_psychology": [
+          1,
+          2
+        ],
+        "high_school_statistics": [
+          2,
+          2
+        ],
+        "high_school_us_history": [
+          2,
+          2
+        ],
+        "high_school_world_history": [
+          2,
+          2
+        ],
+        "human_aging": [
+          1,
+          2
+        ],
+        "human_sexuality": [
+          2,
+          2
+        ],
+        "international_law": [
+          2,
+          2
+        ],
+        "jurisprudence": [
+          2,
+          2
+        ],
+        "logical_fallacies": [
+          2,
+          2
+        ],
+        "machine_learning": [
+          2,
+          2
+        ],
+        "management": [
+          2,
+          2
+        ],
+        "marketing": [
+          2,
+          2
+        ],
+        "medical_genetics": [
+          2,
+          2
+        ],
+        "miscellaneous": [
+          2,
+          2
+        ],
+        "moral_disputes": [
+          1,
+          2
+        ],
+        "moral_scenarios": [
+          2,
+          2
+        ],
+        "nutrition": [
+          2,
+          2
+        ],
+        "philosophy": [
+          0,
+          2
+        ],
+        "prehistory": [
+          2,
+          2
+        ],
+        "professional_accounting": [
+          2,
+          2
+        ],
+        "professional_law": [
+          2,
+          2
+        ],
+        "professional_medicine": [
+          2,
+          2
+        ],
+        "professional_psychology": [
+          2,
+          2
+        ],
+        "public_relations": [
+          2,
+          2
+        ],
+        "security_studies": [
+          1,
+          2
+        ],
+        "sociology": [
+          2,
+          2
+        ],
+        "us_foreign_policy": [
+          2,
+          2
+        ],
+        "virology": [
+          1,
+          2
+        ],
+        "world_religions": [
+          2,
+          2
         ]
       }
     }
