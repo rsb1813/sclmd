@@ -13,7 +13,7 @@ from sclmd import engine as E
 from sclmd import model as M
 from sclmd import plan as P
 from sclmd.generate import Picker, extend
-from sclmd.stream import cap_vram
+from sclmd.stream import VRAM_MARGIN, cap_vram
 
 
 @torch.no_grad()
@@ -24,8 +24,9 @@ def main():
     ap.add_argument("--name", default="v1")
     ap.add_argument("--plan", default=os.path.join(DATA, "plans", "fit_own_v1_11.1.json"))
     ap.add_argument("--capacity", type=int, default=8192)
+    ap.add_argument("--reserve", type=float, default=VRAM_MARGIN / 2**30, help="GiB of VRAM left free (the benchmarks' 16,384 context with the chat's plan: 0.4)")
     args = ap.parse_args()
-    cap_vram()
+    cap_vram(margin=int(args.reserve * 2**30))
     tok = AutoTokenizer.from_pretrained(ckpt("orig"))
     with open(args.text, encoding="utf-8") as f:
         body = tok.encode(f.read(), add_special_tokens=False)

@@ -95,11 +95,14 @@ def main():
             batch.add(j)
         torch.cuda.synchronize()
         t = time.perf_counter()
-        first = {}
+        first, over = {}, set()
         while batch.step():
             for j in jobs:
                 if j.out and j not in first:
                     first[j] = time.perf_counter() - t
+                if j.done is not None and j not in over:  # a text that is over gives its keys and values back (a server
+                    eng.release(j.seq)                     # moves the conversation to RAM): the ones that wait can go on
+                    over.add(j)
         torch.cuda.synchronize()
         seconds = time.perf_counter() - t
         tokens = sum(len(j.out) for j in jobs)
