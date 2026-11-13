@@ -90,6 +90,8 @@ def orig(args, tok, todo, letters, path):
     ck = Checkpoint(ckpt("orig"))
     cfg = ck.cfg
     dtype = torch.float32 if args.fp32 else None
+    if args.fp32:  # everything is twice the size (the embedding alone 5.6 GB): a quarter of the tokens at once
+        args.chunk, args.batch = args.chunk // 4, args.batch // 4
     todo = sorted(todo, key=lambda x: len(x[1]))  # prompts of like length together: little padding
     chunks, cur = [], []
     for item in todo:

@@ -3,25 +3,25 @@
   "plan": "fit_own_v1_11.9",
   "prompt": "no thinking, the answer is the letter after 'The answer is ('",
   "orig_vs_ours": {
-    "questions": 64,
-    "original": 60.94,
-    "ours": 56.25,
-    "difference": -4.69,
-    "interval": 10.16,
-    "right_to_wrong": 7,
-    "wrong_to_right": 4,
-    "answers_that_differ": 13,
-    "largest_logit_is_a_letter": 0.984
+    "questions": 2800,
+    "original": 71.32,
+    "ours": 70.0,
+    "difference": -1.32,
+    "interval": 0.95,
+    "right_to_wrong": 111,
+    "wrong_to_right": 74,
+    "answers_that_differ": 301,
+    "largest_logit_is_a_letter": 0.978
   },
   "orig_vs_orig_fp32": {
-    "questions": 64,
-    "original": 60.94,
-    "original_fp32": 62.5,
-    "difference": 1.56,
-    "interval": 6.85,
-    "right_to_wrong": 2,
+    "questions": 640,
+    "original": 68.75,
+    "original_fp32": 68.44,
+    "difference": -0.31,
+    "interval": 0.87,
+    "right_to_wrong": 5,
     "wrong_to_right": 3,
-    "answers_that_differ": 5,
-    "largest_logit_is_a_letter": 0.984
+    "answers_that_differ": 11,
+    "largest_logit_is_a_letter": 0.973
   }
 }
