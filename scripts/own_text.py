@@ -41,11 +41,34 @@ PROMPTS = [
     ("code_ko", False, "C++로 스레드 풀을 구현해줘. 작업 큐, 조건 변수, 종료 처리까지 포함하고 각 부분이 왜 필요한지 주석으로 설명해줘."),
 ]
 
+# A second set of prompts, for checking on other text what was chosen on the first (--prompts 2).
+PROMPTS_2 = [
+    ("think_en", True, "Three machines A, B and C fill an order in 6, 8 and 12 hours when working alone. They start together, A breaks "
+                       "down after one hour, and B slows to half speed two hours after that. How long does the whole order take? Check "
+                       "your answer by adding up the work done by each machine."),
+    ("think_en", True, "A web service's p99 latency doubled after a deploy, but p50 did not change and CPU use is flat. List the most "
+                       "likely causes in order, say what measurement would confirm or rule out each, and sketch a small Go program "
+                       "that would reproduce the most likely one."),
+    ("think_ko", True, "어떤 회사가 월 구독료를 9,900원에서 12,900원으로 올리려고 한다. 현재 가입자는 40만 명이고, 가격을 올리면 8%가 해지할 "
+                       "것으로 예상된다. 매출이 늘어나는지 계산하고, 해지율이 몇 퍼센트를 넘으면 오히려 손해인지 구한 다음, 가입자당 한 달 "
+                       "비용이 3,000원일 때 이익 기준으로도 같은 계산을 해줘."),
+    ("think_ko", True, "자바스크립트에서 이벤트 루프, 마이크로태스크, 매크로태스크가 어떻게 동작하는지 설명하고, setTimeout과 Promise와 "
+                       "async/await가 섞인 코드의 실행 순서를 맞히는 예제를 세 개 만들어서 풀이해줘."),
+    ("chat_en", False, "Describe how vaccines train the immune system, the difference between mRNA and inactivated-virus vaccines, and why "
+                       "some vaccines need boosters. Write it for a curious high-school student, in detail."),
+    ("chat_ko", False, "기후 변화가 한반도의 농업에 미치는 영향을 작물별로 나누어 설명하고, 농가가 할 수 있는 대응 방법을 구체적으로 알려줘."),
+    ("code_en", False, "Write a complete Python module that implements an interval tree with insert, delete and overlap query, with type "
+                       "hints, docstrings and a small set of unit tests."),
+    ("code_ko", False, "Go로 간단한 HTTP 리버스 프록시를 만들어줘. 라운드 로빈 부하 분산, 헬스 체크, 타임아웃 처리를 포함하고 각 부분을 "
+                       "주석으로 설명해줘."),
+]
+
 
 @torch.no_grad()
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--name", default="own_v1", help="the set's name under data/")
+    ap.add_argument("--prompts", type=int, default=1, help="which list of prompts (1 or 2)")
     ap.add_argument("--codes", default="v1")
     ap.add_argument("--plan", default=os.path.join(DATA, "plans", "fit_11.1.json"), help="the plan that writes the text")
     ap.add_argument("--head", type=int, default=8)
@@ -60,9 +83,10 @@ def main():
     eng = E.Engine.load(args.codes, plan, head or args.head, 8192)
     drafter = E.EngineDrafter.load(eng, ckpt("drafter"), args.codes)
     stop = (tok.eos_token_id, tok.convert_tokens_to_ids("<turn|>"), tok.convert_tokens_to_ids("<|tool_response>"))
-    names = list(dict.fromkeys(c for c, _, _ in PROMPTS))
+    prompts = PROMPTS if args.prompts == 1 else PROMPTS_2
+    names = list(dict.fromkeys(c for c, _, _ in prompts))
     seqs, manifest = [], {"plan": os.path.basename(args.plan), "temperature": args.temperature, "seed": args.seed, "sequences": []}
-    for i, (cat, think, text) in enumerate(PROMPTS):
+    for i, (cat, think, text) in enumerate(prompts):
         out = tok.apply_chat_template([{"role": "user", "content": text}], tokenize=True, add_generation_prompt=True, enable_thinking=think)
         prompt = list(out["input_ids"] if hasattr(out, "keys") else out)
         eng.crop(0)

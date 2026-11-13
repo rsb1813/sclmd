@@ -21,6 +21,8 @@ from sclmd.stream import VRAM_MARGIN, cap_vram
 
 DEPTH = 6  # the drafter's generation_config.json: num_assistant_tokens
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SHARES = "own_v1"  # the measurements the plan is fitted from: on text the model wrote itself (on unseen text of that kind a plan
+# fitted from them is KL 0.055 where one of the same size fitted from other people's text is 0.066)
 LOAD_ROOM = 320 << 20  # VRAM left over the engine: what loading uses for a moment, and the allocator's leftovers
 
 HELP = """[bold]명령[/]
@@ -301,7 +303,7 @@ def main() -> None:
                           f"{(P.code_bytes(cfg, P.uniform(cfg, 6)) + rest + LOAD_ROOM + VRAM_MARGIN) / 2**30:.1f}GiB가 필요합니다. "
                           f"다른 프로그램을 닫거나 --context 를 줄여 보세요.[/]")
             return
-        plan, estimate = P.fit(cfg, cli.name, budget)
+        plan, estimate = P.fit(cfg, cli.name, budget, of=SHARES)
     elif cli.plan == "c6":
         plan = P.uniform(cfg, 6)
     else:
@@ -313,7 +315,7 @@ def main() -> None:
         opts = {"temperature": 1.0, "top_p": 0.95, "top_k": 64, "num_predict": 4096, "verbose": True, "showthink": False}
         session = Session(tok, eng, drafter)
         console.print(f"\n[bold]sclmd chat[/] · gemma-4-31B-it · VRAM {torch.cuda.memory_allocated() / 2**30:.1f}GiB · "
-                      f"가중치 평균 {P.bits_per_weight(cfg, plan):.2f}bit" + (f" (원본 대비 KL 약 {estimate:.3f})" if estimate else "")
+                      f"가중치 평균 {P.bits_per_weight(cfg, plan):.2f}bit" + (f" (직접 쓴 글에서 원본 대비 KL 약 {estimate:.3f})" if estimate else "")
                       + f"\n[grey62]{settings(session, opts)}\n/? 도움말 · /show 설정 보기 · /bye 끝내기[/]\n", highlight=False)
         while True:
             # the last reply goes into the context in its later form while the next message is typed

@@ -1,0 +1,17 @@
+{
+  "layer": 30,
+  "rate": 6,
+  "what": [
+    "scale",
+    "book",
+    "norms"
+  ],
+  "steps": 300,
+  "lr": 0.001,
+  "train_before": 0.012142629089892453,
+  "test_before": 0.012207504163027764,
+  "train_after": 0.01218608904479843,
+  "test_after": 0.012386591698919147,
+  "seconds": 682.7,
+  "peak_vram_gib": 11.37
+}

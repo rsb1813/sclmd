@@ -11,7 +11,7 @@ From scratch, in this order (Python runs from the parent project's environment, 
 
 | Step | Command | Takes |
 |---|---|---|
-| Checkpoints into `C:\models` (`SCLMD_MODELS` to change) | `python -m scripts.download` | 126 GB |
+| Checkpoints into `C:\models` (`SCLMD_MODELS` to change) | `python -m scripts.download orig drafter` (without names: Google's QAT checkpoints too, which nothing here needs any more) | 64 GB (126 GB) |
 | The token sets | `python -m scripts.build_sets` | |
 | The original's outputs over the evaluation set (the reference) | `python -m scripts.reference`, and again with `--quant fp32` | 2 min each |
 | Pair codes for every layer, at 3 and 4 bits | `python -m scripts.quantize` | 23 min, 28 GB |
