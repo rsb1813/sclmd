@@ -678,79 +678,79 @@
     {
       "task": "mmlu_pro",
       "runs": 1,
-      "items": 70,
+      "items": 280,
       "of": 12032,
-      "correct": 54,
-      "score": 77.1,
-      "low": 66.0,
-      "high": 85.4,
+      "correct": 232,
+      "score": 82.9,
+      "low": 78.0,
+      "high": 86.8,
       "card": 85.2,
-      "no_answer": 2,
+      "no_answer": 1,
       "cut": 1,
-      "looped": 1,
+      "looped": 0,
       "errors": 0,
-      "over_8k": 7,
-      "score_at_8k": 71.4,
-      "mean_tokens": 3681,
-      "mean_thinking": 3128,
-      "tok_s": 127.9,
-      "hours": 0.56,
+      "over_8k": 28,
+      "score_at_8k": 74.6,
+      "mean_tokens": 3511,
+      "mean_thinking": 2985,
+      "tok_s": 132.2,
+      "hours": 2.07,
       "by": {
         "biology": [
-          4,
-          5
+          18,
+          20
         ],
         "business": [
-          4,
-          5
+          16,
+          20
         ],
         "chemistry": [
-          3,
-          5
+          17,
+          20
         ],
         "computer science": [
-          3,
-          5
+          17,
+          20
         ],
         "economics": [
-          4,
-          5
+          17,
+          20
         ],
         "engineering": [
-          2,
-          5
+          17,
+          20
         ],
         "health": [
-          4,
-          5
+          14,
+          20
         ],
         "history": [
-          4,
-          5
+          14,
+          20
         ],
         "law": [
-          3,
-          5
+          14,
+          20
         ],
         "math": [
-          5,
-          5
+          20,
+          20
         ],
         "other": [
-          5,
-          5
+          16,
+          20
         ],
         "philosophy": [
-          4,
-          5
+          16,
+          20
         ],
         "physics": [
-          4,
-          5
+          17,
+          20
         ],
         "psychology": [
-          5,
-          5
+          19,
+          20
         ]
       }
     },
