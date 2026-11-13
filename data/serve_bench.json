@@ -1,0 +1,98 @@
+[
+  {
+    "first_turn": {
+      "clients": 1,
+      "tokens": 200,
+      "seconds": 1.84,
+      "tok_s": 108.7,
+      "tok_s_each": 108.7,
+      "first_token_s": 0.28,
+      "first_token_worst_s": 0.28,
+      "prompt_tokens": 28,
+      "prompt_kept": 0
+    },
+    "second_turn": {
+      "clients": 1,
+      "tokens": 200,
+      "seconds": 1.41,
+      "tok_s": 141.6,
+      "tok_s_each": 141.6,
+      "first_token_s": 0.15,
+      "first_token_worst_s": 0.15,
+      "prompt_tokens": 247,
+      "prompt_kept": 226
+    }
+  },
+  {
+    "first_turn": {
+      "clients": 2,
+      "tokens": 400,
+      "seconds": 2.86,
+      "tok_s": 139.8,
+      "tok_s_each": 69.9,
+      "first_token_s": 0.19,
+      "first_token_worst_s": 0.2,
+      "prompt_tokens": 57,
+      "prompt_kept": 0
+    },
+    "second_turn": {
+      "clients": 2,
+      "tokens": 400,
+      "seconds": 2.4,
+      "tok_s": 166.5,
+      "tok_s_each": 83.3,
+      "first_token_s": 0.1,
+      "first_token_worst_s": 0.17,
+      "prompt_tokens": 500,
+      "prompt_kept": 470
+    }
+  },
+  {
+    "first_turn": {
+      "clients": 4,
+      "tokens": 800,
+      "seconds": 3.92,
+      "tok_s": 204.2,
+      "tok_s_each": 51.1,
+      "first_token_s": 0.28,
+      "first_token_worst_s": 0.48,
+      "prompt_tokens": 148,
+      "prompt_kept": 24
+    },
+    "second_turn": {
+      "clients": 4,
+      "tokens": 800,
+      "seconds": 3.32,
+      "tok_s": 240.8,
+      "tok_s_each": 60.2,
+      "first_token_s": 0.13,
+      "first_token_worst_s": 0.22,
+      "prompt_tokens": 1031,
+      "prompt_kept": 979
+    }
+  },
+  {
+    "first_turn": {
+      "clients": 8,
+      "tokens": 1600,
+      "seconds": 6.72,
+      "tok_s": 238.1,
+      "tok_s_each": 29.8,
+      "first_token_s": 0.7,
+      "first_token_worst_s": 1.43,
+      "prompt_tokens": 275,
+      "prompt_kept": 49
+    },
+    "second_turn": {
+      "clients": 8,
+      "tokens": 1304,
+      "seconds": 9.31,
+      "tok_s": 140.0,
+      "tok_s_each": 17.5,
+      "first_token_s": 1.99,
+      "first_token_worst_s": 4.14,
+      "prompt_tokens": 2035,
+      "prompt_kept": 1443
+    }
+  }
+]

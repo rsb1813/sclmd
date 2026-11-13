@@ -17,12 +17,14 @@ class Job:
     scripts/serve.py); the batcher copies the sliding layers' keys to RAM before the reply would write over what
     that position needs."""
 
-    def __init__(self, seq: int, prompt: list, max_new: int, pick: Picker, stop: tuple = (), emit=None, start: int | None = None):
+    def __init__(self, seq: int, prompt: list, max_new: int, pick: Picker | None, stop: tuple = (), emit=None, start: int | None = None,
+                 only_read: bool = False):
         self.seq, self.todo, self.max_new, self.pick, self.stop, self.emit, self.start = seq, list(prompt), max_new, pick, tuple(stop), emit, start
+        self.only_read = only_read  # no reply: the job is over ("read") when its tokens are in, and takes only rows nothing else wants
         self.out = []  # the reply so far
         self.pending = None  # its last token: settled, not yet run
         self.hidden = None  # the main model's output at the position before `pending`
-        self.done = None  # None while it runs; then "stop", "length", "cancelled" or "full" (no memory left for it)
+        self.done = None  # None while it runs; then "stop", "length", "read", "cancelled" or "full" (no memory left for it)
         self.cancel = False  # set from outside: the text ends at the next pass
         self.snapped = False
         self.read = self.passes = self.rows = 0  # prompt tokens read here, passes it had rows in, rows it was given
@@ -43,6 +45,7 @@ class Batcher:
         self.eng, self.drafter, self.depth = eng, drafter, depth
         self.jobs = []
         self.turn = 0
+        self.make_room = None  # called when the pool of keys and values is empty: frees some and says so, or says no
         self.passes = self.rows = self.guess_rows = self.kept_rows = 0
 
     def add(self, job: Job):
@@ -55,17 +58,19 @@ class Batcher:
         eng = self.eng
         at = self.turn % len(live)
         order = live[at:] + live[:at]
-        writers, readers = [j for j in order if j.pending is not None], [j for j in order if j.pending is None]
+        writers = [j for j in order if j.pending is not None]
         rows, free = {}, E.MAX_TOKENS
         for j in writers[:free]:
             rows[j] = 1
             free -= 1
         room = {j: eng.capacity - eng.lengths[j.seq] for j in live}
-        while free and any(rows.get(j, 0) < min(len(j.todo), room[j]) for j in readers):
-            for j in readers:
-                if free and rows.get(j, 0) < min(len(j.todo), room[j]):
-                    rows[j] = rows.get(j, 0) + 1
-                    free -= 1
+        # prompts someone is waiting on, then the reading that is done ahead of need
+        for readers in ([j for j in order if j.pending is None and not j.only_read], [j for j in order if j.only_read]):
+            while free and any(rows.get(j, 0) < min(len(j.todo), room[j]) for j in readers):
+                for j in readers:
+                    if free and rows.get(j, 0) < min(len(j.todo), room[j]):
+                        rows[j] = rows.get(j, 0) + 1
+                        free -= 1
         if self.drafter is not None:
             able = lambda j: min(self.depth, j.max_new - len(j.out), room[j] - 1)  # noqa: E731
             while free and any(rows[j] - 1 < able(j) for j in writers if j in rows):
@@ -97,6 +102,8 @@ class Batcher:
                 eng._provide([(j.seq, eng.lengths[j.seq], rows[j]) for j in use])
                 break
             except E.KVFull:
+                if self.make_room is not None and self.make_room():
+                    continue
                 if len(use) == 1:  # nothing else holds what it lacks back: it cannot go on
                     use[0].done = "full"
                     self.jobs.remove(use[0])
@@ -131,7 +138,9 @@ class Batcher:
             at = eng.lengths[j.seq]  # after the pass: the position after the rows
             if j.pending is None:  # a prompt: when its last token is in, the reply's first token is chosen
                 j.todo, j.read = j.todo[n:], j.read + n
-                if not j.todo:
+                if not j.todo and j.only_read:
+                    j.done = "read"
+                elif not j.todo:
                     j.hidden = hn[-1].clone()
                     j._settle(j.pick(lg[-1], at))
                 continue
@@ -155,6 +164,13 @@ class Batcher:
                 j._settle(wants[kept])  # a guessed stop token is not kept above: it comes back here and ends the text
         self.jobs = [j for j in self.jobs if j.done is None]
         return True
+
+    def drop(self, job: Job):
+        """Takes a job out between passes (its sequence keeps what it has read)."""
+        if job.done is None:
+            job.done = "cancelled"
+        if job in self.jobs:
+            self.jobs.remove(job)
 
     def run(self):
         """Until every job is done."""
