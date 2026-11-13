@@ -9,56 +9,13 @@
   "kv_gib": 0.68,
   "runs": [
     {
-      "texts": 1,
-      "tokens": 200,
-      "seconds": 1.69,
-      "tok_s": 118.3,
-      "tok_s_each": 118.3,
-      "passes": 59,
-      "ms_a_pass": 28.7,
-      "rows_a_pass": 7.24,
-      "guesses_kept": 0.42,
-      "widths": {
-        "8": 58,
-        "16": 0,
-        "32": 1
-      },
-      "first_token_s": 0.04,
-      "ended": [
-        "length"
-      ],
-      "same_as_alone": true
-    },
-    {
-      "texts": 2,
-      "tokens": 400,
-      "seconds": 2.24,
-      "tok_s": 178.8,
-      "tok_s_each": 89.4,
-      "passes": 81,
-      "ms_a_pass": 27.6,
-      "rows_a_pass": 8.72,
-      "guesses_kept": 0.51,
-      "widths": {
-        "8": 71,
-        "16": 9,
-        "32": 1
-      },
-      "first_token_s": 0.11,
-      "ended": [
-        "length",
-        "length"
-      ],
-      "same_as_alone": true
-    },
-    {
       "texts": 4,
       "tokens": 800,
-      "seconds": 2.6,
-      "tok_s": 307.9,
-      "tok_s_each": 77.0,
+      "seconds": 2.5,
+      "tok_s": 319.7,
+      "tok_s_each": 79.9,
       "passes": 81,
-      "ms_a_pass": 32.1,
+      "ms_a_pass": 30.9,
       "rows_a_pass": 15.25,
       "guesses_kept": 0.65,
       "widths": {
@@ -66,7 +23,7 @@
         "16": 61,
         "32": 5
       },
-      "first_token_s": 0.19,
+      "first_token_s": 0.17,
       "ended": [
         "length",
         "length",
@@ -78,19 +35,19 @@
     {
       "texts": 8,
       "tokens": 1600,
-      "seconds": 4.48,
-      "tok_s": 357.3,
-      "tok_s_each": 44.7,
-      "passes": 140,
-      "ms_a_pass": 32.0,
-      "rows_a_pass": 16.39,
-      "guesses_kept": 0.78,
+      "seconds": 3.97,
+      "tok_s": 402.6,
+      "tok_s_each": 50.3,
+      "passes": 103,
+      "ms_a_pass": 38.6,
+      "rows_a_pass": 25.83,
+      "guesses_kept": 0.65,
       "widths": {
-        "8": 16,
-        "16": 109,
-        "32": 15
+        "8": 15,
+        "16": 14,
+        "32": 74
       },
-      "first_token_s": 0.35,
+      "first_token_s": 0.31,
       "ended": [
         "length",
         "length",
@@ -106,19 +63,19 @@
     {
       "texts": 16,
       "tokens": 3196,
-      "seconds": 11.01,
-      "tok_s": 290.4,
-      "tok_s_each": 18.1,
+      "seconds": 10.31,
+      "tok_s": 310.1,
+      "tok_s_each": 19.4,
       "passes": 295,
-      "ms_a_pass": 37.3,
-      "rows_a_pass": 19.74,
-      "guesses_kept": 0.65,
+      "ms_a_pass": 34.9,
+      "rows_a_pass": 19.98,
+      "guesses_kept": 0.64,
       "widths": {
-        "8": 71,
-        "16": 75,
-        "32": 149
+        "8": 85,
+        "16": 51,
+        "32": 159
       },
-      "first_token_s": 0.66,
+      "first_token_s": 0.58,
       "ended": [
         "length",
         "length",

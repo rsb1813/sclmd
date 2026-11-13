@@ -221,7 +221,7 @@ class Engine:
         z = lambda *shape, dtype=torch.float32: torch.zeros(*shape, dtype=dtype, device=device)  # noqa: E731
         # the kernels' work memory, by the names of the DLL's Model (what a pass leaves in them is the last layer's)
         self.work = dict(h=z(rows, cfg.hidden), hn=z(rows, cfg.hidden), logits=z(rows, cfg.vocab),
-                         h2=z(rows, cfg.hidden), fps=z(rows), xf=z(rows // 8, x_size // 16, 32, dtype=torch.int64),
+                         h2=z(rows, cfg.hidden), fps=z(3 * 32), xf=z(rows // 8, x_size // 16, 32, dtype=torch.int64),  # fps: scales, then prep_k's sums (3 * MAX_TOKENS)
                          y=z(rows, y_size), y2=z(rows, cfg.mlp), qhat=z(rows, widest_head, dtype=torch.float16),
                          attn=z(rows, widest_head), scores=z(scores), probs=z(scores, dtype=torch.float16))
         self.h, self.hn, self.logits = self.work["h"], self.work["hn"], self.work["logits"]

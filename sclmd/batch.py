@@ -12,8 +12,9 @@ from .generate import Picker
 
 
 # What a pass of up to 16, 24 or 32 rows costs next to one of up to 8 (scripts/pass_profile.py --rows 32 on the real
-# model at 3 bits a weight: 21.7 ms for 8 rows, 27.0 for 16, 38.3 for 24, 42.4 for 32)
-COST = ((8, 1.0), (16, 1.25), (24, 1.77), (32, 1.95))
+# model at 3 bits a weight: 21.7 ms for 8 rows, 26.6 for 16, 35.6 for 24, 37.8 for 32 at 64 positions; 24.4, 30.8,
+# 41.6, 45.2 at 2,048)
+COST = ((8, 1.0), (16, 1.25), (24, 1.67), (32, 1.80))
 
 
 def cost(rows: int) -> float:

@@ -21,6 +21,7 @@
 #define API extern "C" __declspec(dllexport)
 
 static const int MAX_TOKENS = 32;  // rows of a pass: up to four groups of the eight columns of the tensor-core instruction
+static const int TWO_PHASE = 9;    // rows from which a matrix's input is prepared in two kernels (prep_k)
 static const int MAX_SEGS = 32;    // segments of a pass: at most a sequence a row
 
 // The rows of a pass by sequence: segment i is rows row0[i] .. row0[i] + cnt[i] - 1 (the segments follow each other
@@ -169,38 +170,48 @@ __device__ __forceinline__ float gelu_tanh(float v) {
 //     input's length under 2^14, so that no value leaves fp16's range (fps[token]); then fp16 in the order the
 //     instruction reads: for tile j, lane 4 * (token % 8) + t of the token's group of eight in xf holds the values
 //     at columns 16j + 2t, + 1, + 8, + 9 (a group is the n / 16 tiles of the input).
-// Sums over the whole input are made by every block for itself: they are small next to the matrix that follows,
-// and a kernel less is worth more.
+// The sums over a token's whole input (the two norms and the length) are made by every block for itself when the
+// pass is narrow (phase 0: a kernel less is worth more than the sums cost). In a wide pass they are most of the
+// kernel's work, n / blockDim times over, so one block a token makes them first (phase 1, into sums[2 * token] and
+// fps[token]) and the blocks read them (phase 2). The three phases are this one kernel: the same instructions make
+// the sums and the values in each, so a row's result has the same bits whichever way its pass went.
 __global__ void prep_k(const float* a, const float* b, const float* w, const float* y, const float* post, float scalar, float* h_out,
-                       float* v_out, const float* signs, float* fps, uint64_t* xf, int n, float eps, int mode) {
+                       float* v_out, const float* signs, float* fps, uint64_t* xf, int n, float eps, int mode, int phase, float* sums) {
     __shared__ float buf[1024];
     const int bd = blockDim.x, token = blockIdx.y, i = threadIdx.x, col = blockIdx.x * bd + i;
     const size_t at = size_t(token) * n;
-    float ry = 0;
-    if (y) {
-        float ss = 0;
-        for (int j = i; j < n; j += bd) ss += y[at + j] * y[at + j];
-        ry = powf(block_sum(ss) / n + eps, -0.5f);
-    }
+    float ry = 0, r = 1.0f, fp = 1.0f;
 #define STREAM(j) (y ? (a[at + (j)] + y[at + (j)] * ry * post[j]) * scalar : a[at + (j)])
-    float r = 1.0f;
-    if (mode == 0) {
-        float ss = 0;
-        for (int j = i; j < n; j += bd) {
-            const float hv = STREAM(j);
-            ss += hv * hv;
-        }
-        r = powf(block_sum(ss) / n + eps, -0.5f);
-    }
 #define VALUE(j, hv) (mode == 0 ? (hv) * r * w[j] : mode == 1 ? (hv) : gelu_tanh(hv) * b[at + (j)])
-    float len = 0;
-    for (int j = i; j < n; j += bd) {
-        const float hv = STREAM(j), v = VALUE(j, hv);
-        len += v * v;
+    if (phase == 2) {
+        ry = sums[2 * token], r = sums[2 * token + 1], fp = fps[token];
+    } else {
+        if (y) {
+            float ss = 0;
+            for (int j = i; j < n; j += bd) ss += y[at + j] * y[at + j];
+            ry = powf(block_sum(ss) / n + eps, -0.5f);
+        }
+        if (mode == 0) {
+            float ss = 0;
+            for (int j = i; j < n; j += bd) {
+                const float hv = STREAM(j);
+                ss += hv * hv;
+            }
+            r = powf(block_sum(ss) / n + eps, -0.5f);
+        }
+        float len = 0;
+        for (int j = i; j < n; j += bd) {
+            const float hv = STREAM(j), v = VALUE(j, hv);
+            len += v * v;
+        }
+        len = sqrtf(block_sum(len));
+        fp = len > 16384.0f ? exp2f(ceilf(log2f(len / 16384.0f))) : 1.0f;
+        if (col == 0) fps[token] = fp;
+        if (phase == 1) {
+            if (i == 0) sums[2 * token] = ry, sums[2 * token + 1] = r;
+            return;
+        }
     }
-    len = sqrtf(block_sum(len));
-    const float fp = len > 16384.0f ? exp2f(ceilf(log2f(len / 16384.0f))) : 1.0f;
-    if (col == 0) fps[token] = fp;
     const float hv = STREAM(col), v = VALUE(col, hv);
 #undef STREAM
 #undef VALUE
@@ -477,9 +488,28 @@ struct Owed {
 };
 
 // The input of a matrix with n columns from a (and b, w: see prep_k), rotated, in m.xf with its scales in m.fps.
+// Rows from which prep_k goes in two phases (SCLMD_TWO_PHASE sets it for measurements; a number past MAX_TOKENS: never).
+static int two_phase_from() {
+    static const int from = getenv("SCLMD_TWO_PHASE") ? atoi(getenv("SCLMD_TWO_PHASE")) : TWO_PHASE;
+    return from;
+}
+
+// prep_k for `rows` rows; the sums of the two-phase way go after the rows' scales in fps (which holds 3 * MAX_TOKENS).
+static void launch_prep(int rows, const float* a, const float* b, const float* w, int n, const Rot& rot, int mode, const Owed& owed,
+                        float* h_out, float* v_out, float* fps, uint64_t* xf, float eps) {
+    const dim3 grid(n / rot.block, rows);
+    float* sums = fps + MAX_TOKENS;
+    if (rows >= two_phase_from() && grid.x > 1) {
+        prep_k<<<dim3(1, rows), rot.block>>>(a, b, w, owed.y, owed.post, owed.scalar, h_out, v_out, rot.signs, fps, xf, n, eps, mode, 1, sums);
+        prep_k<<<grid, rot.block>>>(a, b, w, owed.y, owed.post, owed.scalar, h_out, v_out, rot.signs, fps, xf, n, eps, mode, 2, sums);
+    } else {
+        prep_k<<<grid, rot.block>>>(a, b, w, owed.y, owed.post, owed.scalar, h_out, v_out, rot.signs, fps, xf, n, eps, mode, 0, sums);
+    }
+}
+
 static void prep(const Model& m, const float* a, const float* b, const float* w, int n, const Rot& rot, int mode, int tokens,
                  const Owed& owed = Owed{}, float* h_out = nullptr, float* v_out = nullptr) {
-    prep_k<<<dim3(n / rot.block, tokens), rot.block>>>(a, b, w, owed.y, owed.post, owed.scalar, h_out, v_out, rot.signs, m.fps, m.xf, n, m.eps, mode);
+    launch_prep(tokens, a, b, w, n, rot, mode, owed, h_out, v_out, m.fps, m.xf, m.eps);
 }
 
 // What a layer's attention kernels are told of a pass's segments. A row reads the positions up to its own (the
@@ -629,7 +659,7 @@ struct Drafter {
 // The input of one of the drafter's matrices with n columns from a (and b, w: see prep_k), in d.xf with its scales in d.fps.
 static void prep(const Drafter& d, int rows, const float* a, const float* b, const float* w, int n, const Rot& rot, int mode,
                  const Owed& owed = Owed{}, float* h_out = nullptr, float* v_out = nullptr) {
-    prep_k<<<dim3(n / rot.block, rows), rot.block>>>(a, b, w, owed.y, owed.post, owed.scalar, h_out, v_out, rot.signs, d.fps, d.xf, n, d.eps, mode);
+    launch_prep(rows, a, b, w, n, rot, mode, owed, h_out, v_out, d.fps, d.xf, d.eps);
 }
 
 // One guess for each of `rows` sequences (row r: sequence seqs[r]): d.in[r] holds the embedding of the token at
