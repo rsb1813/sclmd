@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <utility>
 
 #define API extern "C" __declspec(dllexport)
 
@@ -55,7 +56,7 @@ struct Model {
     const float* norm;  // the final norm [hidden]
     // work memory
     float* h;        // [8][hidden] the residual stream of the tokens of this pass (in: the embeddings; out: the last layer's output)
-    float* x;        // [8][widest input] a matrix's input before the rotation
+    float* h2;       // [8][hidden] where the residual stream's next step is written (the two take turns)
     float* fps;      // [8] the power of two an input was divided by to fit fp16
     uint64_t* xf;    // [widest input / 16][32] a matrix's input as the instruction reads it
     float* y;        // [8][widest output] a matrix's output
@@ -101,67 +102,91 @@ __device__ __forceinline__ float gelu_tanh(float v) {
     return 0.5f * v * (1.0f + tanhf(0.7978845608028654f * (v + 0.044715f * v * v * v)));
 }
 
-// A matrix's input, one block a token: mode 0: the RMS norm of a[token] times w; 1: a[token] as it is; 2: gelu(a) * b.
-// -> x[token][n], and fps[token]: the power of two that brings the input's length under 2^14, so that no value of
-// it, rotated or not, leaves fp16's range.
-__global__ void input_k(const float* a, const float* b, const float* w, float* x, float* fps, int n, float eps, int mode) {
-    const int token = blockIdx.x;
-    const float* at = a + size_t(token) * n;
+// The input of a matrix with n columns, in one kernel: block (run of blockDim values, token), where blockDim is the
+// rotation's block, or without a rotation (signs null) a power of two that divides n. Three steps:
+//  1. the residual step still owed, if any: with y, h = (a + RMS norm of y times post) * scalar, and the block
+//     writes its own run of h to h_out (which is not a). Without y, h = a.
+//  2. the value: mode 0: RMS norm of h times w; 1: h as it is; 2: gelu(h) * b. Written to v_out if given.
+//  3. signs and the Hadamard transform over the run (with a rotation), over the power of two that brings the whole
+//     input's length under 2^14, so that no value leaves fp16's range (fps[token]); then fp16 in the order the
+//     instruction reads: for tile j, lane 4 * token + t of xf holds the values at columns 16j + 2t, + 1, + 8, + 9.
+// Sums over the whole input are made by every block for itself: they are small next to the matrix that follows,
+// and a kernel less is worth more.
+__global__ void prep_k(const float* a, const float* b, const float* w, const float* y, const float* post, float scalar, float* h_out,
+                       float* v_out, const float* signs, float* fps, uint64_t* xf, int n, float eps, int mode) {
+    __shared__ float buf[1024];
+    const int bd = blockDim.x, token = blockIdx.y, i = threadIdx.x, col = blockIdx.x * bd + i;
+    const size_t at = size_t(token) * n;
+    float ry = 0;
+    if (y) {
+        float ss = 0;
+        for (int j = i; j < n; j += bd) ss += y[at + j] * y[at + j];
+        ry = powf(block_sum(ss) / n + eps, -0.5f);
+    }
+#define STREAM(j) (y ? (a[at + (j)] + y[at + (j)] * ry * post[j]) * scalar : a[at + (j)])
     float r = 1.0f;
     if (mode == 0) {
         float ss = 0;
-        for (int i = threadIdx.x; i < n; i += blockDim.x) ss += at[i] * at[i];
+        for (int j = i; j < n; j += bd) {
+            const float hv = STREAM(j);
+            ss += hv * hv;
+        }
         r = powf(block_sum(ss) / n + eps, -0.5f);
     }
+#define VALUE(j, hv) (mode == 0 ? (hv) * r * w[j] : mode == 1 ? (hv) : gelu_tanh(hv) * b[at + (j)])
     float len = 0;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        float v = mode == 0 ? at[i] * r * w[i] : mode == 1 ? at[i] : gelu_tanh(at[i]) * b[size_t(token) * n + i];
-        x[size_t(token) * n + i] = v;
+    for (int j = i; j < n; j += bd) {
+        const float hv = STREAM(j), v = VALUE(j, hv);
         len += v * v;
     }
     len = sqrtf(block_sum(len));
-    if (threadIdx.x == 0) fps[token] = len > 16384.0f ? exp2f(ceilf(log2f(len / 16384.0f))) : 1.0f;
-}
-
-// x[token][n] rotated and laid out for the instruction: block (m, token) takes the token's m-th run of `block` values
-// (block threads, a power of two from 16 to 1024): signs, Hadamard transform, 1 / sqrt(block), over fps[token], fp16.
-// For tile j, lane 4 * token + t of xf holds the values at columns 16j + 2t, + 1, + 8, + 9.
-__global__ void rotate_k(const float* x, const float* signs, const float* fps, uint64_t* xf, int n) {
-    __shared__ float buf[1024];
-    const int b = blockDim.x, m = blockIdx.x, token = blockIdx.y, i = threadIdx.x, col = m * b + i;
-    buf[i] = x[size_t(token) * n + col] * signs[col];
+    const float fp = len > 16384.0f ? exp2f(ceilf(log2f(len / 16384.0f))) : 1.0f;
+    if (col == 0) fps[token] = fp;
+    const float hv = STREAM(col), v = VALUE(col, hv);
+#undef STREAM
+#undef VALUE
+    if (y) h_out[at + col] = hv;
+    if (v_out) v_out[at + col] = v;
+    buf[i] = signs ? v * signs[col] : v;
     __syncthreads();
-    for (int h = 1; h < b; h <<= 1) {
-        const float lo = buf[i & ~h], hi = buf[i | h];
-        __syncthreads();
-        buf[i] = (i & h) ? lo - hi : lo + hi;
-        __syncthreads();
-    }
-    const float k = rsqrtf(float(b)) / fps[token];
+    if (signs)
+        for (int h = 1; h < bd; h <<= 1) {
+            const float lo = buf[i & ~h], hi = buf[i | h];
+            __syncthreads();
+            buf[i] = (i & h) ? lo - hi : lo + hi;
+            __syncthreads();
+        }
+    const float k = (signs ? rsqrtf(float(bd)) : 1.0f) / fp;
     if ((i & 9) == 0) {  // i % 16 in {0, 2, 4, 6}: the first column of a lane's word
         const int t = (i & 15) >> 1;
-        const uint64_t w = uint64_t(__half_as_ushort(__float2half(buf[i] * k))) | uint64_t(__half_as_ushort(__float2half(buf[i + 1] * k))) << 16 |
-                           uint64_t(__half_as_ushort(__float2half(buf[i + 8] * k))) << 32 |
-                           uint64_t(__half_as_ushort(__float2half(buf[i + 9] * k))) << 48;
-        xf[size_t(col >> 4) * 32 + 4 * token + t] = w;
+        const uint64_t word = uint64_t(__half_as_ushort(__float2half(buf[i] * k))) | uint64_t(__half_as_ushort(__float2half(buf[i + 1] * k))) << 16 |
+                              uint64_t(__half_as_ushort(__float2half(buf[i + 8] * k))) << 32 |
+                              uint64_t(__half_as_ushort(__float2half(buf[i + 9] * k))) << 48;
+        xf[size_t(col >> 4) * 32 + 4 * token + t] = word;
     }
 }
 
 // y[token][row] = scale[row] * fps[token] * sum over columns of W[row][col] * x[token][col], one block a strip of 16
-// rows, its `segs` warps splitting the strip's tiles (a multiple of 4 each) between them.
-template <int BITS>
-__global__ void gemm_k(const uint32_t* codes, const uint32_t* lut, const float* scale, const uint64_t* xf, const float* fps, float* y,
-                       int rows, int cols, int segs, int tokens) {
-    __shared__ uint32_t slut[1 << BITS];
+// rows, its `segs` warps splitting the strip's tiles (a multiple of 4 each) between them. Up to three matrices that
+// share the input go in one launch: the blocks are the first one's strips, then the second's, then the third's.
+__global__ void gemm_k(Mat m0, Mat m1, Mat m2, float* y0, float* y1, float* y2, const uint64_t* xf, const float* fps, int segs, int tokens) {
+    __shared__ uint32_t slut[256];
     __shared__ float part[8][32][4];
-    for (int i = threadIdx.x; i < (1 << BITS); i += blockDim.x) slut[i] = lut[i];
+    int strip = blockIdx.x;
+    Mat m = m0;
+    float* y = y0;
+    if (strip >= m0.rows / 16) {
+        strip -= m0.rows / 16, m = m1, y = y1;
+        if (strip >= m1.rows / 16) strip -= m1.rows / 16, m = m2, y = y2;
+    }
+    for (int i = threadIdx.x; i < (1 << m.bits); i += blockDim.x) slut[i] = m.lut[i];
     __syncthreads();
-    const int strip = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int tiles = cols / 16, per = tiles / segs, first = warp * per;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int tiles = m.cols / 16, per = tiles / segs, first = warp * per;
     float c[4] = {0, 0, 0, 0};
     const uint64_t* xw = xf + size_t(first) * 32 + lane;
-    if (BITS == 8) {
-        const uint32_t* cw = codes + (size_t(strip) * tiles + first) * 32 + lane;
+    if (m.bits == 8) {
+        const uint32_t* cw = m.codes + (size_t(strip) * tiles + first) * 32 + lane;
         for (int j = 0; j < per; j += 4) {
             uint32_t w[4];
             uint64_t b[4];
@@ -170,7 +195,7 @@ __global__ void gemm_k(const uint32_t* codes, const uint32_t* lut, const float* 
                 mma(c, slut[w[i] & 255], slut[w[i] >> 8 & 255], slut[w[i] >> 16 & 255], slut[w[i] >> 24], uint32_t(b[i]), uint32_t(b[i] >> 32));
         }
     } else {  // 6 bits a pair: four tiles of a lane are 16 codes in 96 bits, stored as three words
-        const uint32_t* cw = codes + (size_t(strip) * (tiles / 4) + first / 4) * 96 + lane;
+        const uint32_t* cw = m.codes + (size_t(strip) * (tiles / 4) + first / 4) * 96 + lane;
         for (int j = 0; j < per; j += 4) {
             const uint32_t* q = cw + size_t(j / 4) * 96;
             const uint64_t lo = uint64_t(q[0]) | uint64_t(q[32]) << 32, hi = q[64];
@@ -190,19 +215,8 @@ __global__ void gemm_k(const uint32_t* codes, const uint32_t* lut, const float* 
         float sum = 0;
         for (int w = 0; w < segs; ++w) sum += part[w][lane][i];
         const int row = strip * 16 + (lane >> 2) + (i >= 2 ? 8 : 0), token = 2 * (lane & 3) + (i & 1);
-        if (token < tokens) y[size_t(token) * rows + row] = scale[row] * fps[token] * sum;
+        if (token < tokens) y[size_t(token) * m.rows + row] = m.scale[row] * fps[token] * sum;
     }
-}
-
-// h[token] = (h[token] + RMS norm of y[token] times w) * scalar, one block a token.
-__global__ void residual_k(float* h, const float* y, const float* w, int n, float eps, float scalar) {
-    const int token = blockIdx.x;
-    const float* yt = y + size_t(token) * n;
-    float* ht = h + size_t(token) * n;
-    float ss = 0;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) ss += yt[i] * yt[i];
-    const float r = powf(block_sum(ss) / n + eps, -0.5f);
-    for (int i = threadIdx.x; i < n; i += blockDim.x) ht[i] = (ht[i] + yt[i] * r * w[i]) * scalar;
 }
 
 // What attention does to the projections' outputs, block (vector, token) with head_dim threads. Vector v of a token is
@@ -329,23 +343,28 @@ static int segs_for(int cols) {
     return 1;
 }
 
-static void gemm(const Mat& m, const uint64_t* xf, const float* fps, float* y, int tokens) {
-    const int segs = segs_for(m.cols);
-    if (m.bits == 8)
-        gemm_k<8><<<m.rows / 16, 32 * segs>>>(m.codes, m.lut, m.scale, xf, fps, y, m.rows, m.cols, segs, tokens);
-    else
-        gemm_k<6><<<m.rows / 16, 32 * segs>>>(m.codes, m.lut, m.scale, xf, fps, y, m.rows, m.cols, segs, tokens);
+// One launch for a matrix, or for up to three that share the input in xf (b and c may have no rows).
+static void gemm(const uint64_t* xf, const float* fps, int tokens, const Mat& a, float* ya, const Mat& b = Mat{}, float* yb = nullptr,
+                 const Mat& c = Mat{}, float* yc = nullptr) {
+    const int segs = segs_for(a.cols);
+    gemm_k<<<(a.rows + b.rows + c.rows) / 16, 32 * segs>>>(a, b, c, ya, yb, yc, xf, fps, segs, tokens);
 }
 
-// a (and b, w: see input_k) -> the rotated input of a matrix with n columns, in m.xf with its scales in m.fps.
-static void input(const Model& m, const float* a, const float* b, const float* w, int n, const Rot& rot, int mode, int tokens) {
-    input_k<<<tokens, 1024>>>(a, b, w, m.x, m.fps, n, m.eps, mode);
-    rotate_k<<<dim3(n / rot.block, tokens), rot.block>>>(m.x, rot.signs, m.fps, m.xf, n);
+// What prep_k is told of the residual step still owed: the matrix output it adds, the norm's weight and the layer's scalar.
+struct Owed {
+    const float *y = nullptr, *post = nullptr;
+    float scalar = 1.0f;
+};
+
+// The input of a matrix with n columns from a (and b, w: see prep_k), rotated, in m.xf with its scales in m.fps.
+static void prep(const Model& m, const float* a, const float* b, const float* w, int n, const Rot& rot, int mode, int tokens,
+                 const Owed& owed = Owed{}, float* h_out = nullptr, float* v_out = nullptr) {
+    prep_k<<<dim3(n / rot.block, tokens), rot.block>>>(a, b, w, owed.y, owed.post, owed.scalar, h_out, v_out, rot.signs, m.fps, m.xf, n, m.eps, mode);
 }
 
 // Where a pass's time goes (sclmd_profile): with a table set, the pass waits for the GPU after every launch and adds
 // the time to the launch's kind. The waits make the pass slower as a whole; the shares are what is looked at.
-enum { P_INPUT, P_QKV, P_HEADS, P_SCORES, P_SOFTMAX, P_ATTEND, P_O, P_RESIDUAL, P_GATE_UP, P_DOWN, P_HEAD, P_KINDS };
+enum { P_INPUT, P_QKV, P_HEADS, P_SCORES, P_SOFTMAX, P_ATTEND, P_O, P_GATE_UP, P_DOWN, P_HEAD, P_KINDS };
 static double* g_prof = nullptr;
 static std::chrono::steady_clock::time_point g_prof_t;
 
@@ -367,27 +386,30 @@ API int sclmd_profile(double* times) {
 
 // One matrix times a given input (tests): x[tokens][cols] -> y[tokens][rows], with the model's work memory.
 API int sclmd_linear(const Model* m, const Mat* mat, const Rot* rot, const float* x, float* y, int tokens) {
-    input(*m, x, nullptr, nullptr, mat->cols, *rot, 1, tokens);
-    gemm(*mat, m->xf, m->fps, y, tokens);
+    prep(*m, x, nullptr, nullptr, mat->cols, *rot, 1, tokens);
+    gemm(m->xf, m->fps, tokens, *mat, y);
     return int(cudaGetLastError());
 }
 
 // The pass: m.h holds the scaled embeddings of `tokens` tokens at positions pos0.. ; afterwards it holds the last
 // layer's output, m.hn that output after the final norm, m.logits the logits, and every layer's keys and values have
 // the new positions. Launches only; nothing waits.
+// A layer's two residual steps are not kernels of their own: each is taken by the kernel that prepares the next
+// matrix input from the residual stream, which writes the stream's next state to the other of m.h and m.h2.
 API int sclmd_pass(const Model* mp, int tokens, int pos0) {
     const Model& m = *mp;
     const int n = m.hidden;
+    float *h = m.h, *spare = m.h2;
+    Owed owed;
     for (int i = 0; i < m.n_layers; ++i) {
         const Layer& l = m.layers[i];
         const int hd = l.head_dim, kvh = l.kv_heads, nqo = m.heads * hd, nkv = kvh * hd;
         // attention
-        input(m, m.h, nullptr, l.in_ln, n, l.rot_in, 0, tokens);
+        prep(m, h, nullptr, l.in_ln, n, l.rot_in, 0, tokens, owed, spare);
+        if (owed.y) std::swap(h, spare);
         tick(P_INPUT);
         float *yq = m.y, *yk = m.y + size_t(MAX_TOKENS) * nqo, *yv = yk + size_t(MAX_TOKENS) * nkv;
-        gemm(l.q, m.xf, m.fps, yq, tokens);
-        gemm(l.k, m.xf, m.fps, yk, tokens);
-        if (l.v.rows) gemm(l.v, m.xf, m.fps, yv, tokens);
+        gemm(m.xf, m.fps, tokens, l.q, yq, l.k, yk, l.v, yv);  // a full-attention layer's v has no rows
         tick(P_QKV);
         heads_k<<<dim3(m.heads + 2 * kvh, tokens), hd>>>(yq, yk, l.v.rows ? yv : nullptr, l.q_norm, l.k_norm, l.inv_freq, m.qhat, l.keys,
                                                        l.values, m.heads, kvh, pos0, l.slots, m.eps);
@@ -401,28 +423,26 @@ API int sclmd_pass(const Model* mp, int tokens, int pos0) {
         tick(P_SOFTMAX);
         attend_k<<<dim3(hd / 16, kvh), 32 * groups>>>(m.probs, l.values, m.attn, m.heads, kvh, hd, tokens, base, stride, l.slots);
         tick(P_ATTEND);
-        input(m, m.attn, nullptr, nullptr, nqo, l.rot_o, 1, tokens);
+        prep(m, m.attn, nullptr, nullptr, nqo, l.rot_o, 1, tokens);
         tick(P_INPUT);
-        gemm(l.o, m.xf, m.fps, m.y, tokens);
+        gemm(m.xf, m.fps, tokens, l.o, m.y);
         tick(P_O);
-        residual_k<<<tokens, 1024>>>(m.h, m.y, l.post_attn_ln, n, m.eps, 1.0f);
-        tick(P_RESIDUAL);
+        owed = Owed{m.y, l.post_attn_ln, 1.0f};
         // feed-forward
-        input(m, m.h, nullptr, l.pre_ff_ln, n, l.rot_mlp, 0, tokens);
+        prep(m, h, nullptr, l.pre_ff_ln, n, l.rot_mlp, 0, tokens, owed, spare);
+        std::swap(h, spare);
         tick(P_INPUT);
-        gemm(l.gate, m.xf, m.fps, m.y, tokens);
-        gemm(l.up, m.xf, m.fps, m.y2, tokens);
+        gemm(m.xf, m.fps, tokens, l.gate, m.y, l.up, m.y2);
         tick(P_GATE_UP);
-        input(m, m.y, m.y2, nullptr, m.mlp, l.rot_down, 2, tokens);
+        prep(m, m.y, m.y2, nullptr, m.mlp, l.rot_down, 2, tokens);
         tick(P_INPUT);
-        gemm(l.down, m.xf, m.fps, m.y, tokens);
+        gemm(m.xf, m.fps, tokens, l.down, m.y);
         tick(P_DOWN);
-        residual_k<<<tokens, 1024>>>(m.h, m.y, l.post_ff_ln, n, m.eps, l.scalar);
-        tick(P_RESIDUAL);
+        owed = Owed{m.y, l.post_ff_ln, l.scalar};
     }
-    input_k<<<tokens, 1024>>>(m.h, nullptr, m.norm, m.hn, m.fps, n, m.eps, 0);
-    rotate_k<<<dim3(n / m.rot_head.block, tokens), m.rot_head.block>>>(m.hn, m.rot_head.signs, m.fps, m.xf, n);
-    gemm(m.head, m.xf, m.fps, m.logits, tokens);
+    // the last residual step, the final norm (kept in m.hn) and the head. Two steps a layer: the stream ends in m.h
+    prep(m, h, nullptr, m.norm, n, m.rot_head, 0, tokens, owed, spare, m.hn);
+    gemm(m.xf, m.fps, tokens, m.head, m.logits);
     if (m.softcap > 0) {
         const size_t count = size_t(tokens) * m.vocab;
         softcap_k<<<unsigned((count + 1023) / 1024), 1024>>>(m.logits, count, m.softcap);
@@ -460,7 +480,8 @@ struct Drafter {
     float* hn;      // [hidden] after the final norm
     float* logits;  // [vocab]
     float* next;    // [backbone] the hidden state for the guess after this one
-    float *x, *fps; // the rest as in Model (it may be the main model's own work memory)
+    float* h2;      // [hidden] the residual stream's other state (see sclmd_pass)
+    float* fps;     // the rest as in Model (it may be the main model's own work memory)
     uint64_t* xf;
     float *y, *y2;
     uint16_t* qhat;
@@ -468,18 +489,6 @@ struct Drafter {
     uint16_t* probs;
     float* attn;
 };
-
-// x[token][n] over fps[token] as the instruction reads it, without a rotation: for tile j, lane 4 * token + t of xf
-// holds the values at columns 16j + 2t, + 1, + 8, + 9. A thread a (tile, t).
-__global__ void plain_k(const float* x, const float* fps, uint64_t* xf, int n) {
-    const int token = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x, tile = i >> 2, t = i & 3;
-    if (16 * tile >= n) return;
-    const float* p = x + size_t(token) * n + 16 * tile + 2 * t;
-    const float k = 1.0f / fps[token];
-    xf[size_t(tile) * 32 + 4 * token + t] = uint64_t(__half_as_ushort(__float2half(p[0] * k))) | uint64_t(__half_as_ushort(__float2half(p[1] * k))) << 16 |
-                                              uint64_t(__half_as_ushort(__float2half(p[8] * k))) << 32 |
-                                              uint64_t(__half_as_ushort(__float2half(p[9] * k))) << 48;
-}
 
 // y[token][row] = fps[token] * sum over columns of W[row][col] * x[token][col] for fp16 weights: one block a strip of
 // 16 rows, its `segs` warps splitting the strip's tiles between them.
@@ -513,10 +522,12 @@ static void dense(const Dense& m, const uint64_t* xf, const float* fps, float* y
     dense_k<<<m.rows / 16, 32 * segs>>>(m.w, xf, fps, y, m.rows, m.cols, segs, tokens);
 }
 
-// a (and b, w: see input_k) -> the input of one of the drafter's matrices with n columns, in d.xf with its scale in d.fps.
-static void dense_input(const Drafter& d, const float* a, const float* b, const float* w, int n, int mode) {
-    input_k<<<1, 1024>>>(a, b, w, d.x, d.fps, n, d.eps, mode);
-    plain_k<<<dim3((n / 4 + 255) / 256, 1), 256>>>(d.x, d.fps, d.xf, n);
+// The input of one of the drafter's matrices with n columns from a (and b, w: see prep_k), in d.xf with its scale in d.fps.
+static void dense_prep(const Drafter& d, const float* a, const float* b, const float* w, int n, int mode, const Owed& owed = Owed{},
+                       float* h_out = nullptr, float* v_out = nullptr) {
+    int block = 1024;
+    while (n % block) block >>= 1;
+    prep_k<<<dim3(n / block, 1), block>>>(a, b, w, owed.y, owed.post, owed.scalar, h_out, v_out, nullptr, d.fps, d.xf, n, d.eps, mode);
 }
 
 // One guess: d.in holds the embedding of the token at position `length` and a hidden state; the main model has run
@@ -526,14 +537,17 @@ static void dense_input(const Drafter& d, const float* a, const float* b, const 
 API int sclmd_draft(const Drafter* dp, const Layer* sliding, const Layer* full, int window, int length) {
     const Drafter& d = *dp;
     const int n = d.hidden, last = length - 1;
-    dense_input(d, d.in, nullptr, nullptr, 2 * d.backbone, 1);
+    dense_prep(d, d.in, nullptr, nullptr, 2 * d.backbone, 1);
     dense(d.pre, d.xf, d.fps, d.h, 1);
+    float *h = d.h, *spare = d.h2;
+    Owed owed;
     for (int i = 0; i < d.n_layers; ++i) {
         const DLayer& l = d.layers[i];
         const Layer& src = l.full ? *full : *sliding;
         const int hd = l.head_dim, kvh = l.kv_heads;
         // attention: the query sits at position `length` and reads the main model's keys up to length - 1
-        dense_input(d, d.h, nullptr, l.in_ln, n, 0);
+        dense_prep(d, h, nullptr, l.in_ln, n, 0, owed, spare);
+        if (owed.y) std::swap(h, spare);
         dense(l.q, d.xf, d.fps, d.y, 1);
         heads_k<<<dim3(d.heads, 1), hd>>>(d.y, nullptr, nullptr, l.q_norm, nullptr, l.inv_freq, d.qhat, nullptr, nullptr, d.heads, kvh, length, 1, d.eps);
         const int lo = l.full ? 0 : (last - window > 0 ? last - window : 0);
@@ -542,19 +556,19 @@ API int sclmd_draft(const Drafter* dp, const Layer* sliding, const Layer* full, 
         scores_k<<<dim3(stride / 16, kvh), 32 * groups>>>(d.qhat, src.keys, d.scores, d.heads, kvh, hd, 1, base, stride, src.slots);
         softmax_k<<<dim3(nq, kvh), 256>>>(d.scores, d.probs, d.heads, kvh, 1, last, base, stride, l.full ? 0 : window + 1);
         attend_k<<<dim3(hd / 16, kvh), 32 * groups>>>(d.probs, src.values, d.attn, d.heads, kvh, hd, 1, base, stride, src.slots);
-        dense_input(d, d.attn, nullptr, nullptr, d.heads * hd, 1);
+        dense_prep(d, d.attn, nullptr, nullptr, d.heads * hd, 1);
         dense(l.o, d.xf, d.fps, d.y, 1);
-        residual_k<<<1, 1024>>>(d.h, d.y, l.post_attn_ln, n, d.eps, 1.0f);
+        owed = Owed{d.y, l.post_attn_ln, 1.0f};
         // feed-forward
-        dense_input(d, d.h, nullptr, l.pre_ff_ln, n, 0);
+        dense_prep(d, h, nullptr, l.pre_ff_ln, n, 0, owed, spare);
+        std::swap(h, spare);
         dense(l.gate, d.xf, d.fps, d.y, 1);
         dense(l.up, d.xf, d.fps, d.y2, 1);
-        dense_input(d, d.y, d.y2, nullptr, d.mlp, 2);
+        dense_prep(d, d.y, d.y2, nullptr, d.mlp, 2);
         dense(l.down, d.xf, d.fps, d.y, 1);
-        residual_k<<<1, 1024>>>(d.h, d.y, l.post_ff_ln, n, d.eps, l.scalar);
+        owed = Owed{d.y, l.post_ff_ln, l.scalar};
     }
-    input_k<<<1, 1024>>>(d.h, nullptr, d.norm, d.hn, d.fps, n, d.eps, 0);
-    plain_k<<<dim3((n / 4 + 255) / 256, 1), 256>>>(d.hn, d.fps, d.xf, n);
+    dense_prep(d, h, nullptr, d.norm, n, 0, owed, spare, d.hn);
     dense(d.head, d.xf, d.fps, d.logits, 1);
     dense(d.post, d.xf, d.fps, d.next, 1);
     return int(cudaGetLastError());

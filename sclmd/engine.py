@@ -32,7 +32,7 @@ class Layer(C.Structure):
 class Model(C.Structure):
     _fields_ = ([("layers", C.c_void_p)] + [(n, C.c_int) for n in ("n_layers", "hidden", "mlp", "heads", "window", "vocab")] +
                 [("eps", C.c_float), ("softcap", C.c_float), ("head", Mat), ("rot_head", Rot), ("norm", C.c_void_p)] +
-                [(p, C.c_void_p) for p in ("h", "x", "fps", "xf", "y", "y2", "qhat", "scores", "probs", "attn", "hn", "logits")])
+                [(p, C.c_void_p) for p in ("h", "h2", "fps", "xf", "y", "y2", "qhat", "scores", "probs", "attn", "hn", "logits")])
 
 
 _lib = None
@@ -144,7 +144,7 @@ class Engine:
         z = lambda *shape, dtype=torch.float32: torch.zeros(*shape, dtype=dtype, device=device)  # noqa: E731
         # the kernels' work memory, by the names of the DLL's Model (what a pass leaves in them is the last layer's)
         self.work = dict(h=z(MAX_TOKENS, cfg.hidden), hn=z(MAX_TOKENS, cfg.hidden), logits=z(MAX_TOKENS, cfg.vocab),
-                         x=z(MAX_TOKENS, x_size), fps=z(MAX_TOKENS), xf=z(x_size // 16, 32, dtype=torch.int64),
+                         h2=z(MAX_TOKENS, cfg.hidden), fps=z(MAX_TOKENS), xf=z(x_size // 16, 32, dtype=torch.int64),
                          y=z(MAX_TOKENS, y_size), y2=z(MAX_TOKENS, cfg.mlp), qhat=z(MAX_TOKENS, widest_head, dtype=torch.float16),
                          attn=z(MAX_TOKENS, widest_head), scores=z(scores), probs=z(scores, dtype=torch.float16))
         self.h, self.hn, self.logits = self.work["h"], self.work["hn"], self.work["logits"]
@@ -296,7 +296,7 @@ class DLayer(C.Structure):
 class DrafterC(C.Structure):
     _fields_ = ([("layers", C.c_void_p)] + [(n, C.c_int) for n in ("n_layers", "hidden", "mlp", "heads", "vocab", "backbone")] +
                 [("eps", C.c_float), ("pad", C.c_int), ("pre", Dense), ("post", Dense), ("head", Dense), ("norm", C.c_void_p)] +
-                [(p, C.c_void_p) for p in ("inp", "h", "hn", "logits", "next", "x", "fps", "xf", "y", "y2", "qhat", "scores", "probs", "attn")])
+                [(p, C.c_void_p) for p in ("inp", "h", "hn", "logits", "next", "h2", "fps", "xf", "y", "y2", "qhat", "scores", "probs", "attn")])
 
 
 def pack_dense(w: torch.Tensor, device: str = "cuda", rows_at_once: int = 4096) -> torch.Tensor:
@@ -342,18 +342,19 @@ class EngineDrafter:
             cl.scalar, cl.full, cl.head_dim, cl.kv_heads = float(lay["scalar"]), int(t == M.FULL), hd, cfg.kv_heads[t]
         z = lambda *shape: self._own(torch.zeros(*shape, dtype=torch.float32, device=dev))  # noqa: E731
         self.inp, self.h, self.hn, self.logits, self.next = z(2 * main.hidden), z(cfg.hidden), z(cfg.hidden), z(cfg.vocab), z(main.hidden)
+        self.h2 = z(cfg.hidden)
         c = self.c = DrafterC()
         c.layers = C.cast(self.c_layers, C.c_void_p)
         c.n_layers, c.hidden, c.mlp, c.heads, c.vocab, c.backbone = cfg.n_layers, cfg.hidden, cfg.mlp, cfg.heads, cfg.vocab, main.hidden
         c.eps = cfg.eps
         c.pre, c.post, c.head, c.norm = self._dense(pre), self._dense(post), self._dense(head), f32(norm).data_ptr()
-        for name in ("inp", "h", "hn", "logits", "next"):
+        for name in ("inp", "h", "hn", "logits", "next", "h2"):
             setattr(c, name, getattr(self, name).data_ptr())
         work = eng.work  # wide enough for the main model's matrices: checked here for the drafter's
         widest = max(2 * main.hidden, cfg.mlp, cfg.heads * max(cfg.head_dim.values()))
-        assert work["x"].shape[1] >= widest and work["y"].shape[1] >= widest and work["y2"].shape[1] >= cfg.mlp
+        assert work["xf"].shape[0] * 16 >= widest and work["y"].shape[1] >= widest and work["y2"].shape[1] >= cfg.mlp
         assert cfg.heads <= main.heads
-        for name in ("x", "fps", "xf", "y", "y2", "qhat", "scores", "probs", "attn"):
+        for name in ("fps", "xf", "y", "y2", "qhat", "scores", "probs", "attn"):
             setattr(c, name, work[name].data_ptr())
         self.sliding, self.full = eng.c_layers[main.last_of(M.SLIDING)], eng.c_layers[main.last_of(M.FULL)]
         self.lib = lib()

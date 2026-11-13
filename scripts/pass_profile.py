@@ -13,7 +13,7 @@ from sclmd import model as M
 from sclmd.stream import cap_vram
 from scripts.reference import load_set
 
-KINDS = ("input", "q k v", "heads", "scores", "softmax", "attend", "o", "residual", "gate up", "down", "head")
+KINDS = ("input", "q k v", "heads", "scores", "softmax", "attend", "o", "gate up", "down", "head")
 
 
 @torch.no_grad()

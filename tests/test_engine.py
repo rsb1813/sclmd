@@ -194,7 +194,6 @@ def test_each_layer_alone_matches_the_reference_on_the_same_inputs(small_e):
             assert close(eng.kv[0][0][slot].float().transpose(0, 1), cache.k[0][0, :, pos : pos + n], ONE_LAYER), where
             assert close(eng.kv[0][1][slot].float().transpose(0, 1), cache.v[0][0, :, pos : pos + n], ONE_LAYER), where
             assert close(eng.work["attn"].view(-1)[: n * width].view(n, width), taps["o_in"], ONE_LAYER), where
-            assert close(eng.work["x"].view(-1)[: n * cfg.mlp].view(n, cfg.mlp), taps["down_in"], ONE_LAYER), where
             assert close(eng.h[:n], want, ONE_LAYER), where
             pos += n
 
