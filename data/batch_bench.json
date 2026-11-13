@@ -1,0 +1,144 @@
+{
+  "plan": "c6",
+  "bits": 3.0,
+  "max_new": 200,
+  "think": false,
+  "temperature": 1.0,
+  "drafter": true,
+  "kv_gib": 2.41,
+  "runs": [
+    {
+      "texts": 1,
+      "tokens": 200,
+      "seconds": 1.64,
+      "tok_s": 122.3,
+      "tok_s_each": 122.3,
+      "passes": 61,
+      "ms_a_pass": 26.8,
+      "rows_a_pass": 6.98,
+      "guesses_kept": 0.42,
+      "first_token_s": 0.09,
+      "ended": [
+        "length"
+      ],
+      "same_as_alone": true
+    },
+    {
+      "texts": 2,
+      "tokens": 400,
+      "seconds": 2.18,
+      "tok_s": 183.2,
+      "tok_s_each": 91.6,
+      "passes": 86,
+      "ms_a_pass": 25.4,
+      "rows_a_pass": 7.79,
+      "guesses_kept": 0.54,
+      "first_token_s": 0.17,
+      "ended": [
+        "length",
+        "length"
+      ],
+      "same_as_alone": true
+    },
+    {
+      "texts": 4,
+      "tokens": 800,
+      "seconds": 3.24,
+      "tok_s": 247.0,
+      "tok_s_each": 61.8,
+      "passes": 133,
+      "ms_a_pass": 24.4,
+      "rows_a_pass": 7.88,
+      "guesses_kept": 0.79,
+      "first_token_s": 0.36,
+      "ended": [
+        "length",
+        "length",
+        "length",
+        "length"
+      ],
+      "same_as_alone": true
+    },
+    {
+      "texts": 8,
+      "tokens": 1600,
+      "seconds": 6.05,
+      "tok_s": 264.4,
+      "tok_s_each": 33.1,
+      "passes": 235,
+      "ms_a_pass": 25.7,
+      "rows_a_pass": 7.97,
+      "guesses_kept": 1.0,
+      "first_token_s": 0.78,
+      "ended": [
+        "length",
+        "length",
+        "length",
+        "length",
+        "length",
+        "length",
+        "length",
+        "length"
+      ],
+      "same_as_alone": true
+    },
+    {
+      "texts": 12,
+      "tokens": 2370,
+      "seconds": 8.88,
+      "tok_s": 267.0,
+      "tok_s_each": 22.2,
+      "passes": 351,
+      "ms_a_pass": 25.3,
+      "rows_a_pass": 8.0,
+      "guesses_kept": 0.9,
+      "first_token_s": 2.75,
+      "ended": [
+        "length",
+        "length",
+        "full",
+        "length",
+        "length",
+        "length",
+        "length",
+        "length",
+        "full",
+        "stop",
+        "length",
+        "length"
+      ],
+      "same_as_alone": false
+    },
+    {
+      "texts": 16,
+      "tokens": 2255,
+      "seconds": 9.02,
+      "tok_s": 250.1,
+      "tok_s_each": 15.6,
+      "passes": 356,
+      "ms_a_pass": 25.3,
+      "rows_a_pass": 7.77,
+      "guesses_kept": 0.79,
+      "first_token_s": 3.98,
+      "ended": [
+        "length",
+        "full",
+        "full",
+        "full",
+        "full",
+        "full",
+        "length",
+        "full",
+        "full",
+        "stop",
+        "full",
+        "length",
+        "length",
+        "length",
+        "length",
+        "length"
+      ],
+      "same_as_alone": false
+    }
+  ]
+}

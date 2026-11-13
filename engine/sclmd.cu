@@ -361,8 +361,14 @@ __global__ void attend_k(const uint16_t* probs, const uint16_t* values, float* o
     // the left operand: rows are values 16 dt + g and + 8 of the head, columns the tile's positions 2t, 2t + 1, 2t + 8, 2t + 9
     const size_t col = size_t(kh) * hd + 16 * dt + g, row = size_t(kvh) * hd;
     float c[4] = {0, 0, 0, 0};
+    // the sequence's table; a pass reads at most ring + 1 tiles, so the table's index goes round at most once (each
+    // iteration works its own out: one that follows from the last would keep the loads from overlapping)
+    const int32_t* mine = tiles + size_t(a.seq[seg]) * ring;
+    const int j0 = (base >> 4) % ring;
+    const size_t tile_values = 16 * row, in_tile = 2 * t * row + col;
     for (int r = 0; r < stride; r += 16) {
-        const uint16_t* va = values + (slot_of(tiles, ring, a.seq[seg], base + r) + 2 * t) * row + col;  // position 2t of the tile
+        const int j = j0 + (r >> 4);
+        const uint16_t* va = values + size_t(mine[j < ring ? j : j - ring]) * tile_values + in_tile;  // position 2t of the tile
         const uint16_t *vb = va + row, *vc = va + 8 * row, *vd = va + 9 * row;
         const uint32_t b0 = has ? *(const uint32_t*)(pq + r) : 0, b1 = has ? *(const uint32_t*)(pq + r + 8) : 0;
         mma(c, uint32_t(va[0]) | uint32_t(vb[0]) << 16, uint32_t(va[8]) | uint32_t(vb[8]) << 16, uint32_t(vc[0]) | uint32_t(vd[0]) << 16,
