@@ -21,7 +21,7 @@ from sclmd.stream import VRAM_MARGIN, cap_vram
 
 DEPTH = 6  # the drafter's generation_config.json: num_assistant_tokens
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LOAD_ROOM = 512 << 20  # VRAM left over the engine: what loading uses for a moment, and the allocator's leftovers
+LOAD_ROOM = 320 << 20  # VRAM left over the engine: what loading uses for a moment, and the allocator's leftovers
 
 HELP = """[bold]명령[/]
   /?, /help              이 도움말

@@ -65,15 +65,24 @@ _ROW = (_LANE // 4)[:, None] + torch.tensor([0, 8, 0, 8])[None, :]
 _PAIR = (_LANE % 4)[:, None] + torch.tensor([0, 0, 4, 4])[None, :]
 
 
-def pack(codes: torch.Tensor, bits: int, strips_at_once: int = 256, device=None) -> torch.Tensor:
+def words(codes: torch.Tensor, bits: int) -> int:
+    """int32 words pack() makes of codes [rows, pairs]: four codes a word at 8 bits, sixteen in three at 6."""
+    rows, pairs = codes.shape
+    return rows // 16 * (4 * pairs if bits == 8 else 3 * pairs)
+
+
+def pack(codes: torch.Tensor, bits: int, strips_at_once: int = 256, device=None, out: torch.Tensor | None = None) -> torch.Tensor:
     """codes (uint8 [rows, cols / 2], a code per pair of columns) in the order the kernel reads them (int32), on
-    `device` (default: where the codes are). Done a part of the rows at a time, each part moved to the device by
-    itself: the temporaries are 16 times the codes, and the head's codes alone are 0.7 GB."""
+    `device` (default: where the codes are), or into `out` (words(codes, bits) long). Done a part of the rows at a
+    time, each part moved to the device by itself: the temporaries are 16 times the codes, and the head's codes
+    alone are 0.7 GB."""
     rows, pairs = codes.shape
     assert rows % 16 == 0 and pairs % 32 == 0 and bits in (6, 8)
-    device = codes.device if device is None else device
-    per_strip = pairs * 16 // 4 if bits == 8 else pairs * 16 * 3 // 16  # words: four codes each, or sixteen in three
-    out = torch.empty(rows // 16 * per_strip, dtype=torch.int32, device=device)
+    per_strip = words(codes, bits) // (rows // 16)
+    if out is None:
+        out = torch.empty(rows // 16 * per_strip, dtype=torch.int32, device=codes.device if device is None else device)
+    assert out.numel() == rows // 16 * per_strip
+    device = out.device
     step = 16 * strips_at_once
     for a in range(0, rows, step):
         out[a // 16 * per_strip : (a + step) // 16 * per_strip] = _pack(codes[a : a + step].to(device), bits)
@@ -126,13 +135,21 @@ class Engine:
         self.rots = {}
         f32 = lambda t: self._own(t.to(device=device, dtype=torch.float32).contiguous())  # noqa: E731
         self.c_layers = (Layer * cfg.n_layers)()
+        # Few, large allocations: PyTorch rounds each up to 2 MiB, and a tensor a matrix and a layer's keys wasted 0.57 GiB.
+        # The keys and values of all layers of a kind are one tensor each: [layers of the kind, slots, heads, head_dim]
+        self.kv_all = {t: tuple(self._own(torch.zeros(cfg.layer_types.count(t), capacity if t == M.FULL else cfg.window + SPARE,
+                                                      cfg.kv_heads[t], cfg.head_dim[t], dtype=torch.float16, device=device)) for _ in range(2))
+                       for t in dict.fromkeys(cfg.layer_types)}
         self.kv = []
         for i, (lay, cl) in enumerate(zip(layers, self.c_layers)):
             t = cfg.layer_types[i]
             hd, kvh = cfg.head_dim[t], cfg.kv_heads[t]
-            for name in M.LINEARS:
-                if name in lay["mats"]:
-                    setattr(cl, name, self._mat(*lay["mats"][name]))
+            mats = {name: lay["mats"][name] for name in M.LINEARS if name in lay["mats"]}
+            codes_all = self._own(torch.empty(sum(words(c, b) for c, _, _, b in mats.values()), dtype=torch.int32, device=device))
+            at = 0
+            for name, (codes, scales, book, bits) in mats.items():  # the layer's codes are one tensor
+                setattr(cl, name, self._mat(codes, scales, book, bits, codes_all[at : at + words(codes, bits)]))
+                at += words(codes, bits)
             cl.rot_in, cl.rot_o = self._rot(cfg.hidden), self._rot(cfg.heads * hd)
             cl.rot_mlp, cl.rot_down = self._rot(cfg.hidden), self._rot(cfg.mlp)
             for name in ("in_ln", "post_attn_ln", "pre_ff_ln", "post_ff_ln", "q_norm", "k_norm"):
@@ -142,11 +159,13 @@ class Engine:
             inv[:rotated] = 1.0 / (theta ** (torch.arange(0, 2 * rotated, 2).float() / hd))
             cl.inv_freq = f32(inv).data_ptr()
             slots = capacity if t == M.FULL else cfg.window + SPARE
-            keys = self._own(torch.zeros(slots, kvh, hd, dtype=torch.float16, device=device))
-            values = self._own(torch.zeros(slots, kvh, hd, dtype=torch.float16, device=device))
+            nth = cfg.layer_types[:i].count(t)
+            keys, values = self.kv_all[t][0][nth], self.kv_all[t][1][nth]
             self.kv.append((keys, values))
             cl.keys, cl.values = keys.data_ptr(), values.data_ptr()
             cl.scalar, cl.full, cl.head_dim, cl.kv_heads, cl.slots = float(lay["scalar"]), int(t == M.FULL), hd, kvh, slots
+            if device != "cpu":
+                torch.cuda.empty_cache()  # packing's temporaries, or the allocator keeps them beside the codes
         widest_head = cfg.heads * max(cfg.head_dim.values())
         y_size = max(max(cfg.heads * cfg.head_dim[t] + 2 * cfg.kv_heads[t] * cfg.head_dim[t] for t in cfg.head_dim), cfg.mlp, cfg.hidden)
         x_size = max(cfg.hidden, widest_head, cfg.mlp)
@@ -195,9 +214,9 @@ class Engine:
         self.keep.append(t)
         return t
 
-    def _mat(self, codes: torch.Tensor, scales: torch.Tensor, book: torch.Tensor, bits: int) -> Mat:
+    def _mat(self, codes: torch.Tensor, scales: torch.Tensor, book: torch.Tensor, bits: int, out: torch.Tensor | None = None) -> Mat:
         dev = self.device
-        packed = self._own(pack(codes, bits, device=dev))
+        packed = pack(codes, bits, out=out) if out is not None else self._own(pack(codes, bits, device=dev))
         table = self._own(lut(book.to(dev)))
         scale = self._own(scales.to(device=dev, dtype=torch.float32).contiguous())
         return Mat(packed.data_ptr(), table.data_ptr(), scale.data_ptr(), codes.shape[0], codes.shape[1] * 2, bits, 0)
@@ -247,20 +266,17 @@ class Engine:
         """Remembers the present length so that restore() can come back to it however far the text goes on.
         (crop() cannot: a sliding layer's ring is written over as the text goes on. Its keys and values are copied
         to RAM here, 0.85 GB for the real model; one snapshot at a time.)"""
-        sliding = [kv for kv, t in zip(self.kv, self.cfg.layer_types) if t == M.SLIDING]
+        sliding = self.kv_all.get(M.SLIDING, ())
         if self._snap is None:
-            self._snap = [tuple(torch.empty(t.shape, dtype=t.dtype).pin_memory() for t in kv) for kv in sliding]
-        for kv, saved in zip(sliding, self._snap):
-            for t, to in zip(kv, saved):
-                to.copy_(t)
+            self._snap = [torch.empty(t.shape, dtype=t.dtype).pin_memory() for t in sliding]
+        for t, to in zip(sliding, self._snap):
+            to.copy_(t)
         self._snap_at = (self.length, self.high)
 
     def restore(self):
         """Back to the snapshot's length: every position from there on is forgotten."""
-        sliding = [kv for kv, t in zip(self.kv, self.cfg.layer_types) if t == M.SLIDING]
-        for kv, saved in zip(sliding, self._snap):
-            for t, src in zip(kv, saved):
-                t.copy_(src)
+        for t, src in zip(self.kv_all.get(M.SLIDING, ()), self._snap):
+            t.copy_(src)
         self.length, self.high = self._snap_at
 
     def _kept(self, first: int) -> bool:
@@ -322,6 +338,9 @@ class EngineDrafter:
         assert cfg.window == main.window and pre[0].shape[1] == main.hidden  # the joined input: a code a pair of columns
         self.keep = []
         f32 = lambda t: self._own(t.to(device=dev, dtype=torch.float32).contiguous())  # noqa: E731
+        every = [m for lay in layers for m in lay["mats"].values()] + [pre, post, head]
+        self._codes = self._own(torch.empty(sum(words(c, b) for c, _, _, b in every), dtype=torch.int32, device=dev))  # one allocation
+        self._at = 0
         self.c_layers = (DLayer * cfg.n_layers)()
         for i, (lay, cl) in enumerate(zip(layers, self.c_layers)):
             t = cfg.layer_types[i]
@@ -380,7 +399,9 @@ class EngineDrafter:
 
     def _mat(self, codes: torch.Tensor, scales: torch.Tensor, book: torch.Tensor, bits: int) -> Mat:
         dev = self.eng.device
-        packed, table = self._own(pack(codes, bits, device=dev)), self._own(lut(book.to(dev)))
+        packed = pack(codes, bits, out=self._codes[self._at : self._at + words(codes, bits)])
+        self._at += words(codes, bits)
+        table = self._own(lut(book.to(dev)))
         scale = self._own(scales.to(device=dev, dtype=torch.float32).contiguous())
         return Mat(packed.data_ptr(), table.data_ptr(), scale.data_ptr(), codes.shape[0], codes.shape[1] * 2, bits, 0)
 
