@@ -105,7 +105,7 @@ def main():
         # the head's kernel: the engine's logits against PyTorch's from the engine's own last outputs
         worst = 0.0
         for r, a, logits in sample:
-            want = M.logits_of(cfg, hidden[r, a : a + eng.rows].to(DEV), norm, test_embed)
+            want = M.logits_of(cfg, hidden[r, a : a + logits.shape[0]].to(DEV), norm, test_embed)
             worst = max(worst, ((logits.to(DEV) - want).abs().amax(-1) / want.abs().amax(-1)).max().item())
         report["head_kernel_worst"] = worst
         print(f"[engine] head kernel against PyTorch: worst difference {worst:.1e} of the largest logit", flush=True)

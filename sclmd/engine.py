@@ -26,8 +26,9 @@ def ring_tiles(cfg: M.Config, kind: str, capacity: int, rows: int = 8) -> int:
 
 
 def tile_bytes(cfg: M.Config, kind: str) -> int:
-    """VRAM of one tile of a kind: 16 positions of keys and values (fp16) in every layer of the kind."""
-    return cfg.layer_types.count(kind) * TILE * cfg.kv_heads[kind] * cfg.head_dim[kind] * 2 * 2
+    """VRAM of one tile of a kind: 16 positions of keys and values (int8, and a float32 scale a head) in every layer
+    of the kind."""
+    return cfg.layer_types.count(kind) * TILE * cfg.kv_heads[kind] * (cfg.head_dim[kind] + 4) * 2
 
 
 def fixed_bytes(cfg: M.Config, head_bits: int, capacity: int, pool: dict | None = None, rows: int = 8) -> int:
@@ -54,7 +55,8 @@ class Rot(C.Structure):
 class Layer(C.Structure):
     _fields_ = ([(m, Mat) for m in ("q", "k", "v", "o", "gate", "up", "down")] +
                 [(r, Rot) for r in ("rot_in", "rot_o", "rot_mlp", "rot_down")] +
-                [(p, C.c_void_p) for p in ("in_ln", "post_attn_ln", "pre_ff_ln", "post_ff_ln", "q_norm", "k_norm", "inv_freq", "keys", "values", "tiles")] +
+                [(p, C.c_void_p) for p in ("in_ln", "post_attn_ln", "pre_ff_ln", "post_ff_ln", "q_norm", "k_norm", "inv_freq", "keys", "values",
+                                           "tiles", "kscale", "vscale")] +
                 [("scalar", C.c_float), ("full", C.c_int), ("head_dim", C.c_int), ("kv_heads", C.c_int), ("ring", C.c_int), ("pad", C.c_int)])
 
 
@@ -179,9 +181,11 @@ class Engine:
         self.tiles = {t: [[-1] * self.ring[t] for _ in range(sequences)] for t in kinds}
         self.tables = {t: self._own(torch.zeros(sequences, self.ring[t], dtype=torch.int32, device=device)) for t in kinds}
         # Few, large allocations: PyTorch rounds each up to 2 MiB, and a tensor a matrix and a layer's keys wasted 0.57 GiB.
-        # The keys and values of all layers of a kind are one tensor each: [layers of the kind, pool slots, heads, head_dim]
+        # The keys and values of all layers of a kind are one tensor each: [layers of the kind, pool slots, heads, head_dim],
+        # int8, and their scales [layers, pool slots, heads]: (keys, values, keys' scales, values' scales)
         self.kv_all = {t: tuple(self._own(torch.zeros(cfg.layer_types.count(t), self.pool[t] * TILE, cfg.kv_heads[t], cfg.head_dim[t],
-                                                      dtype=torch.float16, device=device)) for _ in range(2))
+                                                      dtype=torch.int8, device=device)) for _ in range(2))
+                       + tuple(self._own(torch.zeros(cfg.layer_types.count(t), self.pool[t] * TILE, cfg.kv_heads[t], device=device)) for _ in range(2))
                        for t in kinds}
         self.kv = []
         for i, (lay, cl) in enumerate(zip(layers, self.c_layers)):
@@ -202,9 +206,10 @@ class Engine:
             inv[:rotated] = 1.0 / (theta ** (torch.arange(0, 2 * rotated, 2).float() / hd))
             cl.inv_freq = f32(inv).data_ptr()
             nth = cfg.layer_types[:i].count(t)
-            keys, values = self.kv_all[t][0][nth], self.kv_all[t][1][nth]
-            self.kv.append((keys, values))
+            keys, values, kscale, vscale = (x[nth] for x in self.kv_all[t])
+            self.kv.append((keys, values, kscale, vscale))
             cl.keys, cl.values, cl.tiles = keys.data_ptr(), values.data_ptr(), self.tables[t].data_ptr()
+            cl.kscale, cl.vscale = kscale.data_ptr(), vscale.data_ptr()
             cl.scalar, cl.full, cl.head_dim, cl.kv_heads, cl.ring = float(lay["scalar"]), int(t == M.FULL), hd, kvh, self.ring[t]
             if device != "cpu":
                 torch.cuda.empty_cache()  # packing's temporaries, or the allocator keeps them beside the codes
@@ -363,27 +368,32 @@ class Engine:
         return torch.cat(logits), torch.cat(hidden)
 
     def _tiles_view(self, t: torch.Tensor, kind: str) -> torch.Tensor:
-        """[layers, pool slots, heads, head_dim] as [layers, pool tiles, 16, heads, head_dim]."""
-        return t.view(t.shape[0], self.pool[kind], TILE, t.shape[2], t.shape[3])
+        """[layers, pool slots, heads (, head_dim)] as [layers, pool tiles, 16, heads (, head_dim)]."""
+        return t.view(t.shape[0], self.pool[kind], TILE, *t.shape[2:])
+
+    def kv_float(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """A layer's keys and values as numbers: [pool slots, heads, head_dim] (the int8 values times their scales)."""
+        k, v, ks, vs = self.kv[layer]
+        return k.float() * ks[..., None], v.float() * vs[..., None]
 
     def snapshot(self, seq: int = 0):
         """Remembers a sequence's present length so that restore() can come back to it however far the text goes on.
         (crop() cannot: a sliding layer's ring is written over as the text goes on. Its keys and values are copied
-        to RAM here, 0.85 GB for the real model; one snapshot a sequence.)"""
+        to RAM here, 0.43 GB for the real model; one snapshot a sequence.)"""
         if M.SLIDING not in self.kv_all:
             self._snaps[seq] = {"at": (self.lengths[seq], self.highs[seq]), "tiles": [], "data": []}
             return
         own = [x for x in self.tiles[M.SLIDING][seq] if x >= 0]
         snap = self._snaps.get(seq)
         if snap is None or not snap["data"]:
-            shape = lambda t: (t.shape[0], self.ring[M.SLIDING], TILE, t.shape[2], t.shape[3])  # noqa: E731
+            shape = lambda t: (t.shape[0], self.ring[M.SLIDING], TILE, *t.shape[2:])  # noqa: E731
             snap = self._snaps[seq] = {"data": [torch.empty(shape(t), dtype=t.dtype).pin_memory() for t in self.kv_all[M.SLIDING]]}
         self._copy_tiles(M.SLIDING, own, snap["data"], out=True)
         snap["tiles"], snap["at"] = own, (self.lengths[seq], self.highs[seq])
 
     def _copy_tiles(self, kind: str, own: list, data: list, out: bool):
-        """The tiles `own` of a kind (keys, values) to (out) or from the RAM copies `data`, a layer at a time (a copy
-        of all layers at once would need its size again in VRAM when the tiles are not next to each other)."""
+        """The tiles `own` of a kind (keys, values and their scales) to (out) or from the RAM copies `data`, a layer at
+        a time (a copy of all layers at once would need its size again in VRAM when the tiles are not next to each other)."""
         if not own:
             return
         run = own == list(range(own[0], own[0] + len(own)))  # next to each other in the pool: a slice
@@ -406,13 +416,13 @@ class Engine:
 
     def park(self, seq: int) -> dict:
         """Takes a sequence off the GPU: what it holds comes back as a state in RAM (its keys and values up to its
-        length: 0.82 MB a token for the last 1,040 tokens and 82 KB a token), and its tiles go back to the pool.
+        length: 0.42 MB a token for the last 1,040 tokens and 41 KB a token), and its tiles go back to the pool.
         unpark() puts it on any free sequence later. A snapshot of it is given up."""
         self.trim(seq)
         state = {"length": self.lengths[seq], "high": self.highs[seq], "kinds": {}, "bytes": 0}
         for t in self.ring:
             js = [j for j, tile in enumerate(self.tiles[t][seq]) if tile >= 0]
-            data = [torch.empty(k.shape[0], len(js), TILE, k.shape[2], k.shape[3], dtype=k.dtype) for k in self.kv_all[t]]
+            data = [torch.empty(k.shape[0], len(js), TILE, *k.shape[2:], dtype=k.dtype) for k in self.kv_all[t]]
             self._copy_tiles(t, [self.tiles[t][seq][j] for j in js], data, out=True)
             state["kinds"][t] = {"js": js, "data": data}
             state["bytes"] += sum(d.numel() * d.element_size() for d in data)
@@ -483,15 +493,16 @@ class Engine:
 
     def keys(self, length: int, seq: int = 0) -> dict:
         """What the drafter attends to: per layer type the keys and values of the last layer of that type, for the
-        positions the drafter may read, as (keys [1, heads, m, head_dim], values, positions), in fp16 as they are kept."""
+        positions the drafter may read, as (keys [1, heads, m, head_dim], values, positions): the numbers as they are
+        kept (int8 times the scale)."""
         assert length <= self.lengths[seq] and self._kept(length - (self.cfg.window + 1), seq), "further back than the sliding layers keep"
         out = {}
         for t in (M.SLIDING, M.FULL):
-            k, v = self.kv[self.cfg.last_of(t)]
+            k, v, ks, vs = self.kv[self.cfg.last_of(t)]
             first = 0 if t == M.FULL else max(0, length - (self.cfg.window + 1))
             pos = torch.arange(first, length, device=self.device)
             slot = self.slots(t, pos, seq)
-            out[t] = (k[slot].transpose(0, 1)[None], v[slot].transpose(0, 1)[None], pos)
+            out[t] = ((k[slot].float() * ks[slot][..., None]).transpose(0, 1)[None], (v[slot].float() * vs[slot][..., None]).transpose(0, 1)[None], pos)
         return out
 
 

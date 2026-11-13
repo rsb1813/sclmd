@@ -553,7 +553,7 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=8001)
     ap.add_argument("--name", default="v1", help="the codes' folder under C:\\models\\sclmd-codes")
     ap.add_argument("--kv-gib", type=float, default=0.0, help="VRAM for the conversations' keys and values (0: all that 3 bits a weight "
-                    "leaves, about 2.5 GiB). A conversation takes 0.82 MB a token up to 1,024 tokens and 82 KB a token after; what is "
+                    "leaves, about 2.4 GiB). A conversation takes 0.42 MB a token up to 1,024 tokens and 41 KB a token after; what is "
                     "not set aside here goes to 4-bit matrices (quality)")
     ap.add_argument("--context", type=int, default=8192, help="tokens one conversation can hold (prompt and reply)")
     ap.add_argument("--sequences", type=int, default=32, help="conversations held at once, those kept for their next turn included")

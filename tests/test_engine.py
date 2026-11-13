@@ -1,6 +1,7 @@
 # The engine (engine/sclmd.cu through sclmd/engine.py) against the reference decoder on a small random Gemma 4.
-# The reference gets the same stored matrices and the engine's two roundings (a matrix's input and the kept keys and
-# values, attention's queries and weights are fp16), so what is left between the two is the order of float32 sums.
+# The reference gets the same stored matrices and the engine's roundings (a matrix's input, attention's queries and
+# weights are fp16; the kept keys and values are int8 with a scale a vector), so what is left between the two is the
+# order of float32 sums.
 import os
 
 import pytest
@@ -48,8 +49,20 @@ class Stored:
 
 
 def fp16(t: torch.Tensor) -> torch.Tensor:
-    """What the engine keeps as fp16: the queries, keys and values of attention, and its weights."""
+    """What the engine keeps as fp16: the queries of attention, and its weights."""
     return t.half().float()
+
+
+def int8(t: torch.Tensor) -> torch.Tensor:
+    """What the engine keeps of a key or value: each vector as int8 times its scale (its largest size over 127)."""
+    most = t.float().abs().amax(-1, keepdim=True)
+    scale = torch.where(most > 0, most / 127.0, torch.ones_like(most))
+    return torch.round(t.float() / scale) * scale
+
+
+# A key or value whose rounding to int8 falls the other way in the engine is off by one step: 1/127 of the vector's largest
+KEPT = 1.0 / 127 + 1e-3
+BOOST = 4096.0  # the engine's attention weights are kept times this (engine/sclmd.cu)
 
 
 class Reference:
@@ -67,7 +80,7 @@ class Reference:
         pos = torch.arange(start, start + len(ids), device=DEV)
         h = self.embed(ids)[None]
         for i, w in enumerate(self.layers):
-            h = M.layer_forward(cfg, i, w, h, pos, self.cache, self.shared, linear=lambda x, m: m(x), rounded=fp16)
+            h = M.layer_forward(cfg, i, w, h, pos, self.cache, self.shared, linear=lambda x, m: m(x), rounded=fp16, kept=int8)
         self.cache.length = start + len(ids)
         hn = M.rms_norm(h[0], self.norm, cfg.eps)
         logits = self.head(hn)
@@ -144,6 +157,10 @@ def test_one_matrix_times_up_to_eight_inputs():
 # the flips add up and attention's sharp softmax multiplies them. (The kernels themselves are checked without
 # flips: test_one_matrix..., test_attention_kernels...)
 ONE_LAYER, WHOLE_MODEL = 5e-3, 2e-2
+# Where the engine's own keys and values feed later layers, the bound is wider: a difference of 1e-4 before a layer
+# tips a few of its keys' and values' roundings to int8 the other way (a step is 1/127 of a vector's largest), and
+# each layer after does the same again. Six layers of the small model: 0.02 on average, 0.05 at worst.
+WHOLE_KEPT = 0.12
 
 
 def test_attention_kernels_against_pytorch_on_the_engines_own_buffers(small_e):
@@ -167,7 +184,8 @@ def test_attention_kernels_against_pytorch_on_the_engines_own_buffers(small_e):
             probs = eng.work["probs"][: kvh * nq * stride].view(kvh, nq, stride)
             attn = eng.work["attn"].view(-1)[: n * heads * hd].view(n, heads, hd).double()
             slot = torch.arange(first_tile, first_tile + stride, device=DEV) % slots
-            keys, values = eng.kv[0][0][slot].double(), eng.kv[0][1][slot].double()  # [positions, key heads, head_dim]
+            keys = eng.kv_float(0)[0][slot].double()  # [positions, key heads, head_dim]
+            values, scales = eng.kv[0][1][slot].double(), eng.kv[0][3][slot].double()  # the values as int8, and their scales [positions, key heads]
             for kh in range(kvh):
                 for query in range(nq):
                     token, head = query // rep, kh * rep + query % rep
@@ -175,9 +193,10 @@ def test_attention_kernels_against_pytorch_on_the_engines_own_buffers(small_e):
                     b = pos + token - first_tile + 1  # the positions this query reads, as indices
                     where = (i, pos, n, kh, query)
                     assert close(scores[kh, query, a:b].double(), keys[a:b, kh] @ q[token, head], 1e-5), where
-                    assert close(probs[kh, query, a:b].float(), torch.softmax(scores[kh, query, a:b], -1), 1e-3), where  # fp16: 5e-4
+                    # the weights are kept times the values' scales (fp16: 5e-4)
+                    assert close(probs[kh, query, a:b].float(), torch.softmax(scores[kh, query, a:b], -1) * scales[a:b, kh].float() * BOOST, 1e-3), where
                     assert not probs[kh, query, :a].any() and not probs[kh, query, b:].any(), where
-                    assert close(attn[token, head], probs[kh, query].double() @ values[:, kh], 1e-5), where
+                    assert close(attn[token, head], probs[kh, query].double() @ values[:, kh] / BOOST, 1e-5), where
             pos += n
 
 
@@ -195,11 +214,12 @@ def test_each_layer_alone_matches_the_reference_on_the_same_inputs(small_e):
             eng.advance([(0, n)])
             positions = torch.arange(pos, pos + n, device=DEV)
             want = M.layer_forward(cfg, 0, small_e.ref_layers[i], h[None], positions, cache, linear=lambda x, m: m(x), rounded=fp16,
-                                   tap=lambda name, x: taps.__setitem__(name, x[0]))[0]
+                                   kept=int8, tap=lambda name, x: taps.__setitem__(name, x[0]))[0]
             where = (i, pos, n)
             slot = positions % eng.kv[0][0].shape[0]
-            assert close(eng.kv[0][0][slot].float().transpose(0, 1), cache.k[0][0, :, pos : pos + n], ONE_LAYER), where
-            assert close(eng.kv[0][1][slot].float().transpose(0, 1), cache.v[0][0, :, pos : pos + n], ONE_LAYER), where
+            keys, values = eng.kv_float(0)
+            assert close(keys[slot].transpose(0, 1), cache.k[0][0, :, pos : pos + n], KEPT), where
+            assert close(values[slot].transpose(0, 1), cache.v[0][0, :, pos : pos + n], KEPT), where
             assert close(eng.work["attn"].view(-1)[: n * width].view(n, width), taps["o_in"], ONE_LAYER), where
             assert close(eng.h[:n], want, ONE_LAYER), where
             pos += n
@@ -214,9 +234,11 @@ def test_passes_match_the_reference_past_the_window_and_the_ring(small_e):
         a, b = eng.feed(part)
         got_logits.append(a)
         got_hidden.append(b)
-    assert close(torch.cat(got_hidden), want_hidden, WHOLE_MODEL)
-    assert close(torch.cat(got_logits), want_logits, WHOLE_MODEL)
-    assert same_choice(torch.cat(got_logits), want_logits, 2 * WHOLE_MODEL)
+    assert close(torch.cat(got_hidden), want_hidden, WHOLE_KEPT)
+    assert close(torch.cat(got_logits), want_logits, WHOLE_KEPT)
+    assert same_choice(torch.cat(got_logits), want_logits, 2 * WHOLE_KEPT)
+    mean = ((torch.cat(got_hidden) - want_hidden).abs().amax(-1) / want_hidden.abs().amax(-1)).mean()
+    assert mean < WHOLE_KEPT / 3
 
 
 def test_a_position_is_the_same_bits_alone_or_among_eight(small_e):
@@ -249,7 +271,7 @@ def test_keys_for_the_drafter_match_the_reference(small_e):
             k, v, pos = ref.shared[t]
             first = 0 if t == M.FULL else max(0, length - (cfg.window + 1))
             assert got[t][2].tolist() == list(range(first, length))
-            assert close(got[t][0], k[:, :, first:length], WHOLE_MODEL) and close(got[t][1], v[:, :, first:length], WHOLE_MODEL)
+            assert close(got[t][0], k[:, :, first:length], WHOLE_KEPT) and close(got[t][1], v[:, :, first:length], WHOLE_KEPT)
     with pytest.raises(AssertionError):
         eng.keys(3)  # a sliding layer no longer has positions that far back: the ring has gone round
 

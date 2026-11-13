@@ -281,7 +281,7 @@ def main() -> None:
     ap.add_argument("--plan", default="auto", help="which matrices are 3 bits and which 4: auto (as many at 4 bits as the VRAM "
                     "that is free now holds, the most useful first), c6 (3 bits everywhere), or a plan file")
     ap.add_argument("--head", type=int, default=8)
-    ap.add_argument("--context", type=int, default=8192, help="tokens a conversation can hold (82 KB of VRAM each, taken at the start: what it takes, the plan cannot spend on 4-bit matrices). Attention weights are fp16: past about 16,000 positions the smallest lose precision, which has not been measured")
+    ap.add_argument("--context", type=int, default=8192, help="tokens a conversation can hold (41 KB of VRAM each, taken at the start: what it takes, the plan cannot spend on 4-bit matrices)")
     ap.add_argument("--no-drafter", action="store_true")
     ap.add_argument("--reserve", type=float, default=VRAM_MARGIN / 2**30, help="GiB of the VRAM that is free now to leave to other "
                     "programs. Less means more matrices at 4 bits; if other programs then take more, Windows pages VRAM out and everything slows down")

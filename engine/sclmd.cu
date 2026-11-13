@@ -59,11 +59,14 @@ struct Layer {
     const float *in_ln, *post_attn_ln, *pre_ff_ln, *post_ff_ln;  // [hidden]
     const float *q_norm, *k_norm;                                 // [head_dim]
     const float* inv_freq;                                        // [head_dim / 2], zero past the rotated pairs
-    // This layer's keys and values, fp16, in tiles of 16 positions: [pool tiles][16][kv_heads * head_dim]. A sequence
-    // is given tiles from the pool as it grows: tiles[sequence * ring + j] is the pool tile that holds its positions
-    // 16j .. 16j + 15, j taken modulo `ring` (the table is shared by the layers of a kind).
-    uint16_t *keys, *values;
+    // This layer's keys and values in tiles of 16 positions: [pool tiles][16][kv_heads * head_dim], as int8 with a
+    // scale for each head's vector (kscale, vscale: [pool tiles][16][kv_heads]): a vector is its int8 values times
+    // its scale, the largest of them 127. A sequence is given tiles from the pool as it grows: tiles[sequence * ring
+    // + j] is the pool tile that holds its positions 16j .. 16j + 15, j taken modulo `ring` (the table is shared by
+    // the layers of a kind).
+    int8_t *keys, *values;
     const int32_t* tiles;
+    float *kscale, *vscale;
     float scalar;
     int full;      // 1: attends to every earlier position; 0: to the last `window`
     int head_dim, kv_heads;
@@ -110,6 +113,24 @@ __device__ __forceinline__ int seg_of_row(const Att& a, int row) {
 // The slot (position in the pool) of a sequence's position `pos`.
 __device__ __forceinline__ size_t slot_of(const int32_t* tiles, int ring, int seq, int pos) {
     return size_t(tiles[size_t(seq) * ring + (pos >> 4) % ring]) * 16 + (pos & 15);
+}
+
+// An attention weight is kept as fp16 of weight * the value's scale * BOOST (attend_k divides the sum by BOOST): a
+// scale is at most sqrt(head_dim) / 127, under 0.2, so the largest is under 800, and a weight of 1e-6 is still an
+// ordinary fp16 number (without the boost a weight under 2e-3 would fall among the smallest, which have few bits).
+#define BOOST 4096.0f
+
+// int8 values as the fp16 the tensor-core instruction takes: table[b] is the half-precision bits of int8(b). Filled by
+// the block that uses it (256 entries in its shared memory).
+__device__ __forceinline__ void fill_table(uint16_t* table) {
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) table[i] = __half_as_ushort(__float2half(float(int8_t(i))));
+    __syncthreads();
+}
+
+// Two neighbouring int8 values (read as one 16-bit word) as two fp16 in one register.
+__device__ __forceinline__ uint32_t two(const uint16_t* table, const int8_t* p) {
+    const uint16_t w = *(const uint16_t*)p;
+    return uint32_t(table[w & 255]) | uint32_t(table[w >> 8]) << 16;
 }
 
 // The sum of v over the block's threads (a multiple of 32, at most 1024), returned to every thread.
@@ -276,12 +297,14 @@ __global__ void gemm_k(Mat m0, Mat m1, Mat m2, float* y0, float* y1, float* y2, 
 // What attention does to the projections' outputs, block (vector, token) with head_dim threads. Vector v of a token is
 // one of its `heads` query heads (v < heads), `kvh` key heads or `kvh` value heads:
 //   query: RMS norm times q_norm, rotary position -> qhat[token][head][head_dim] (fp16)
-//   key:   RMS norm times k_norm, rotary position -> keys[slot of the position][head] (fp16)
-//   value: RMS norm                               -> values[slot][head] (fp16); the value's source is yv (or yk when null)
+//   key:   RMS norm times k_norm, rotary position -> keys[slot of the position][head] (int8), kscale[slot][head]
+//   value: RMS norm                               -> values[slot][head] (int8), vscale[slot][head]; its source is yv (or yk when null)
 // The rotary position turns pair (d, d + head_dim / 2) by pos * inv_freq[d]. The token's position and sequence are
-// its segment's (a.pos0: the position of the segment's first row).
+// its segment's (a.pos0: the position of the segment's first row). A key or value is kept as int8: the vector divided
+// by its scale (its largest size over 127) and rounded.
 __global__ void heads_k(const float* yq, const float* yk, const float* yv, const float* q_norm, const float* k_norm, const float* inv_freq,
-                        uint16_t* qhat, uint16_t* keys, uint16_t* values, const int32_t* tiles, Att a, int heads, int kvh, int ring, float eps) {
+                        uint16_t* qhat, int8_t* keys, int8_t* values, float* kscale, float* vscale, const int32_t* tiles, Att a, int heads,
+                        int kvh, int ring, float eps) {
     const int hd = blockDim.x, v = blockIdx.x, token = blockIdx.y, d = threadIdx.x, half = hd / 2;
     const int kind = v < heads ? 0 : v < heads + kvh ? 1 : 2, head = kind == 0 ? v : kind == 1 ? v - heads : v - heads - kvh;
     const float* src = kind == 0 ? yq + (size_t(token) * heads + head) * hd
@@ -292,7 +315,9 @@ __global__ void heads_k(const float* yq, const float* yk, const float* yv, const
     const int seg = seg_of_row(a, token), pos = a.pos0[seg] + token - a.row0[seg];
     const size_t slot = kind == 0 ? 0 : slot_of(tiles, ring, a.seq[seg], pos);
     if (kind == 2) {
-        values[(slot * kvh + head) * hd + d] = __half_as_ushort(__float2half(val * r));
+        const float v = val * r, most = block_max(fabsf(v)), scale = most > 0 ? most / 127.0f : 1.0f;
+        values[(slot * kvh + head) * hd + d] = int8_t(rintf(v / scale));
+        if (d == 0) vscale[slot * kvh + head] = scale;
         return;
     }
     buf[d] = val * r * (kind == 0 ? q_norm[d] : k_norm[d]);
@@ -300,10 +325,13 @@ __global__ void heads_k(const float* yq, const float* yk, const float* yv, const
     const float ang = float(pos) * inv_freq[d % half];
     const float turned = d < half ? -buf[d + half] : buf[d - half];
     const float out = buf[d] * cosf(ang) + turned * sinf(ang);
-    if (kind == 0)
+    if (kind == 0) {
         qhat[(size_t(token) * heads + head) * hd + d] = __half_as_ushort(__float2half(out));
-    else
-        keys[(slot * kvh + head) * hd + d] = __half_as_ushort(__float2half(out));
+        return;
+    }
+    const float most = block_max(fabsf(out)), scale = most > 0 ? most / 127.0f : 1.0f;
+    keys[(slot * kvh + head) * hd + d] = int8_t(rintf(out / scale));
+    if (d == 0) kscale[slot * kvh + head] = scale;
 }
 
 // Attention runs on the tensor cores too, in three kernels. The positions a segment's rows read are taken in tiles of
@@ -315,9 +343,12 @@ __global__ void heads_k(const float* yq, const float* yk, const float* yv, const
 // heads); eight of them are the eight columns of the instruction, and each group of eight has a warp.
 // A segment's scores: scores[off + (key head * nq + query) * stride + (position - base)], nq its queries a key head.
 
-// Scores = query . key: block (position tile of a segment, key head).
-__global__ void scores_k(const uint16_t* qhat, const uint16_t* keys, float* scores, const int32_t* tiles, Att a, int heads, int kvh, int hd,
-                         int ring) {
+// Scores = query . key: block (position tile of a segment, key head). The keys are int8: the sums are of the int8
+// values (as fp16), and a position's sum is multiplied by its key's scale.
+__global__ void scores_k(const uint16_t* qhat, const int8_t* keys, const float* kscale, float* scores, const int32_t* tiles, Att a, int heads,
+                         int kvh, int hd, int ring) {
+    __shared__ uint16_t table[256];
+    fill_table(table);
     int seg = 0;
     for (int i = 1; i < a.n; ++i)
         if (int(blockIdx.x) >= a.tile0[i]) seg = i;
@@ -326,8 +357,8 @@ __global__ void scores_k(const uint16_t* qhat, const uint16_t* keys, float* scor
     if (group * 8 >= nq) return;
     // the left operand: rows are the tile's positions (this lane: g and g + 8), columns sixteen of the head's values
     const size_t slot = slot_of(tiles, ring, a.seq[seg], a.base[seg] + 16 * tile);
-    const uint16_t* ka = keys + ((slot + g) * kvh + kh) * hd + 2 * t;
-    const uint16_t* kb = keys + ((slot + g + 8) * kvh + kh) * hd + 2 * t;
+    const int8_t* ka = keys + ((slot + g) * kvh + kh) * hd + 2 * t;
+    const int8_t* kb = keys + ((slot + g + 8) * kvh + kh) * hd + 2 * t;
     // the right operand: column g is query group * 8 + g
     const int query = group * 8 + g;
     const bool has = query < nq;
@@ -335,18 +366,21 @@ __global__ void scores_k(const uint16_t* qhat, const uint16_t* keys, float* scor
     float c[4] = {0, 0, 0, 0};
     for (int j = 0; j < hd; j += 16) {
         const uint32_t b0 = has ? *(const uint32_t*)(qa + j) : 0, b1 = has ? *(const uint32_t*)(qa + j + 8) : 0;
-        mma(c, *(const uint32_t*)(ka + j), *(const uint32_t*)(kb + j), *(const uint32_t*)(ka + j + 8), *(const uint32_t*)(kb + j + 8), b0, b1);
+        mma(c, two(table, ka + j), two(table, kb + j), two(table, ka + j + 8), two(table, kb + j + 8), b0, b1);
     }
     float* out = scores + a.off[seg];
+    const float sa = kscale[(slot + g) * kvh + kh], sb = kscale[(slot + g + 8) * kvh + kh];
     for (int i = 0; i < 4; ++i) {  // c[i]: position of the tile g (+ 8), query group * 8 + 2t (+ 1)
         const int q = group * 8 + 2 * t + (i & 1), r = 16 * tile + g + (i >= 2 ? 8 : 0);
-        if (q < nq) out[(size_t(kh) * nq + q) * stride + r] = c[i];
+        if (q < nq) out[(size_t(kh) * nq + q) * stride + r] = c[i] * (i >= 2 ? sb : sa);
     }
 }
 
 // The softmax of a query's scores over the positions it may read, as fp16 in the same layout: block (query of the
 // pass, key head). A row at position pos reads positions up to its own, and with a window the last `window` of them.
-__global__ void softmax_k(const float* scores, uint16_t* probs, Att a, int heads, int kvh, int window) {
+// What is written is the weight times the scale of the position's value (the values are int8: attend_k sums those).
+__global__ void softmax_k(const float* scores, uint16_t* probs, const float* vscale, const int32_t* tiles, Att a, int heads, int kvh,
+                          int window, int ring) {
     const int n = blockDim.x, rep = heads / kvh, kh = blockIdx.y, row = blockIdx.x / rep, seg = seg_of_row(a, row);
     const int nq = rep * a.cnt[seg], query = blockIdx.x - rep * a.row0[seg], pos = a.pos0[seg] + row - a.row0[seg];
     const int base = a.base[seg], stride = a.stride[seg];
@@ -362,14 +396,25 @@ __global__ void softmax_k(const float* scores, uint16_t* probs, Att a, int heads
     float sum = 0;
     for (int r = mine; r <= last; r += n) sum += expf(s[r] - mx);
     sum = block_sum(sum);
-    for (int r = threadIdx.x; r < stride; r += n)
-        p[r] = r >= first && r <= last ? __half_as_ushort(__float2half(expf(s[r] - mx) / sum)) : 0;
+    const int32_t* own = tiles + size_t(a.seq[seg]) * ring;  // the sequence's table (see attend_k)
+    const int j0 = (base >> 4) % ring;
+    for (int r = threadIdx.x; r < stride; r += n) {
+        if (r < first || r > last) {
+            p[r] = 0;
+            continue;
+        }
+        const int j = j0 + (r >> 4);
+        const float scale = vscale[(size_t(own[j < ring ? j : j - ring]) * 16 + (r & 15)) * kvh + kh];
+        p[r] = __half_as_ushort(__float2half(expf(s[r] - mx) / sum * (scale * BOOST)));
+    }
 }
 
 // The weighted sum of the values: block (sixteen of the head's values, key head, segment); a warp walks the position
-// tiles. -> out[row][head][head_dim]
-__global__ void attend_k(const uint16_t* probs, const uint16_t* values, float* out, const int32_t* tiles, Att a, int heads, int kvh, int hd,
+// tiles. -> out[row][head][head_dim]. The values are int8 (as fp16 through the table); their scales are in the weights.
+__global__ void attend_k(const uint16_t* probs, const int8_t* values, float* out, const int32_t* tiles, Att a, int heads, int kvh, int hd,
                          int ring) {
+    __shared__ uint16_t table[256];
+    fill_table(table);
     const int seg = blockIdx.z, rep = heads / kvh, nq = rep * a.cnt[seg], stride = a.stride[seg], base = a.base[seg];
     const int dt = blockIdx.x, kh = blockIdx.y, group = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     if (group * 8 >= nq) return;
@@ -387,15 +432,16 @@ __global__ void attend_k(const uint16_t* probs, const uint16_t* values, float* o
     const size_t tile_values = 16 * row, in_tile = 2 * t * row + col;
     for (int r = 0; r < stride; r += 16) {
         const int j = j0 + (r >> 4);
-        const uint16_t* va = values + size_t(mine[j < ring ? j : j - ring]) * tile_values + in_tile;  // position 2t of the tile
-        const uint16_t *vb = va + row, *vc = va + 8 * row, *vd = va + 9 * row;
+        const int8_t* va = values + size_t(mine[j < ring ? j : j - ring]) * tile_values + in_tile;  // position 2t of the tile
+        const int8_t *vb = va + row, *vc = va + 8 * row, *vd = va + 9 * row;
         const uint32_t b0 = has ? *(const uint32_t*)(pq + r) : 0, b1 = has ? *(const uint32_t*)(pq + r + 8) : 0;
-        mma(c, uint32_t(va[0]) | uint32_t(vb[0]) << 16, uint32_t(va[8]) | uint32_t(vb[8]) << 16, uint32_t(vc[0]) | uint32_t(vd[0]) << 16,
-            uint32_t(vc[8]) | uint32_t(vd[8]) << 16, b0, b1);
+#define PAIR(x, y, i) (uint32_t(table[uint8_t(x[i])]) | uint32_t(table[uint8_t(y[i])]) << 16)
+        mma(c, PAIR(va, vb, 0), PAIR(va, vb, 8), PAIR(vc, vd, 0), PAIR(vc, vd, 8), b0, b1);
+#undef PAIR
     }
     for (int i = 0; i < 4; ++i) {  // c[i]: value 16 dt + g (+ 8), query group * 8 + 2t (+ 1)
         const int q = group * 8 + 2 * t + (i & 1), d = 16 * dt + g + (i >= 2 ? 8 : 0);
-        if (q < nq) out[(size_t(a.row0[seg] + q / rep) * heads + kh * rep + q % rep) * hd + d] = c[i];
+        if (q < nq) out[(size_t(a.row0[seg] + q / rep) * heads + kh * rep + q % rep) * hd + d] = c[i] * (1.0f / BOOST);
     }
 }
 
@@ -508,11 +554,11 @@ API int sclmd_pass(const Model* mp, int tokens, const Segs* segs) {
         const Att a = att_for(*segs, l.full, m.heads, m.window - 1);
         const int rep = m.heads / kvh, groups = (rep * a.most + 7) / 8;
         heads_k<<<dim3(m.heads + 2 * kvh, tokens), hd>>>(yq, yk, l.v.rows ? yv : nullptr, l.q_norm, l.k_norm, l.inv_freq, m.qhat, l.keys,
-                                                       l.values, l.tiles, a, m.heads, kvh, l.ring, m.eps);
+                                                       l.values, l.kscale, l.vscale, l.tiles, a, m.heads, kvh, l.ring, m.eps);
         tick(P_HEADS);
-        scores_k<<<dim3(tiles_of(a), kvh), 32 * groups>>>(m.qhat, l.keys, m.scores, l.tiles, a, m.heads, kvh, hd, l.ring);
+        scores_k<<<dim3(tiles_of(a), kvh), 32 * groups>>>(m.qhat, l.keys, l.kscale, m.scores, l.tiles, a, m.heads, kvh, hd, l.ring);
         tick(P_SCORES);
-        softmax_k<<<dim3(rep * tokens, kvh), 256>>>(m.scores, m.probs, a, m.heads, kvh, l.full ? 0 : m.window);
+        softmax_k<<<dim3(rep * tokens, kvh), 256>>>(m.scores, m.probs, l.vscale, l.tiles, a, m.heads, kvh, l.full ? 0 : m.window, l.ring);
         tick(P_SOFTMAX);
         attend_k<<<dim3(hd / 16, kvh, a.n), 32 * groups>>>(m.probs, l.values, m.attn, l.tiles, a, m.heads, kvh, hd, l.ring);
         tick(P_ATTEND);
@@ -612,11 +658,11 @@ API int sclmd_draft(const Drafter* dp, const Layer* sliding, const Layer* full, 
         prep(d, rows, h, nullptr, l.in_ln, n, l.rot_in, 0, owed, spare);
         if (owed.y) std::swap(h, spare);
         gemm(d.xf, d.fps, rows, l.q, d.y);
-        heads_k<<<dim3(d.heads, rows), hd>>>(d.y, nullptr, nullptr, l.q_norm, nullptr, l.inv_freq, d.qhat, nullptr, nullptr, nullptr,
-                                             att_for(at, true, d.heads, 0), d.heads, kvh, 1, d.eps);
+        heads_k<<<dim3(d.heads, rows), hd>>>(d.y, nullptr, nullptr, l.q_norm, nullptr, l.inv_freq, d.qhat, nullptr, nullptr, nullptr, nullptr,
+                                             nullptr, att_for(at, true, d.heads, 0), d.heads, kvh, 1, d.eps);
         const Att a = att_for(read, l.full, d.heads, window);
-        scores_k<<<dim3(tiles_of(a), kvh), 32 * groups>>>(d.qhat, src.keys, d.scores, src.tiles, a, d.heads, kvh, hd, src.ring);
-        softmax_k<<<dim3(rep * rows, kvh), 256>>>(d.scores, d.probs, a, d.heads, kvh, l.full ? 0 : window + 1);
+        scores_k<<<dim3(tiles_of(a), kvh), 32 * groups>>>(d.qhat, src.keys, src.kscale, d.scores, src.tiles, a, d.heads, kvh, hd, src.ring);
+        softmax_k<<<dim3(rep * rows, kvh), 256>>>(d.scores, d.probs, src.vscale, src.tiles, a, d.heads, kvh, l.full ? 0 : window + 1, src.ring);
         attend_k<<<dim3(hd / 16, kvh, a.n), 32 * groups>>>(d.probs, src.values, d.attn, src.tiles, a, d.heads, kvh, hd, src.ring);
         prep(d, rows, d.attn, nullptr, nullptr, d.heads * hd, l.rot_o, 1);
         gemm(d.xf, d.fps, rows, l.o, d.y);
