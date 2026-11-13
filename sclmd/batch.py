@@ -151,6 +151,9 @@ class Batcher:
         # last to come that holds any gives them up and starts over once a job has ended (_start_over); a job that
         # is the only one holding any cannot be helped and ends ("full").
         while True:
+            # make_room may have dropped a job (the reading ahead of a conversation it moved off the GPU): its sequence
+            # is no longer its own, and it gets nothing in this pass
+            live = [j for j in live if j.done is None]
             use, free = [], eng.free_tiles()
             for j in live:  # in the order they came
                 if not rows.get(j):
@@ -165,6 +168,8 @@ class Batcher:
             self.starved = sum(1 for j in live if rows.get(j)) - len(use)
             if not self.starved or self.make_room is None or not self.make_room():
                 break
+        if not live:  # every job that had rows was dropped
+            return True
         if not use:
             holders = [j for j in self.jobs if any(x >= 0 for t in eng.ring for x in eng.tiles[t][j.seq])]
             if len(holders) > 1:

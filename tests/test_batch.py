@@ -16,7 +16,7 @@ STOP = (7,)
 
 
 def pickers():
-    return [Picker(), Picker(temperature=1.0, top_k=64, top_p=0.95, seed=3), Picker(temperature=0.7, top_k=20, top_p=0.9, seed=11)]
+    return [Picker(), Picker(temperature=5.0, top_k=16, top_p=1.0, seed=3), Picker(temperature=3.0, top_k=20, top_p=0.98, seed=11)]  # hot: a wrong context shows in the text (tests/test_serve.py: hot)
 
 
 def alone(small: Small, prompt: list, max_new: int, pick: Picker) -> list:
@@ -112,7 +112,7 @@ def test_a_text_that_starts_over_for_lack_of_memory_goes_on_with_the_same_tokens
     cfg = small_e.cfg
     ring = {t: E.ring_tiles(cfg, t, 96) for t in (M.SLIDING, M.FULL)}
     texts = [ids_of(10, 150), ids_of(11, 151), ids_of(9, 152)]  # short prompts: the three are writing when memory runs out
-    picks = [Picker(), Picker(temperature=1.0, top_k=64, top_p=0.95, seed=5), Picker()]
+    picks = [Picker(), Picker(temperature=5.0, top_k=16, top_p=1.0, seed=5), Picker(temperature=5.0, top_k=16, top_p=1.0, seed=6)]
     want = [generate(small_e.engine(), t, 30, pick, stop=()) for t, pick in zip(texts, picks)]
     for with_drafter in (False, True):
         eng = small_e.engine(sequences=3, pool={M.SLIDING: ring[M.SLIDING] + 1, M.FULL: ring[M.FULL] + 1})

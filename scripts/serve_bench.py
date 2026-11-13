@@ -1,6 +1,9 @@
 # Load on a running server (scripts/serve.py, or any OpenAI-compatible one): N clients ask at the same moment, each a
 # conversation of its own, and then each asks a follow-up. For every N: the tokens a second of all replies together and
 # of each, the time to a reply's first token, and how much of the follow-up's prompt the server had kept.
+# With --check every client's two requests are then asked once more, alone, and every reply that was written under load
+# is compared with that: a client's prompt and seed are the same in every round and the server's choices depend only
+# on the seed and the position, so the texts must be the same, whatever else the server was doing.
 # Stands alone (no project imports):  python scripts/serve_bench.py --clients 1,2,4,8
 import argparse
 import http.client
@@ -63,6 +66,40 @@ def chat(url: str, messages: list, max_tokens: int, think: bool, seed: int, out:
     conn.close()
 
 
+def check(url: str, seen: dict, max_tokens: int, think: bool) -> dict:
+    """Asks every client's two requests alone and compares the replies written under load with them.
+    seen: client -> [(clients at once, first reply, second reply), ...]"""
+    same = total = 0
+    wrong = []
+    for i in sorted(seen):
+        alone = []
+        messages = [{"role": "user", "content": PROMPTS[i][0]}]
+        for turn in range(2):
+            out = {}
+            chat(url, messages, max_tokens, think, 1000 + i, out)
+            if out.get("status") != 200:
+                print(f"check: client {i} alone failed: {out.get('error')}", flush=True)
+                return {"failed": True}
+            alone.append((out["content"], out["reasoning"]))
+            messages = messages + [{"role": "assistant", "content": out["content"]}, {"role": "user", "content": PROMPTS[i][1]}]
+        for n, first, second in seen[i]:
+            for turn, got in enumerate((first, second)):
+                if turn == 1 and first != alone[0]:
+                    continue  # its second request was another one: the first reply already differed (and is counted)
+                total += 1
+                if got == alone[turn]:
+                    same += 1
+                else:
+                    a, b = got[0] + got[1], alone[turn][0] + alone[turn][1]
+                    at = next((k for k, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+                    wrong.append({"client": i, "turn": turn + 1, "at_once": n, "differs_at_char": at, "under_load": a[at : at + 40], "alone": b[at : at + 40]})
+    print(f"check: {same} of {total} replies written under load are the text the same request gets alone", flush=True)
+    for w in wrong[:8]:
+        print(f"  client {w['client']} turn {w['turn']} with {w['at_once']} at once differs from character {w['differs_at_char']}: "
+              f"{w['under_load']!r} / alone {w['alone']!r}", flush=True)
+    return {"replies": total, "same_as_alone": same, "different": wrong}
+
+
 def together(url: str, asks: list, max_tokens: int, think: bool) -> tuple[list, float]:
     """The conversations in `asks` (each a list of messages) asked at the same moment -> (each one's result, seconds)."""
     outs = [{} for _ in asks]
@@ -99,9 +136,10 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=200)
     ap.add_argument("--think", action="store_true")
     ap.add_argument("--pause", type=float, default=3.0, help="seconds between a reply and the follow-up (a user reads and types)")
+    ap.add_argument("--check", action="store_true", help="afterwards ask every request alone and compare the replies written under load with that")
     ap.add_argument("--out")
     args = ap.parse_args()
-    report = []
+    report, seen = [], {}
     for n in [int(c) for c in args.clients.split(",")]:
         asks = [[{"role": "user", "content": PROMPTS[i][0]}] for i in range(n)]
         outs, seconds = together(args.url, asks, args.max_tokens, args.think)
@@ -110,8 +148,13 @@ def main():
             break
         asks = [a + [{"role": "assistant", "content": o["content"]}, {"role": "user", "content": PROMPTS[i][1]}] for i, (a, o) in enumerate(zip(asks, outs))]
         time.sleep(args.pause)
+        firsts = outs
         outs, seconds = together(args.url, asks, args.max_tokens, args.think)
         report.append({"first_turn": first, "second_turn": line(f"{n:2d} at once, second turn", outs, seconds)})
+        for i, (a, b) in enumerate(zip(firsts, outs)):
+            seen.setdefault(i, []).append((n, (a["content"], a["reasoning"]), (b.get("content", ""), b.get("reasoning", ""))))
+    if args.check and seen:
+        report.append({"check": check(args.url, seen, args.max_tokens, args.think)})
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2)

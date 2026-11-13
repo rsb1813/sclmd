@@ -104,12 +104,30 @@ class Server:
             return True
         if old.job is not None:
             self.batch.drop(old.job)
-        tokens = old.now(self.eng)
         del self.kept[old.seq]
-        self.parked.append(Parked(tokens, self.eng.park(old.seq), old.used))
         self.unused.append(old.seq)
+        if old.later is None and not self._to_start(old):  # nothing of it can be gone on from
+            self.eng.release(old.seq)
+            return True
+        self.parked.append(Parked(old.now(self.eng), self.eng.park(old.seq), old.used))
         while sum(p.state["bytes"] for p in self.parked) > self.ram:  # RAM is full: the oldest parked ones are forgotten
             self.parked.remove(min(self.parked, key=lambda p: p.used))
+        return True
+
+    def _to_start(self, kept: Kept) -> bool:
+        """Takes a kept conversation's sequence back to where its last turn began (its base): past it the sequence
+        holds the reply as it was written, which a later turn does not begin with. False: the sliding layers no
+        longer hold what that position needs (should not happen: the batcher copies a turn start to RAM before a
+        reply writes over it)."""
+        eng, seq, n = self.eng, kept.seq, len(kept.base)
+        if eng.lengths[seq] == n:
+            return True
+        if kept.snapped or (kept.job is not None and kept.job.snapped):
+            eng.restore(seq)
+        if not eng._kept(n - eng.cfg.window + 1, seq):
+            return False
+        eng.crop(n, seq)
+        eng.trim(seq)
         return True
 
     def _forget(self, kept: Kept) -> None:
@@ -153,21 +171,17 @@ class Server:
                 self.batch.drop(best.job)
             del self.kept[seq]
             reused = most
-            if eng.lengths[seq] != most:  # back to the last turn's start
-                if best.snapped or (best.job is not None and best.job.snapped):
-                    eng.restore(seq)
-                if eng._kept(most - eng.cfg.window + 1, seq):
-                    eng.crop(most, seq)
-                    eng.trim(seq)
-                else:  # should not happen: the batcher copies a turn start before it is written over
-                    eng.release(seq)
-                    reused = 0
+            if eng.lengths[seq] != most and not self._to_start(best):  # back to the last turn's start
+                eng.release(seq)
+                reused = 0
         elif self.unused:
             seq = self.unused.pop()
         elif self._make_room():
             seq = self.unused.pop()
         else:
             return False
+        # the sequence holds exactly what is counted as kept: nothing of another conversation
+        assert eng.lengths[seq] == reused, f"sequence {seq} holds {eng.lengths[seq]} positions where {reused} were expected"
         req.reused = reused
         req.job = Job(seq, req.full[reused:], req.max_new, req.pick, self.stop, emit=lambda t, q=req.events: q.put(("token", t)),
                       start=req.start, base=req.full[:reused])
@@ -243,8 +257,27 @@ class Server:
         return True
 
     def run(self) -> None:
+        """Turns for ever. If one fails, every request that is under way or waiting is told (the HTTP threads answer
+        with an error instead of waiting for tokens that will not come), and the engine starts from nothing."""
+        import traceback
+
         while True:
-            self.turn()
+            try:
+                self.turn()
+            except Exception as e:  # noqa: BLE001
+                traceback.print_exc()
+                print(f"[serve] the engine's thread failed: {type(e).__name__}: {e}; {len(self.active) + len(self.waiting)} requests are told", flush=True)
+                for req in self.active + self.waiting:
+                    req.events.put(("error", 500, f"the server failed while answering: {type(e).__name__}"))
+                self.reset()
+
+    def reset(self) -> None:
+        """Forgets every conversation and job: the engine as it was when it was loaded."""
+        self.active, self.waiting, self.kept, self.parked = [], [], {}, []
+        self.batch.jobs = []
+        for seq in range(self.eng.sequences):
+            self.eng.release(seq)
+        self.unused = list(range(self.eng.sequences - 1, -1, -1))
 
     def about(self) -> dict:
         eng = self.eng
@@ -477,9 +510,8 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 if stopped:
                     continue
-                # the tokens that come within a moment are taken together: a wake-up for every token of every reply
-                # would keep the engine's thread from the interpreter (8 clients: 300 tok/s instead of 420)
-                time.sleep(0.03 if stream else 0.25)
+                # the tokens that have come by now are taken together (waiting 30 ms for more made no difference
+                # to the speed of eight clients: 293 tok/s with it, 300 without)
                 tokens, last = [event[1]], None
                 try:
                     while last is None:

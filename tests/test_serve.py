@@ -15,6 +15,14 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available() or not __import__(
 STOP = (7,)
 
 
+def hot(seed: int = 0) -> Picker:
+    """A sampler whose choice turns on small differences of the logits and on the position. The small model's greedy
+    text hardly depends on what came before it (11 of 12 texts stay the same when 40 other tokens are put in before
+    the last eight); a text sampled like this always does (0 of 12 stay the same), so a conversation that is
+    continued from the wrong place does not pass for the right one."""
+    return Picker(temperature=5.0, top_k=16, top_p=1.0, seed=seed)
+
+
 def ask(server: Server, full: list, start: int, max_new: int, pick: Picker) -> Request:
     req = Request(full, start, max_new, pick, False)
     server.submit(req)
@@ -38,6 +46,21 @@ def finish(server: Server, *reqs) -> list:
     return out
 
 
+def finish_one(server: Server, req) -> list:
+    """Turns until the request is done, and not one more (what reads ahead after it has only begun)."""
+    while req.job is None or req.job.done is None:
+        server.turn(wait=False)
+    server.turn(wait=False)  # the turn in which the server sees that it is done
+    tokens, result = [], None
+    while not req.events.empty():
+        event = req.events.get()
+        if event[0] == "token":
+            tokens.append(event[1])
+        else:
+            result = event[1]
+    return [(tokens, result)]
+
+
 def fresh(small, full: list, max_new: int, pick: Picker) -> list:
     return generate(small.engine(), full, max_new, pick, stop=STOP)
 
@@ -49,14 +72,14 @@ def test_a_conversations_next_turn_goes_on_from_what_was_kept(small_e, drafter_e
         system, user1, user2 = ids_of(6, 60), ids_of(9, 61), ids_of(7, 62)
         gen = [5, 6]  # what a template adds for the model's turn: the turn start comes after the first of the two
         full1, start1 = system + user1 + gen, len(system + user1) + 1
-        (reply1, r1), = finish(server, ask(server, full1, start1, reply_room, Picker(seed=1)))
-        assert reply1 == fresh(small_e, full1, reply_room, Picker(seed=1)) and r1["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
+        (reply1, r1), = finish(server, ask(server, full1, start1, reply_room, hot(1)))
+        assert reply1 == fresh(small_e, full1, reply_room, hot(1)) and r1["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
         # the next turn: the template writes the earlier reply in another form (here: other tokens), then the new message
         full2 = full1[:start1] + ids_of(5, 63) + user2 + gen
-        other = ask(server, ids_of(20, 64), 19, 10, Picker())  # another conversation at the same time
-        (reply2, r2), _ = finish(server, ask(server, full2, len(full2) - 1, 15, Picker(seed=2)), other)
+        other = ask(server, ids_of(20, 64), 19, 10, hot())  # another conversation at the same time
+        (reply2, r2), _ = finish(server, ask(server, full2, len(full2) - 1, 15, hot(2)), other)
         assert r2["usage"]["prompt_tokens_details"]["cached_tokens"] == start1
-        assert reply2 == fresh(small_e, full2, 15, Picker(seed=2))
+        assert reply2 == fresh(small_e, full2, 15, hot(2))
         assert len(server.kept) == 2 and not server.active
 
 
@@ -64,9 +87,9 @@ def test_more_conversations_than_sequences_take_the_oldest_kept_ones_place(small
     eng = small_e.engine(sequences=2)
     server = Server(None, eng, None, STOP)
     prompts = [ids_of(8 + i, 70 + i) for i in range(5)]
-    reqs = [ask(server, p, len(p) - 1, 8, Picker()) for p in prompts]  # five at once on two sequences: three wait
+    reqs = [ask(server, p, len(p) - 1, 8, hot()) for p in prompts]  # five at once on two sequences: three wait
     for (tokens, result), p in zip(finish(server, *reqs), prompts):
-        assert tokens == fresh(small_e, p, 8, Picker()) and result["finish_reason"] in ("stop", "length")
+        assert tokens == fresh(small_e, p, 8, hot()) and result["finish_reason"] in ("stop", "length")
     assert len(server.kept) == 2 and server.totals["requests"] == 5
 
 
@@ -76,17 +99,17 @@ def test_kept_conversations_give_way_when_keys_and_values_run_out(small_e):  # n
     eng = small_e.engine(sequences=4, pool={M.SLIDING: ring[M.SLIDING] + 1, M.FULL: ring[M.FULL] + 1})  # one long conversation's worth
     server = Server(None, eng, None, STOP)
     a, b = ids_of(30, 80), ids_of(34, 81)
-    (first, _), = finish(server, ask(server, a, 29, 20, Picker()))
-    assert first == fresh(small_e, a, 20, Picker()) and len(server.kept) == 1
-    (second, result), = finish(server, ask(server, b, 33, 20, Picker()))  # needs the tiles the kept one holds
-    assert second == fresh(small_e, b, 20, Picker()) and result["ended"] in ("stop", "length")
+    (first, _), = finish(server, ask(server, a, 29, 20, hot()))
+    assert first == fresh(small_e, a, 20, hot()) and len(server.kept) == 1
+    (second, result), = finish(server, ask(server, b, 33, 20, hot()))  # needs the tiles the kept one holds
+    assert second == fresh(small_e, b, 20, hot()) and result["ended"] in ("stop", "length")
     assert len(server.kept) == 1
 
 
 def test_a_cancelled_request_frees_its_sequence(small_e):  # noqa: F811
     eng = small_e.engine(sequences=2)
     server = Server(None, eng, None, STOP)
-    req = ask(server, ids_of(40, 90), 39, 30, Picker())
+    req = ask(server, ids_of(40, 90), 39, 30, hot())
     for _ in range(3):
         server.turn(wait=False)
     req.cancelled = True
@@ -102,18 +125,18 @@ def test_a_reply_is_read_in_ahead_as_a_later_turn_writes_it(small_e, drafter_e):
         server.canon = lambda req, tokens: req.full[: req.start] + written
         full1 = ids_of(15, 96) + [5, 6]
         start1 = len(full1) - 1
-        (reply1, _), = finish(server, ask(server, full1, start1, reply_room, Picker(seed=1)))
+        (reply1, _), = finish(server, ask(server, full1, start1, reply_room, hot(1)))
         kept = server.kept[0]
         assert kept.job.done == "read" and kept.now(eng) == full1[:start1] + written  # read in while nothing else ran
         full2 = full1[:start1] + written + ids_of(7, 97) + [5, 6]
-        (reply2, r2), = finish(server, ask(server, full2, len(full2) - 1, 15, Picker(seed=2)))
+        (reply2, r2), = finish(server, ask(server, full2, len(full2) - 1, 15, hot(2)))
         assert r2["usage"]["prompt_tokens_details"]["cached_tokens"] == start1 + len(written)
-        assert reply2 == fresh(small_e, full2, 15, Picker(seed=2))
+        assert reply2 == fresh(small_e, full2, 15, hot(2))
         # a client that sends the reply back in another form: the sequence goes back to the turn's start
         full3 = full2[: len(full2) - 1] + ids_of(4, 98) + ids_of(6, 99) + [5, 6]
-        (reply3, r3), = finish(server, ask(server, full3, len(full3) - 1, 15, Picker(seed=3)))
+        (reply3, r3), = finish(server, ask(server, full3, len(full3) - 1, 15, hot(3)))
         assert r3["usage"]["prompt_tokens_details"]["cached_tokens"] == len(full2) - 1
-        assert reply3 == fresh(small_e, full3, 15, Picker(seed=3))
+        assert reply3 == fresh(small_e, full3, 15, hot(3))
 
 
 def test_the_next_turn_may_come_before_the_reading_ahead_is_done(small_e):  # noqa: F811
@@ -122,15 +145,15 @@ def test_the_next_turn_may_come_before_the_reading_ahead_is_done(small_e):  # no
     written = ids_of(30, 100)
     server.canon = lambda req, tokens: req.full[: req.start] + written
     full1 = ids_of(10, 101) + [5, 6]
-    req = ask(server, full1, len(full1) - 1, 6, Picker())
+    req = ask(server, full1, len(full1) - 1, 6, hot())
     while req.job is None or req.job.done is None:
         server.turn(wait=False)
     server.turn(wait=False)  # one pass of the reading ahead: 8 of its 30 tokens
     assert 0 < server.kept[0].job.read < 30
     full2 = full1[: len(full1) - 1] + written + ids_of(5, 102) + [5, 6]
-    (reply2, r2), = finish(server, ask(server, full2, len(full2) - 1, 12, Picker(seed=4)))
+    (reply2, r2), = finish(server, ask(server, full2, len(full2) - 1, 12, hot(4)))
     assert r2["usage"]["prompt_tokens_details"]["cached_tokens"] == len(full1) - 1 + 8
-    assert reply2 == fresh(small_e, full2, 12, Picker(seed=4))
+    assert reply2 == fresh(small_e, full2, 12, hot(4))
 
 
 def test_conversations_wait_in_ram_when_the_gpu_is_short_and_come_back(small_e):  # noqa: F811
@@ -138,24 +161,88 @@ def test_conversations_wait_in_ram_when_the_gpu_is_short_and_come_back(small_e):
     ring = {t: E.ring_tiles(cfg, t, 96) for t in (M.SLIDING, M.FULL)}
     # two sequences and keys and values for about one long conversation: the others have to leave the GPU
     eng = small_e.engine(sequences=2, pool={M.SLIDING: ring[M.SLIDING] + 2, M.FULL: ring[M.FULL] + 2})
-    server = Server(None, eng, None, STOP, ram=1 << 30)
-    firsts = [ids_of(22 + 3 * i, 130 + i) + [5, 6] for i in range(4)]
-    replies = []
-    for full in firsts:  # four conversations, one after the other
-        (reply, _), = finish(server, ask(server, full, len(full) - 1, 10, Picker()))
-        assert reply == fresh(small_e, full, 10, Picker())
-        replies.append(reply)
-    assert len(server.kept) + len(server.parked) == 4 and len(server.parked) >= 2
-    for i in (0, 2, 1, 3):  # each one's next turn: all of it but the new message is found again
-        full2 = firsts[i][: len(firsts[i]) - 1] + ids_of(6, 140 + i) + [5, 6]
-        (reply2, r2), = finish(server, ask(server, full2, len(full2) - 1, 9, Picker(seed=i)))
-        assert r2["usage"]["prompt_tokens_details"]["cached_tokens"] == len(firsts[i]) - 1, i
-        assert reply2 == fresh(small_e, full2, 9, Picker(seed=i)), i
+    for room in (10, 40):  # 40 tokens of reply: past what the sliding ring keeps of the turn start
+        eng = small_e.engine(sequences=2, pool={M.SLIDING: ring[M.SLIDING] + 2, M.FULL: ring[M.FULL] + 2})
+        server = Server(None, eng, None, STOP, ram=1 << 30)
+        firsts = [ids_of(22 + 3 * i, 130 + i) + [5, 6] for i in range(4)]
+        for full in firsts:  # four conversations, one after the other
+            (reply, _), = finish(server, ask(server, full, len(full) - 1, room, hot()))
+            assert reply == fresh(small_e, full, room, hot())
+        assert len(server.kept) + len(server.parked) == 4 and len(server.parked) >= 2
+        # what waits in RAM is the conversation up to its turn start, not the reply as it was written after it
+        assert all(p.state["length"] == len(p.tokens) for p in server.parked)
+        for i in (0, 2, 1, 3):  # each one's next turn: all of it but the new message is found again
+            full2 = firsts[i][: len(firsts[i]) - 1] + ids_of(6, 140 + i) + [5, 6]
+            (reply2, r2), = finish(server, ask(server, full2, len(full2) - 1, 9, hot(i)))
+            assert r2["usage"]["prompt_tokens_details"]["cached_tokens"] == len(firsts[i]) - 1, (room, i)
+            assert reply2 == fresh(small_e, full2, 9, hot(i)), (room, i)
     # with no RAM allowed they are forgotten instead, and the next turn starts anew
     eng = small_e.engine(sequences=2, pool={M.SLIDING: ring[M.SLIDING] + 2, M.FULL: ring[M.FULL] + 2})
     server = Server(None, eng, None, STOP)
     for full in firsts:
-        finish(server, ask(server, full, len(full) - 1, 10, Picker()))
+        finish(server, ask(server, full, len(full) - 1, 10, hot()))
     full2 = firsts[0][: len(firsts[0]) - 1] + ids_of(6, 140) + [5, 6]
-    (reply2, r2), = finish(server, ask(server, full2, len(full2) - 1, 9, Picker()))
-    assert not server.parked and r2["usage"]["prompt_tokens_details"]["cached_tokens"] == 0 and reply2 == fresh(small_e, full2, 9, Picker())
+    (reply2, r2), = finish(server, ask(server, full2, len(full2) - 1, 9, hot()))
+    assert not server.parked and r2["usage"]["prompt_tokens_details"]["cached_tokens"] == 0 and reply2 == fresh(small_e, full2, 9, hot())
+
+
+def test_a_conversation_that_leaves_the_gpu_while_it_is_read_ahead_leaves_nothing_behind(small_e):  # noqa: F811
+    cfg = small_e.cfg
+    ring = {t: E.ring_tiles(cfg, t, 96) for t in (M.SLIDING, M.FULL)}
+    for ram in (1 << 30, 0):  # moved to RAM, or forgotten
+        eng = small_e.engine(sequences=2, pool={M.SLIDING: ring[M.SLIDING] + 1, M.FULL: ring[M.FULL] + 1})
+        server = Server(None, eng, None, STOP, ram=ram)
+        written = ids_of(40, 160)  # a long reply to read in ahead: many passes
+        server.canon = lambda req, tokens: req.full[: req.start] + written if req.full[0] == first[0] else None
+        first = ids_of(12, 161) + [5, 6]
+        (reply1, _), = finish_one(server, ask(server, first, len(first) - 1, 6, hot()))
+        kept = server.kept[0]
+        assert kept.job is not None and kept.job.done is None  # the reading ahead has only begun
+        # a second conversation needs more keys and values than are free: the first has to leave in the middle of a
+        # pass, and of one in which its reading ahead has rows (the second's prompt is short: rows are left over)
+        second = ids_of(12, 162) + [5, 6]
+        (reply2, _), = finish(server, ask(server, second, len(second) - 1, 20, hot(6)))
+        assert reply2 == fresh(small_e, second, 20, hot(6))
+        assert 0 not in server.kept and (len(server.parked) == 1) == (ram > 0)
+        assert all(eng.lengths[seq] == 0 for seq in server.unused), "an unused sequence holds positions"
+        # a third conversation, on whatever sequence is free: it reads only its own tokens
+        third = ids_of(14, 163) + [5, 6]
+        (reply3, r3), = finish(server, ask(server, third, len(third) - 1, 12, hot(7)))
+        assert reply3 == fresh(small_e, third, 12, hot(7)) and r3["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
+        if ram:  # and the first one's next turn finds what it had read
+            again = first[: len(first) - 1] + written + ids_of(5, 164) + [5, 6]
+            (reply4, r4), = finish(server, ask(server, again, len(again) - 1, 10, hot(8)))
+            assert reply4 == fresh(small_e, again, 10, hot(8)) and r4["usage"]["prompt_tokens_details"]["cached_tokens"] >= len(first) - 1
+
+
+def test_requests_are_told_when_the_engines_thread_fails(small_e):  # noqa: F811
+    import threading
+
+    eng = small_e.engine(sequences=2)
+    server = Server(None, eng, None, STOP)
+    boom = {"left": 3}
+    step = server.batch.step
+
+    def failing():
+        boom["left"] -= 1
+        if boom["left"] == 0:
+            raise RuntimeError("a kernel failed")
+        return step()
+
+    server.batch.step = failing
+    threading.Thread(target=server.run, daemon=True).start()
+    req = ask(server, ids_of(30, 170), 29, 20, hot())
+    while True:
+        event = req.events.get(timeout=20)
+        if event[0] != "token":
+            break
+    assert event[0] == "error" and event[1] == 500
+    server.batch.step = step  # and the server goes on: the next request is answered
+    again = ask(server, ids_of(12, 171), 11, 8, hot())
+    tokens = []
+    while True:
+        event = again.events.get(timeout=20)
+        if event[0] != "token":
+            break
+        tokens.append(event[1])
+    assert event[0] == "done" and tokens == fresh(small_e, ids_of(12, 171), 8, hot())
