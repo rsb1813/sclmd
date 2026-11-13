@@ -3,7 +3,6 @@
 # commands change the settings. The context is always what the model's chat template writes for the conversation.
 import argparse
 import ctypes
-import json
 import os
 import random
 import signal
@@ -16,12 +15,13 @@ from rich.console import Console
 from sclmd import ckpt
 from sclmd import engine as E
 from sclmd import model as M
+from sclmd import plan as P
 from sclmd.generate import Picker, extend
-from sclmd.stream import cap_vram
+from sclmd.stream import VRAM_MARGIN, cap_vram
 
 DEPTH = 6  # the drafter's generation_config.json: num_assistant_tokens
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_PLAN = os.path.join(ROOT, "data", "plans", "default.json")
+LOAD_ROOM = 512 << 20  # VRAM left over the engine: what loading uses for a moment, and the allocator's leftovers
 
 HELP = """[bold]명령[/]
   /?, /help              이 도움말
@@ -275,8 +275,8 @@ def reply(line: str, session: Session, opts: dict, console: Console) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--name", default="v1", help="the codes' folder under C:\\models\\sclmd-codes")
-    ap.add_argument("--plan", default=DEFAULT_PLAN if os.path.exists(DEFAULT_PLAN) else None,
-                    help="which matrices are 3 bits and which 4 (default: data/plans/default.json, or 3 bits everywhere)")
+    ap.add_argument("--plan", default="auto", help="which matrices are 3 bits and which 4: auto (as many at 4 bits as the VRAM "
+                    "that is free now holds, the most useful first), c6 (3 bits everywhere), or a plan file")
     ap.add_argument("--head", type=int, default=8)
     ap.add_argument("--context", type=int, default=8192, help="tokens a conversation can hold (82 KB of VRAM each)")
     ap.add_argument("--no-drafter", action="store_true")
@@ -290,20 +290,31 @@ def main() -> None:
     cap_vram()
     tok = AutoTokenizer.from_pretrained(ckpt("orig"))
     cfg = M.Config.load(ckpt("orig"))
-    if cli.plan:
-        with open(cli.plan, encoding="utf-8") as f:
-            p = json.load(f)
-        plan, head = {int(k): v for k, v in p["layers"].items()}, p.get("head") or cli.head
+    head, estimate = cli.head, None
+    if cli.plan == "auto":
+        # what is free now, less what PyTorch is kept from (cap_vram), the rest of the engine, and room to load in
+        free = torch.cuda.mem_get_info()[0] - VRAM_MARGIN
+        rest = E.fixed_bytes(cfg, head, cli.context) + (0 if cli.no_drafter else E.DRAFTER_BYTES)
+        budget = free - rest - LOAD_ROOM
+        if budget < P.code_bytes(cfg, P.uniform(cfg, 6)):
+            console.print(f"[yellow]VRAM이 모자랍니다: 지금 비어 있는 것은 {(free + VRAM_MARGIN) / 2**30:.1f}GiB이고, 전부 3bit로도 "
+                          f"{(P.code_bytes(cfg, P.uniform(cfg, 6)) + rest + LOAD_ROOM + VRAM_MARGIN) / 2**30:.1f}GiB가 필요합니다. "
+                          f"다른 프로그램을 닫거나 --context 를 줄여 보세요.[/]")
+            return
+        plan, estimate = P.fit(cfg, cli.name, budget)
+    elif cli.plan == "c6":
+        plan = P.uniform(cfg, 6)
     else:
-        plan, head = {i: {m: 6 for m in M.LINEARS} for i in range(cfg.n_layers)}, cli.head
+        plan, head = P.read(cli.plan)
+        head = head or cli.head
     with torch.no_grad():
         eng = E.Engine.load(cli.name, plan, head, cli.context)
-        drafter = None if cli.no_drafter else E.EngineDrafter.load(eng, ckpt("drafter"), DEPTH)
+        drafter = None if cli.no_drafter else E.EngineDrafter.load(eng, ckpt("drafter"), cli.name, depth=DEPTH)
         opts = {"temperature": 1.0, "top_p": 0.95, "top_k": 64, "num_predict": 4096, "verbose": True, "showthink": False}
         session = Session(tok, eng, drafter)
         console.print(f"\n[bold]sclmd chat[/] · gemma-4-31B-it · VRAM {torch.cuda.memory_allocated() / 2**30:.1f}GiB · "
-                      f"{os.path.splitext(os.path.basename(cli.plan))[0] if cli.plan else '전부 3bit'}\n[grey62]{settings(session, opts)}\n"
-                      f"/? 도움말 · /show 설정 보기 · /bye 끝내기[/]\n", highlight=False)
+                      f"가중치 평균 {P.bits_per_weight(cfg, plan):.2f}bit" + (f" (원본 대비 KL 약 {estimate:.3f})" if estimate else "")
+                      + f"\n[grey62]{settings(session, opts)}\n/? 도움말 · /show 설정 보기 · /bye 끝내기[/]\n", highlight=False)
         while True:
             # the last reply goes into the context in its later form while the next message is typed
             ahead = threading.Thread(target=torch.no_grad()(session.settle))

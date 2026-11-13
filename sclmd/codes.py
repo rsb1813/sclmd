@@ -127,3 +127,41 @@ def load_head(name: str, bits: int, device="cuda", dtype=torch.float32, rows: in
     for a in range(0, codes.shape[0], rows):
         out[a : a + rows] = weight(codes[a : a + rows].to(device), scales[a : a + rows].to(device), book.to(device)).to(dtype)
     return out
+
+
+# The drafter's matrices: one file, both rates. Names: pre, post, head, layers.<i>.<q|o|gate|up|down>.
+
+def drafter_path(name: str) -> str:
+    return os.path.join(CODES, name, "drafter.safetensors")
+
+
+def save_drafter(name: str, fits: dict, info: dict):
+    """fits: (matrix, bits) -> {codes, scales, book}."""
+    path = drafter_path(name)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    save_file({f"{m}.c{bits}.{key}": f[key].cpu().contiguous() for (m, bits), f in fits.items() for key in ("codes", "scales", "book")},
+              path + ".tmp")
+    with open(path[: -len(".safetensors")] + ".json", "w", encoding="utf-8") as fh:
+        json.dump(info, fh, indent=2)
+    os.replace(path + ".tmp", path)
+
+
+def drafter_stored(name: str, bits: int, device="cpu") -> dict:
+    """Every matrix of the drafter as stored: name -> (codes, scales, book, bits)."""
+    out = {}
+    with safe_open(drafter_path(name), framework="pt", device=device) as f:
+        for key in f.keys():
+            m, rate, part = key.rsplit(".", 2)
+            if rate == f"c{bits}" and part == "codes":
+                out[m] = (f.get_tensor(key), f.get_tensor(f"{m}.{rate}.scales"), f.get_tensor(f"{m}.{rate}.book"), bits)
+    return out
+
+
+def load_drafter_head(name: str, bits: int, device="cuda", dtype=torch.float32, rows: int = 32768) -> torch.Tensor:
+    """The drafter's head as its codes give it ([vocab, hidden]), built a part at a time."""
+    with safe_open(drafter_path(name), framework="pt", device="cpu") as f:
+        codes, scales, book = (f.get_tensor(f"head.c{bits}.{part}") for part in ("codes", "scales", "book"))
+    out = torch.empty(codes.shape[0], codes.shape[1] * 2, dtype=dtype, device=device)
+    for a in range(0, codes.shape[0], rows):
+        out[a : a + rows] = weight(codes[a : a + rows].to(device), scales[a : a + rows].to(device), book.to(device)).to(dtype)
+    return out

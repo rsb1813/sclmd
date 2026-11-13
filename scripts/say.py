@@ -50,7 +50,7 @@ def main():
     plan, head = load_plan(args.plan, args.rate, args.head, cfg)
     t = time.time()
     eng = E.Engine.load(args.name, plan, head, args.capacity)
-    drafter = None if args.no_drafter else E.EngineDrafter.load(eng, ckpt("drafter"), DEPTH)
+    drafter = None if args.no_drafter else E.EngineDrafter.load(eng, ckpt("drafter"), args.name, depth=DEPTH)
     torch.cuda.synchronize()
     print(f"[say] loaded in {time.time() - t:.0f} s, VRAM {torch.cuda.memory_allocated() / 2**30:.2f} GiB, prompt {len(prompt)} tokens", flush=True)
     pick = Picker(args.temperature, seed=args.seed)

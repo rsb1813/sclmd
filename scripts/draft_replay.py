@@ -44,6 +44,8 @@ def main():
     ap.add_argument("--drafter", default="drafter")
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--places", type=int, default=128, help="places drafted together")
+    ap.add_argument("--codes", help="the drafter's matrices as stored pair codes of this name (scripts/quantize_drafter.py)")
+    ap.add_argument("--rate", type=int, default=8, help="bits a pair for --codes")
     args = ap.parse_args()
     cap_vram()
     dev = "cuda"
@@ -52,7 +54,7 @@ def main():
     ck = Checkpoint(ckpt(args.ref))
     cfg, embed, norm = ck.cfg, ck.embed(dev), ck.norm(dev)
     scale = M.embed_scale(cfg, embed.dtype)
-    drafter = Drafter.load(ckpt(args.drafter), dev)
+    drafter = Drafter.load_codes(ckpt(args.drafter), args.codes, args.rate, dev) if args.codes else Drafter.load(ckpt(args.drafter), dev)
     s, n = ids.shape
     keys = ("greedy", "sampled", "sampled_raw", "compare")
     per_seq = {k: [] for k in keys}
@@ -99,7 +101,8 @@ def main():
         rows = [i for i, c in enumerate(category) if c == ci]
         report["tokens_per_verification"][name] = {k: float(np.nanmean([per_seq[k][i] for i in rows])) for k in keys}
     report["tokens_per_verification"]["all"] = {k: float(np.nanmean(per_seq[k])) for k in keys}
-    with open(os.path.join(DATA, f"draft_replay_{args.set}_{args.ref}_{args.drafter}.json"), "w", encoding="utf-8") as f:
+    tag = args.drafter + (f"_{args.codes}_c{args.rate}" if args.codes else "")
+    with open(os.path.join(DATA, f"draft_replay_{args.set}_{args.ref}_{tag}.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
     print(json.dumps(report, ensure_ascii=False, indent=2))
 

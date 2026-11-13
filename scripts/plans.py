@@ -5,30 +5,16 @@ import os
 
 from sclmd import DATA, ckpt
 from sclmd import model as M
+from sclmd import plan as P
 
 FOLDER = os.path.join(DATA, "plans")
 
 
-def sizes(cfg: M.Config, i: int) -> dict:
-    """Weights of layer i's matrices."""
-    t = cfg.layer_types[i]
-    qo, kv = cfg.heads * cfg.head_dim[t] * cfg.hidden, cfg.kv_heads[t] * cfg.head_dim[t] * cfg.hidden
-    out = {"q": qo, "k": kv, "v": kv, "o": qo, "gate": cfg.mlp * cfg.hidden, "up": cfg.mlp * cfg.hidden, "down": cfg.mlp * cfg.hidden}
-    if t == M.FULL:
-        del out["v"]
-    return out
-
-
 def write(name: str, layers: dict, head: int | None = None, note: str = "") -> str:
-    os.makedirs(FOLDER, exist_ok=True)
-    path = os.path.join(FOLDER, name + ".json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump({"note": note, "head": head, "layers": {str(i): mats for i, mats in layers.items()}}, f, indent=1)
-    return path
+    return P.write(os.path.join(FOLDER, name + ".json"), layers, head, note)
 
 
-def uniform(cfg: M.Config, bits: int) -> dict:
-    return {i: {m: bits for m in sizes(cfg, i)} for i in range(cfg.n_layers)}
+uniform = P.uniform
 
 
 def main():

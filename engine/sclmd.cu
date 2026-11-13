@@ -452,16 +452,12 @@ API int sclmd_pass(const Model* mp, int tokens, int pos0) {
 }
 
 // ---- The drafter (Gemma4Assistant): a few layers that guess the next token from the main model's last output.
-// Its matrices are not quantized: fp16 weights, stored in the order the instruction reads them. It has no keys of
-// its own: every layer attends to the keys and values of the main model's last sliding or last full-attention layer.
-
-struct Dense {
-    const uint32_t* w;  // [strip of 16 rows][tile of 16 columns][lane][4]: the four registers of the lane, two fp16 each
-    int rows, cols;     // multiples of 16
-};
+// Its matrices are pair codes like the main model's. It has no keys of its own: every layer attends to the keys and
+// values of the main model's last sliding or last full-attention layer.
 
 struct DLayer {
-    Dense q, o, gate, up, down;
+    Mat q, o, gate, up, down;
+    Rot rot_in, rot_o, rot_mlp, rot_down;
     const float *in_ln, *post_attn_ln, *pre_ff_ln, *post_ff_ln, *q_norm, *inv_freq;
     float scalar;
     int full, head_dim, kv_heads;
@@ -472,7 +468,8 @@ struct Drafter {
     int n_layers, hidden, mlp, heads, vocab, backbone;
     float eps;
     int pad;
-    Dense pre, post, head;
+    Mat pre, post, head;
+    Rot rot_pre, rot_out;  // of the joined input, and of the final norm's output (the head's and post's input)
     const float* norm;
     // work memory
     float* in;      // [2 * backbone] the token's embedding in the main model, then a hidden state: the main model's last output, or `next`
@@ -490,44 +487,10 @@ struct Drafter {
     float* attn;
 };
 
-// y[token][row] = fps[token] * sum over columns of W[row][col] * x[token][col] for fp16 weights: one block a strip of
-// 16 rows, its `segs` warps splitting the strip's tiles between them.
-__global__ void dense_k(const uint32_t* w, const uint64_t* xf, const float* fps, float* y, int rows, int cols, int segs, int tokens) {
-    __shared__ float part[8][32][4];
-    const int strip = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int tiles = cols / 16, per = tiles / segs, first = warp * per;
-    const uint4* a = reinterpret_cast<const uint4*>(w) + (size_t(strip) * tiles + first) * 32 + lane;
-    const uint64_t* xw = xf + size_t(first) * 32 + lane;
-    float c[4] = {0, 0, 0, 0};
-    for (int j = 0; j < per; ++j) {
-        const uint4 v = a[size_t(j) * 32];
-        const uint64_t b = xw[size_t(j) * 32];
-        mma(c, v.x, v.y, v.z, v.w, uint32_t(b), uint32_t(b >> 32));
-    }
-    for (int i = 0; i < 4; ++i) part[warp][lane][i] = c[i];
-    __syncthreads();
-    if (warp) return;
-    for (int i = 0; i < 4; ++i) {
-        float sum = 0;
-        for (int s = 0; s < segs; ++s) sum += part[s][lane][i];
-        const int row = strip * 16 + (lane >> 2) + (i >= 2 ? 8 : 0), token = 2 * (lane & 3) + (i & 1);
-        if (token < tokens) y[size_t(token) * rows + row] = fps[token] * sum;
-    }
-}
-
-static void dense(const Dense& m, const uint64_t* xf, const float* fps, float* y, int tokens) {
-    const int tiles = m.cols / 16;
-    int segs = 8;
-    while (segs > 1 && (tiles % segs || tiles / segs < 8)) segs >>= 1;
-    dense_k<<<m.rows / 16, 32 * segs>>>(m.w, xf, fps, y, m.rows, m.cols, segs, tokens);
-}
-
 // The input of one of the drafter's matrices with n columns from a (and b, w: see prep_k), in d.xf with its scale in d.fps.
-static void dense_prep(const Drafter& d, const float* a, const float* b, const float* w, int n, int mode, const Owed& owed = Owed{},
-                       float* h_out = nullptr, float* v_out = nullptr) {
-    int block = 1024;
-    while (n % block) block >>= 1;
-    prep_k<<<dim3(n / block, 1), block>>>(a, b, w, owed.y, owed.post, owed.scalar, h_out, v_out, nullptr, d.fps, d.xf, n, d.eps, mode);
+static void prep(const Drafter& d, const float* a, const float* b, const float* w, int n, const Rot& rot, int mode, const Owed& owed = Owed{},
+                 float* h_out = nullptr, float* v_out = nullptr) {
+    prep_k<<<dim3(n / rot.block, 1), rot.block>>>(a, b, w, owed.y, owed.post, owed.scalar, h_out, v_out, rot.signs, d.fps, d.xf, n, d.eps, mode);
 }
 
 // One guess: d.in holds the embedding of the token at position `length` and a hidden state; the main model has run
@@ -537,8 +500,8 @@ static void dense_prep(const Drafter& d, const float* a, const float* b, const f
 API int sclmd_draft(const Drafter* dp, const Layer* sliding, const Layer* full, int window, int length) {
     const Drafter& d = *dp;
     const int n = d.hidden, last = length - 1;
-    dense_prep(d, d.in, nullptr, nullptr, 2 * d.backbone, 1);
-    dense(d.pre, d.xf, d.fps, d.h, 1);
+    prep(d, d.in, nullptr, nullptr, 2 * d.backbone, d.rot_pre, 1);
+    gemm(d.xf, d.fps, 1, d.pre, d.h);
     float *h = d.h, *spare = d.h2;
     Owed owed;
     for (int i = 0; i < d.n_layers; ++i) {
@@ -546,9 +509,9 @@ API int sclmd_draft(const Drafter* dp, const Layer* sliding, const Layer* full, 
         const Layer& src = l.full ? *full : *sliding;
         const int hd = l.head_dim, kvh = l.kv_heads;
         // attention: the query sits at position `length` and reads the main model's keys up to length - 1
-        dense_prep(d, h, nullptr, l.in_ln, n, 0, owed, spare);
+        prep(d, h, nullptr, l.in_ln, n, l.rot_in, 0, owed, spare);
         if (owed.y) std::swap(h, spare);
-        dense(l.q, d.xf, d.fps, d.y, 1);
+        gemm(d.xf, d.fps, 1, l.q, d.y);
         heads_k<<<dim3(d.heads, 1), hd>>>(d.y, nullptr, nullptr, l.q_norm, nullptr, l.inv_freq, d.qhat, nullptr, nullptr, d.heads, kvh, length, 1, d.eps);
         const int lo = l.full ? 0 : (last - window > 0 ? last - window : 0);
         const int base = lo & ~15, stride = ((last >> 4) + 1) * 16 - base;
@@ -556,26 +519,24 @@ API int sclmd_draft(const Drafter* dp, const Layer* sliding, const Layer* full, 
         scores_k<<<dim3(stride / 16, kvh), 32 * groups>>>(d.qhat, src.keys, d.scores, d.heads, kvh, hd, 1, base, stride, src.slots);
         softmax_k<<<dim3(nq, kvh), 256>>>(d.scores, d.probs, d.heads, kvh, 1, last, base, stride, l.full ? 0 : window + 1);
         attend_k<<<dim3(hd / 16, kvh), 32 * groups>>>(d.probs, src.values, d.attn, d.heads, kvh, hd, 1, base, stride, src.slots);
-        dense_prep(d, d.attn, nullptr, nullptr, d.heads * hd, 1);
-        dense(l.o, d.xf, d.fps, d.y, 1);
+        prep(d, d.attn, nullptr, nullptr, d.heads * hd, l.rot_o, 1);
+        gemm(d.xf, d.fps, 1, l.o, d.y);
         owed = Owed{d.y, l.post_attn_ln, 1.0f};
         // feed-forward
-        dense_prep(d, h, nullptr, l.pre_ff_ln, n, 0, owed, spare);
+        prep(d, h, nullptr, l.pre_ff_ln, n, l.rot_mlp, 0, owed, spare);
         std::swap(h, spare);
-        dense(l.gate, d.xf, d.fps, d.y, 1);
-        dense(l.up, d.xf, d.fps, d.y2, 1);
-        dense_prep(d, d.y, d.y2, nullptr, d.mlp, 2);
-        dense(l.down, d.xf, d.fps, d.y, 1);
+        gemm(d.xf, d.fps, 1, l.gate, d.y, l.up, d.y2);
+        prep(d, d.y, d.y2, nullptr, d.mlp, l.rot_down, 2);
+        gemm(d.xf, d.fps, 1, l.down, d.y);
         owed = Owed{d.y, l.post_ff_ln, l.scalar};
     }
-    dense_prep(d, h, nullptr, d.norm, n, 0, owed, spare, d.hn);
-    dense(d.head, d.xf, d.fps, d.logits, 1);
-    dense(d.post, d.xf, d.fps, d.next, 1);
+    prep(d, h, nullptr, d.norm, n, d.rot_out, 0, owed, spare, d.hn);
+    gemm(d.xf, d.fps, 1, d.head, d.logits, d.post, d.next);
     return int(cudaGetLastError());
 }
 
-API int sclmd_draft_sizes(int* dense, int* dlayer, int* drafter) {
-    *dense = sizeof(Dense), *dlayer = sizeof(DLayer), *drafter = sizeof(Drafter);
+API int sclmd_draft_sizes(int* dlayer, int* drafter) {
+    *dlayer = sizeof(DLayer), *drafter = sizeof(Drafter);
     return 0;
 }
 

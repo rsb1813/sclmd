@@ -21,6 +21,21 @@ class Drafter:
                    ck.norm(device), ck.embed(device))
 
     @classmethod
+    def load_codes(cls, folder: str, name: str, bits: int, device: str = "cuda") -> "Drafter":
+        """The drafter with its matrices as their stored pair codes give them (scripts/quantize_drafter.py), in PyTorch."""
+        from . import codes as C
+
+        d = cls.load(folder, device)
+        dtype = d.pre.dtype
+        w = {m: C.weight(c.to(device), s.to(device), b.to(device)).to(dtype) for m, (c, s, b, _) in C.drafter_stored(name, bits).items()
+             if m != "head"}
+        d.pre, d.post, d.head = w["pre"], w["post"], C.load_drafter_head(name, bits, device, dtype)
+        for i, lay in enumerate(d.layers):
+            for m in ("q", "o", "gate", "up", "down"):
+                lay[m] = w[f"layers.{i}.{m}"]
+        return d
+
+    @classmethod
     def from_state(cls, cfg: M.Config, state: dict) -> "Drafter":
         layers = [M.layer_weights(state, "model.", i) for i in range(cfg.n_layers)]
         return cls(cfg, layers, state["pre_projection.weight"], state["post_projection.weight"], state["model.norm.weight"],
@@ -28,7 +43,7 @@ class Drafter:
 
     @torch.no_grad()
     def step(self, token_embed: torch.Tensor, hidden: torch.Tensor, last: torch.Tensor, shared: dict, linear=F.linear,
-             rounded=None) -> tuple[torch.Tensor, torch.Tensor]:
+             rounded=None, tap=None) -> tuple[torch.Tensor, torch.Tensor]:
         """One guess for each of n places in a sequence.
         token_embed [batch, n, backbone]: the main model's (scaled) embedding of the token just before the guess.
         hidden [batch, n, backbone]: the main model's last output (after its final norm) at the position before that
@@ -36,11 +51,19 @@ class Drafter:
         last [n]: the last position whose keys each place may read; the place itself sits at last + 1.
         shared: layer type -> (keys, values, their positions).
         linear, rounded: as in model.layer_forward (a test of the engine's drafter passes the engine's arithmetic).
+        tap(where, name, tensor): called with the input of every matrix: ("pre", "in"), (layer, "attn_in" | "o_in" |
+            "mlp_in" | "down_in"), ("out", "in") for the head and the projection back.
         Returns (logits [batch, n, vocab], the hidden state for the guess after this one)."""
         cfg = self.cfg
-        h = linear(torch.cat((token_embed, hidden), dim=-1), self.pre)
+        x = torch.cat((token_embed, hidden), dim=-1)
+        if tap:
+            tap("pre", "in", x)
+        h = linear(x, self.pre)
         for i, w in enumerate(self.layers):
             # transformers lets the drafter read `window + 1` keys in a sliding layer
-            h = M.layer_forward(cfg, i, w, h, last + 1, shared=shared, see=(last, cfg.window + 1), linear=linear, rounded=rounded)
+            h = M.layer_forward(cfg, i, w, h, last + 1, shared=shared, see=(last, cfg.window + 1), linear=linear, rounded=rounded,
+                                tap=(lambda name, t, i=i: tap(i, name, t)) if tap else None)
         h = M.rms_norm(h, self.norm, cfg.eps)
+        if tap:
+            tap("out", "in", h)
         return linear(h, self.head), linear(h, self.post)

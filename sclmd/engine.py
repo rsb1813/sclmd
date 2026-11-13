@@ -11,6 +11,15 @@ from . import model as M
 DLL = os.path.join(os.path.dirname(__file__), "..", "engine", "build", "sclmd.dll")
 MAX_TOKENS = 8
 SPARE = 16  # positions a sliding layer keeps past its window: a pass writes up to 8, the drafter reads window + 1
+DRAFTER_BYTES = 240 << 20  # the drafter at 4 bits a weight (0.47B weights) and its work memory
+
+
+def fixed_bytes(cfg: M.Config, head_bits: int, capacity: int) -> int:
+    """VRAM an Engine takes besides the layers' codes: the head's codes, the keys and values, the work memory."""
+    head = cfg.vocab * cfg.hidden * head_bits // 16
+    kv = sum((capacity if t == M.FULL else cfg.window + SPARE) * cfg.kv_heads[t] * cfg.head_dim[t] * 2 * 2 for t in cfg.layer_types)
+    work = MAX_TOKENS * cfg.vocab * 4 + cfg.heads * MAX_TOKENS * (max(capacity, cfg.window + MAX_TOKENS) + 32) * 6 + (32 << 20)
+    return head + kv + work
 
 
 class Mat(C.Structure):
@@ -56,16 +65,18 @@ _ROW = (_LANE // 4)[:, None] + torch.tensor([0, 8, 0, 8])[None, :]
 _PAIR = (_LANE % 4)[:, None] + torch.tensor([0, 0, 4, 4])[None, :]
 
 
-def pack(codes: torch.Tensor, bits: int, strips_at_once: int = 256) -> torch.Tensor:
-    """codes (uint8 [rows, cols / 2], a code per pair of columns) in the order the kernel reads them (int32).
-    Done a part of the rows at a time: the temporaries are 16 times the codes."""
+def pack(codes: torch.Tensor, bits: int, strips_at_once: int = 256, device=None) -> torch.Tensor:
+    """codes (uint8 [rows, cols / 2], a code per pair of columns) in the order the kernel reads them (int32), on
+    `device` (default: where the codes are). Done a part of the rows at a time, each part moved to the device by
+    itself: the temporaries are 16 times the codes, and the head's codes alone are 0.7 GB."""
     rows, pairs = codes.shape
     assert rows % 16 == 0 and pairs % 32 == 0 and bits in (6, 8)
+    device = codes.device if device is None else device
     per_strip = pairs * 16 // 4 if bits == 8 else pairs * 16 * 3 // 16  # words: four codes each, or sixteen in three
-    out = torch.empty(rows // 16 * per_strip, dtype=torch.int32, device=codes.device)
+    out = torch.empty(rows // 16 * per_strip, dtype=torch.int32, device=device)
     step = 16 * strips_at_once
     for a in range(0, rows, step):
-        out[a // 16 * per_strip : (a + step) // 16 * per_strip] = _pack(codes[a : a + step], bits)
+        out[a // 16 * per_strip : (a + step) // 16 * per_strip] = _pack(codes[a : a + step].to(device), bits)
     return out
 
 
@@ -186,7 +197,7 @@ class Engine:
 
     def _mat(self, codes: torch.Tensor, scales: torch.Tensor, book: torch.Tensor, bits: int) -> Mat:
         dev = self.device
-        packed = self._own(pack(codes.to(dev), bits))
+        packed = self._own(pack(codes, bits, device=dev))
         table = self._own(lut(book.to(dev)))
         scale = self._own(scales.to(device=dev, dtype=torch.float32).contiguous())
         return Mat(packed.data_ptr(), table.data_ptr(), scale.data_ptr(), codes.shape[0], codes.shape[1] * 2, bits, 0)
@@ -283,48 +294,32 @@ class Engine:
 
 # ---- The drafter on the engine's kernels (engine/sclmd.cu: sclmd_draft)
 
-class Dense(C.Structure):
-    _fields_ = [("w", C.c_void_p), ("rows", C.c_int), ("cols", C.c_int)]
-
-
 class DLayer(C.Structure):
-    _fields_ = ([(m, Dense) for m in ("q", "o", "gate", "up", "down")] +
+    _fields_ = ([(m, Mat) for m in ("q", "o", "gate", "up", "down")] + [(r, Rot) for r in ("rot_in", "rot_o", "rot_mlp", "rot_down")] +
                 [(p, C.c_void_p) for p in ("in_ln", "post_attn_ln", "pre_ff_ln", "post_ff_ln", "q_norm", "inv_freq")] +
                 [("scalar", C.c_float), ("full", C.c_int), ("head_dim", C.c_int), ("kv_heads", C.c_int)])
 
 
 class DrafterC(C.Structure):
     _fields_ = ([("layers", C.c_void_p)] + [(n, C.c_int) for n in ("n_layers", "hidden", "mlp", "heads", "vocab", "backbone")] +
-                [("eps", C.c_float), ("pad", C.c_int), ("pre", Dense), ("post", Dense), ("head", Dense), ("norm", C.c_void_p)] +
+                [("eps", C.c_float), ("pad", C.c_int), ("pre", Mat), ("post", Mat), ("head", Mat), ("rot_pre", Rot), ("rot_out", Rot),
+                 ("norm", C.c_void_p)] +
                 [(p, C.c_void_p) for p in ("inp", "h", "hn", "logits", "next", "h2", "fps", "xf", "y", "y2", "qhat", "scores", "probs", "attn")])
-
-
-def pack_dense(w: torch.Tensor, device: str = "cuda", rows_at_once: int = 4096) -> torch.Tensor:
-    """Weights [rows, cols] as fp16 in the order the kernel reads them (int32 [strip][tile][lane][4]), a part of the
-    rows at a time."""
-    rows, cols = w.shape
-    assert rows % 16 == 0 and cols % 16 == 0
-    out = torch.empty(rows * cols // 2, dtype=torch.int32, device=device)
-    for a in range(0, rows, rows_at_once):
-        c = w[a : a + rows_at_once].to(device=device, dtype=torch.float16).contiguous().view(torch.int32)  # a word: two columns
-        c = c.view(c.shape[0] // 16, 16, cols // 16, 8).permute(0, 2, 1, 3)  # [strip, tile, row in strip, pair in tile]
-        out[a * cols // 2 : (a + c.shape[0] * 16) * cols // 2] = c[:, :, _ROW.to(device), _PAIR.to(device)].reshape(-1)
-    return out
 
 
 class EngineDrafter:
     """The drafter beside an Engine: guess(token, hidden, length) as generation asks for it (sclmd/generate.py).
-    Its matrices are fp16 as stored (bf16 weights fit in fp16 exactly, tiny ones aside); its work memory is the
-    engine's, which is idle while the drafter guesses.
+    Its matrices are pair codes like the main model's (it only guesses: what the codes lose shows as fewer guesses
+    kept, never in the text); its work memory is the engine's, which is idle while the drafter guesses.
 
-    layers: per layer its weights by the names of model.LAYER_KEYS (q, o, gate, up, down, the norms, scalar)."""
+    layers: per layer a dict with "mats": q, o, gate, up, down -> (codes, scales, book, bits), and the layer's small
+    weights by the names of model.LAYER_KEYS. pre, post, head: the same four things for the three other matrices."""
 
-    def __init__(self, eng: Engine, cfg: M.Config, layers: list, pre: torch.Tensor, post: torch.Tensor, norm: torch.Tensor,
-                 head: torch.Tensor, depth: int = 6):
+    def __init__(self, eng: Engine, cfg: M.Config, layers: list, pre: tuple, post: tuple, norm: torch.Tensor, head: tuple, depth: int = 6):
         self.eng, self.cfg, self.depth, dev = eng, cfg, depth, eng.device
         main = eng.cfg
         assert cfg.kv_shared == cfg.n_layers and cfg.head_dim == main.head_dim and cfg.kv_heads == main.kv_heads
-        assert cfg.window == main.window and pre.shape[1] == 2 * main.hidden
+        assert cfg.window == main.window and pre[0].shape[1] == main.hidden  # the joined input: a code a pair of columns
         self.keep = []
         f32 = lambda t: self._own(t.to(device=dev, dtype=torch.float32).contiguous())  # noqa: E731
         self.c_layers = (DLayer * cfg.n_layers)()
@@ -332,7 +327,8 @@ class EngineDrafter:
             t = cfg.layer_types[i]
             hd = cfg.head_dim[t]
             for name in ("q", "o", "gate", "up", "down"):
-                setattr(cl, name, self._dense(lay[name]))
+                setattr(cl, name, self._mat(*lay["mats"][name]))
+            cl.rot_in, cl.rot_o, cl.rot_mlp, cl.rot_down = self._rot(cfg.hidden), self._rot(cfg.heads * hd), self._rot(cfg.hidden), self._rot(cfg.mlp)
             for name in ("in_ln", "post_attn_ln", "pre_ff_ln", "post_ff_ln", "q_norm"):
                 setattr(cl, name, f32(lay[name]).data_ptr())
             theta, rotated = cfg.rope[t]
@@ -347,7 +343,8 @@ class EngineDrafter:
         c.layers = C.cast(self.c_layers, C.c_void_p)
         c.n_layers, c.hidden, c.mlp, c.heads, c.vocab, c.backbone = cfg.n_layers, cfg.hidden, cfg.mlp, cfg.heads, cfg.vocab, main.hidden
         c.eps = cfg.eps
-        c.pre, c.post, c.head, c.norm = self._dense(pre), self._dense(post), self._dense(head), f32(norm).data_ptr()
+        c.pre, c.post, c.head, c.norm = self._mat(*pre), self._mat(*post), self._mat(*head), f32(norm).data_ptr()
+        c.rot_pre, c.rot_out = self._rot(2 * main.hidden), self._rot(cfg.hidden)
         for name in ("inp", "h", "hn", "logits", "next", "h2"):
             setattr(c, name, getattr(self, name).data_ptr())
         work = eng.work  # wide enough for the main model's matrices: checked here for the drafter's
@@ -358,25 +355,37 @@ class EngineDrafter:
             setattr(c, name, work[name].data_ptr())
         self.sliding, self.full = eng.c_layers[main.last_of(M.SLIDING)], eng.c_layers[main.last_of(M.FULL)]
         self.lib = lib()
-        sizes = [C.c_int() for _ in range(3)]
+        sizes = [C.c_int() for _ in range(2)]
         self.lib.sclmd_draft_sizes(*[C.byref(s) for s in sizes])
-        assert [s.value for s in sizes] == [C.sizeof(Dense), C.sizeof(DLayer), C.sizeof(DrafterC)], "struct layouts differ"
+        assert [s.value for s in sizes] == [C.sizeof(DLayer), C.sizeof(DrafterC)], "struct layouts differ"
         self.lib.sclmd_draft.argtypes = [C.c_void_p, C.c_void_p, C.c_void_p, C.c_int, C.c_int]
 
     @classmethod
-    def load(cls, eng: Engine, folder: str, depth: int = 6) -> "EngineDrafter":
+    def load(cls, eng: Engine, folder: str, name: str, bits: int = 8, depth: int = 6) -> "EngineDrafter":
+        """The drafter in `folder` with its matrices as the stored codes `name` (scripts/quantize_drafter.py)."""
         from .checkpoint import Checkpoint
 
         ck = Checkpoint(folder)
-        layers = [ck.layer(i, "cpu") for i in range(ck.cfg.n_layers)]
-        return cls(eng, ck.cfg, layers, ck.get("pre_projection.weight"), ck.get("post_projection.weight"), ck.norm(), ck.embed(), depth)
+        mats = CD.drafter_stored(name, bits)
+        layers = [ck.layer(i, "cpu", skip=M.LINEARS) | {"mats": {m: mats[f"layers.{i}.{m}"] for m in ("q", "o", "gate", "up", "down")}}
+                  for i in range(ck.cfg.n_layers)]
+        return cls(eng, ck.cfg, layers, mats["pre"], mats["post"], ck.norm(), mats["head"], depth)
+
+    def bytes(self) -> int:
+        return sum(t.numel() * t.element_size() for t in self.keep)
 
     def _own(self, t: torch.Tensor) -> torch.Tensor:
         self.keep.append(t)
         return t
 
-    def _dense(self, w: torch.Tensor) -> Dense:
-        return Dense(self._own(pack_dense(w, self.eng.device)).data_ptr(), w.shape[0], w.shape[1])
+    def _mat(self, codes: torch.Tensor, scales: torch.Tensor, book: torch.Tensor, bits: int) -> Mat:
+        dev = self.eng.device
+        packed, table = self._own(pack(codes, bits, device=dev)), self._own(lut(book.to(dev)))
+        scale = self._own(scales.to(device=dev, dtype=torch.float32).contiguous())
+        return Mat(packed.data_ptr(), table.data_ptr(), scale.data_ptr(), codes.shape[0], codes.shape[1] * 2, bits, 0)
+
+    def _rot(self, cols: int) -> Rot:
+        return self.eng._rot(cols)  # the same rotation as any matrix of the main model with that many columns
 
     def step(self, token_embed: torch.Tensor, hidden: torch.Tensor, length: int) -> tuple[torch.Tensor, torch.Tensor]:
         """One guess for position length + 1 from the token at `length` (its embedding in the main model) and a hidden

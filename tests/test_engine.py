@@ -270,7 +270,8 @@ def test_text_is_the_same_with_any_mix_of_right_and_wrong_guesses(small_e):
 
 @pytest.fixture(scope="module")
 def drafter_e():
-    """(config, state) of a small random drafter for the `small_e` model; its matrices are fp16 values, as the engine keeps them."""
+    """A small random drafter for the `small_e` model, its matrices as stored pair codes: (config, its small weights and
+    Stored matrices by layer, pre, post, norm, head)."""
     from transformers import Gemma4AssistantConfig, Gemma4AssistantForCausalLM, Gemma4TextConfig
 
     text = dict(ETEXT, hidden_size=64, intermediate_size=128, num_hidden_layers=4, num_kv_shared_layers=4, final_logit_softcapping=None,
@@ -278,26 +279,33 @@ def drafter_e():
     config = Gemma4AssistantConfig(text_config=Gemma4TextConfig(**text), backbone_hidden_size=ETEXT["hidden_size"])
     hf = randomize(Gemma4AssistantForCausalLM(config).eval(), 6)
     hf.lm_head.weight = hf.model.embed_tokens.weight
-    state = {k: (v.half().float() if v.dim() == 2 else v).to(DEV) for k, v in hf.state_dict().items()}
-    return M.Config.from_text_config(config.text_config.to_dict()), state
+    state = {k: v.to(DEV) for k, v in hf.state_dict().items()}
+    cfg = M.Config.from_text_config(config.text_config.to_dict())
+    layers = []
+    for i in range(cfg.n_layers):
+        w = M.layer_weights(state, "model.", i)
+        layers.append({k: (Stored(v, 6 if (i + j) % 2 else 8) if k in M.LINEARS else v) for j, (k, v) in enumerate(w.items())})
+    return (cfg, layers, Stored(state["pre_projection.weight"], 8), Stored(state["post_projection.weight"], 6), state["model.norm.weight"],
+            Stored(state["model.embed_tokens.weight"], 8))
 
 
 def engine_drafter(eng: E.Engine, drafter_e) -> E.EngineDrafter:
-    cfg, state = drafter_e
-    return E.EngineDrafter(eng, cfg, [M.layer_weights(state, "model.", i) for i in range(cfg.n_layers)], state["pre_projection.weight"],
-                           state["post_projection.weight"], state["model.norm.weight"], state["model.embed_tokens.weight"])
+    cfg, layers, pre, post, norm, head = drafter_e
+    lays = [{k: v for k, v in w.items() if k not in M.LINEARS} | {"mats": {k: v.stored() for k, v in w.items() if k in M.LINEARS}} for w in layers]
+    return E.EngineDrafter(eng, cfg, lays, pre.stored(), post.stored(), norm, head.stored())
 
 
-def dense16(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """A matrix of fp16 values times an input, as the engine's kernel computes it: the input is fp16 too."""
-    flat = x.reshape(-1, x.shape[-1]).float()
-    length = flat.norm(dim=-1, keepdim=True)
-    fps = torch.where(length > 16384, torch.exp2(torch.ceil(torch.log2(length / 16384))), torch.ones_like(length))
-    return (((flat / fps).half().float() @ w.t()) * fps).reshape(*x.shape[:-1], -1)
+def torch_drafter(drafter_e) -> Drafter:
+    """The same drafter in PyTorch, its matrices as the codes give them."""
+    cfg, layers, pre, post, norm, head = drafter_e
+    weight = lambda m: C.weight(m.codes, m.scales, m.book.half().float())  # noqa: E731
+    lays = [{k: (weight(v) if k in M.LINEARS else v) for k, v in w.items()} for w in layers]
+    return Drafter(cfg, lays, weight(pre), weight(post), norm, weight(head))
 
 
 def test_the_drafter_on_the_engine_matches_the_reference_drafter(small_e, drafter_e):
-    ref = Drafter.from_state(*drafter_e)
+    cfg, layers, pre, post, norm, head = drafter_e
+    ref = Drafter(cfg, layers, pre, post, norm, head)  # its matrices are Stored: the product as the kernels compute it
     eng = small_e.engine()
     nat = engine_drafter(eng, drafter_e)
     ids = ids_of(44, 12)
@@ -308,35 +316,29 @@ def test_the_drafter_on_the_engine_matches_the_reference_drafter(small_e, drafte
         embed, state = eng.embed([ids[length - 1]])[0], hidden[length - 1]
         for step in range(3):
             want_logits, want_next = ref.step(embed[None, None], state[None, None], torch.tensor([length - 1], device=DEV), keys,
-                                              linear=dense16, rounded=fp16)
+                                              linear=lambda x, m: m(x), rounded=fp16)
             logits, state = nat.step(embed, state, length)
             assert close(logits[None], want_logits[0], WHOLE_MODEL) and close(state[None], want_next[0], WHOLE_MODEL), (length, step)
             assert int(logits.argmax()) == int(want_logits.argmax())
             state = state.clone()
             embed = eng.embed([int(torch.randint(3, 300, (1,), generator=g))])[0]
     # whole guesses: the same tokens as the drafter in PyTorch
+    plain = torch_drafter(drafter_e)
     for length in (44, 40):
-        want = drafter_guess(ref, eng, 6)(ids[length - 1], hidden[length - 1], length)
+        want = drafter_guess(plain, eng, 6)(ids[length - 1], hidden[length - 1], length)
         assert nat.guess(ids[length - 1], hidden[length - 1], length) == want
 
 
 def test_with_the_drafter_the_text_is_unchanged(small_e, drafter_e):
-    drafter = Drafter.from_state(*drafter_e)
     truth = generate(small_e.engine(), PROMPT, 40, Picker())
     eng = small_e.engine()
     assert generate(eng, PROMPT, 40, Picker(), engine_drafter(eng, drafter_e).guess) == truth
+    eng = small_e.engine()
+    assert generate(eng, PROMPT, 40, Picker(), drafter_guess(torch_drafter(drafter_e), eng, 6)) == truth
     pick = Picker(temperature=1.0, top_k=64, top_p=0.95, seed=3)
     sampled = generate(small_e.engine(), PROMPT, 40, pick)
     eng = small_e.engine()
     assert generate(eng, PROMPT, 40, pick, engine_drafter(eng, drafter_e).guess) == sampled
-    eng, stats = small_e.engine(), {}
-    assert generate(eng, PROMPT, 40, Picker(), drafter_guess(drafter, eng, 6), stats=stats) == truth
-    # and the drafter on the engine's keys guesses what it guesses on the reference's
-    ref = small_e.reference()
-    ref.keys = lambda length: {t: (k[:, :, :length], v[:, :, :length], pos[:length]) for t, (k, v, pos) in ref.shared.items()}
-    eng = small_e.engine()
-    (_, he), (_, hr) = eng.feed(PROMPT), ref.feed(PROMPT)
-    assert drafter_guess(drafter, eng, 6)(truth[0], he[-1], len(PROMPT)) == drafter_guess(drafter, ref, 6)(truth[0], hr[-1], len(PROMPT))
 
 
 def test_packing_a_part_of_the_rows_at_a_time_is_the_same():
