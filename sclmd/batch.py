@@ -100,13 +100,22 @@ class Batcher:
             rows[j] = 1
             free -= 1
         room = {j: eng.capacity - eng.lengths[j.seq] for j in live}
-        # prompts someone is waiting on, then the reading that is done ahead of need
-        for readers in ([j for j in order if j.pending is None and not j.only_read], [j for j in order if j.only_read]):
-            while free and any(rows.get(j, 0) < min(len(j.todo), room[j]) for j in readers):
+
+        def read(readers: list, most: int) -> int:
+            """Up to `most` rows shared among the readers; how many were given."""
+            given = 0
+            while given < most and any(rows.get(j, 0) < min(len(j.todo), room[j]) for j in readers):
                 for j in readers:
-                    if free and rows.get(j, 0) < min(len(j.todo), room[j]):
+                    if given < most and rows.get(j, 0) < min(len(j.todo), room[j]):
                         rows[j] = rows.get(j, 0) + 1
-                        free -= 1
+                        given += 1
+            return given
+
+        # prompts someone is waiting on; then the reading done ahead of need, a quarter of the pass at most while
+        # texts are being written (their guesses come before the rest of it)
+        ahead = [j for j in order if j.only_read]
+        free -= read([j for j in order if j.pending is None and not j.only_read], free)
+        free -= read(ahead, min(free, width // 4) if writers else free)
         if self.drafter is not None:
             able = lambda j: min(self.depth, j.max_new - len(j.out), room[j] - 1)  # noqa: E731
             while free and any(rows[j] - 1 < able(j) for j in writers if j in rows):
@@ -114,6 +123,7 @@ class Batcher:
                     if free and j in rows and rows[j] - 1 < able(j):
                         rows[j] += 1
                         free -= 1
+        read(ahead, free)
         return rows
 
     @torch.no_grad()

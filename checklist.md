@@ -8,13 +8,13 @@
   - HTTP로 클라이언트 8개: 합계 300 tok/s, 둘째 턴의 첫 토큰 0.17초(프롬프트 2,031토큰 중 1,930이 남아 있음). 16개: 첫 턴 388 tok/s
   - 한 통과가 여러 대화의 토큰을 최대 32행까지 함께 처리. 대화의 키·값은 쓴 만큼만 차지하고, 기다리는 대화는 모자라면 RAM으로 갔다가 돌아옴. 메모리가 모자라도 답이 잘리지 않고 기다렸다 이어 씀
   - 한계는 키·값 메모리: 기본 설정(전부 3bit, 직접 쓴 글 KL 약 0.10)에서 2.3GiB = 짧은 대화 5,400토큰어치(500토큰 대화 11개)를 동시에 GPU에 둠. `--kv-gib`를 줄이면 그만큼 4bit 행렬이 늘어 품질이 오르고 동시 대화가 줆
-- **채팅도 좋아짐 (`chat.bat`, 같은 VRAM 13.6GiB)**: 키·값을 int8로 두어 0.70GiB가 남았고 그만큼 4bit 행렬이 늘어 **평균 3.29 → 3.48bit, 직접 쓴 글 기준 KL 예측 0.049 → 0.033** (int8 자체의 손실은 원본 대비 KL +0.0005). 프롬프트 읽기는 한 통과 16토큰으로 370 → 590 tok/s. 긴 답의 속도는 그대로(115~190 tok/s)
-- **② 벤치마크: 도는 중** (00:38 시작; 순서 `data\bench\queue.txt`, 진행 `logs\bench_queue.log`, 답 `data\bench\replies`, 채점 `..\.venv\Scripts\python -I scripts\bench_score.py`, 요약 `data\bench_summary.json`)
-  - 방식: 채팅이 답하는 그대로(생각 켬, temperature 1.0, top_p 0.95, top_k 64, 드래프터), 문항마다 답 하나. **밤을 시작할 때의 엔진(3.29bit, fp16 키·값)을 얼린 사본**(`.claude\worktrees\bench`)에서 돌므로, 위의 3.48bit보다 조금 낮은 설정의 점수임
-  - 설정 A (3.29bit, 문맥 8,192): MMLU-Pro, MMMLU 한국어, MMLU, KMMLU, GSM8K, HumanEval
-  - 설정 B (3.20bit, 문맥 16,384): AIME 2026, LiveCodeBench v6, BBEH. 생각이 8,192를 넘겨서 잘리기 때문(AIME 한 문제가 13,152토큰)
+- **채팅도 좋아짐 (`chat.bat`, 같은 VRAM 13.6GiB)**: 키·값을 int8로 두어 0.70GiB가 남았고 그만큼 4bit 행렬이 늘어 **평균 3.29 → 3.48bit. 처음 보는 직접 쓴 글(`own_v2`)에서 원본 대비 KL 0.039** (3.26bit 배분은 0.055였음; 첫 선택 일치 96.4%; int8 자체의 손실은 따로 +0.0005~0.0014). 프롬프트 읽기는 한 통과 16토큰으로 370 → 590 tok/s. 긴 답의 속도는 그대로(115~190 tok/s)
+- **② 벤치마크: 도는 중** (02:08에 다시 시작; 순서 `data\bench\queue.txt`, 진행 `logs\bench_queue.log`, 답 `data\bench\replies`, 채점 `..\.venv\Scripts\python -I scripts\bench_score.py`, 요약 `data\bench_summary.json`)
+  - 방식: 채팅이 답하는 그대로(생각 켬, temperature 1.0, top_p 0.95, top_k 64, 드래프터), 문항마다 답 하나
+  - **설정 하나: 지금 채팅이 올리는 가중치(3.49bit `fit_own_v1_11.9`, int8 키·값)에 문맥만 16,384.** 생각이 채팅 기본 문맥 8,192를 넘기는 문항이 많아서임(AIME 한 문제 13,152토큰, MMLU-Pro도 36문항 중 5개). 요약에는 8,192였다면 받았을 점수도 함께 나옴. 얼린 사본(`.claude\worktrees\bench`)에서 돌므로 본 작업 트리의 수정이 섞이지 않음
+  - 순서: 먼저 과제마다 한 조각(MMLU-Pro 70, AIME 30, LiveCodeBench 35, MMMLU 한국어 114, GSM8K 100, HumanEval 164, BBEH 23, KMMLU 90, MMLU 114), 다음에 원본과 맞대기(MMLU-Pro 2,800문항, 생각 없이 답 글자만: `scripts/bench_paired.py`), 그 뒤로 각 과제를 늘림. 전체는 하루 넘게 걸림: 필요하면 `logs\pause`
+  - 00:38~02:07에 옛 설정(3.29bit, fp16 키·값, 문맥 8,192)으로 돌린 것은 따로 둠(`data\bench_summary_3.29bit_fp16.json`): GSM8K 150문항 98.7%, HumanEval 164문항 99.4%, MMLU-Pro 36문항 63.9%(5개가 문맥 초과로 답 없음)
   - 못 돌리는 것: GPQA Diamond·HLE(접근 승인이 필요한 데이터셋인데 이 계정에 권한이 없음: huggingface.co/datasets/Idavidrein/gpqa, cais/hle에서 신청하면 됨), Tau2(사용자 역할을 할 두 번째 모델이 필요), MRCR 128k(문맥이 VRAM에 안 들어감), 시각·음성 세트
-  - 지금까지 (02:10): GSM8K 150문항 98.7%, HumanEval 164문항 99%대. 나머지는 대기열 순서대로
 - 속도 그대로인 것: 채팅의 긴 답 136~150 tok/s, 드래프터를 끄면 43~45 tok/s
 - 확인 못 한 것: 실제 콘솔에서의 Ctrl+C·입력 중 키 숨김·생각 줄 덮어쓰기(파이프 입력으로만 돌려 봄), 서버를 실제 클라이언트 앱(Open WebUI 등)에 붙여 보는 것, 문맥 8,192 초과에서의 품질
 
@@ -80,4 +80,4 @@
 - [x] 문항 준비·생성·채점을 나눔 (`scripts/bench_prepare.py`, `bench.py`, `bench_score.py`), 멈췄다 이어가는 대기열 (`bench_queue.sh`)
 - [ ] 모델 카드: MMLU-Pro, AIME 2026 (4회), LiveCodeBench v6 (175문제), BBEH, MMMLU 한국어: 도는 중
 - [ ] 그 외: GSM8K, HumanEval, MMLU, KMMLU: 도는 중
-- [ ] 원본과 같은 문항으로 맞대기 (생각 없이 답 글자만): 아직 안 함
+- [ ] 원본과 같은 문항으로 맞대기 (`scripts/bench_paired.py`, 생각 없이 답 글자만): 64문항으로 돌려 봄(원본 60.9%, 우리 56.3%, 답 13개가 다름; 원본을 float32로 계산한 것과도 5개가 다름: 문항 수가 적어 아무 말도 못 함). 2,800문항은 대기열에 있음

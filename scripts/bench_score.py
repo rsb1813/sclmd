@@ -295,6 +295,8 @@ def score_task(bench: str, task: str, tag: str, files: list, run_code: bool) -> 
            "score": round(100 * k / max(n, 1), 1), "low": round(100 * lo, 1), "high": round(100 * hi, 1), "card": CARD.get(task),
            "no_answer": sum(got is None for r, got, _ in rows), "cut": sum(not r.get("ended", False) and not r.get("looped", False) for r in ok),
            "looped": sum(r.get("looped", False) for r in ok), "errors": n - len(ok),
+           "over_8k": sum(r["prompt_tokens"] + r["tokens"] > 8192 - 8 for r in ok),
+           "score_at_8k": round(100 * sum(right and r.get("prompt_tokens", 0) + r.get("tokens", 0) <= 8192 - 8 for r, _, right in rows) / max(n, 1), 1),
            "mean_tokens": round(tokens / max(len(ok), 1)), "mean_thinking": round(sum(r["think_tokens"] for r in ok) / max(len(ok), 1)),
            "tok_s": round(tokens / max(seconds, 1e-9), 1), "hours": round(seconds / 3600, 2)}
     if task in NOTE:
@@ -322,13 +324,16 @@ def main():
     for r in results:
         card = f"{r['card']:.1f}" if r["card"] is not None else "  - "
         print(f"{r['task']:12s} {r['score']:5.1f}% ({r['low']:.1f}-{r['high']:.1f}) card {card} | {r['correct']}/{r['items']} of {r['of']}, "
-              f"no answer {r['no_answer']}, cut {r['cut']}, looped {r['looped']}, errors {r['errors']} | {r['mean_tokens']} tokens a reply "
+              f"no answer {r['no_answer']}, cut {r['cut']}, looped {r['looped']}, errors {r['errors']}, over 8k {r['over_8k']} "
+              f"(score with an 8,192 context {r['score_at_8k']}%) | {r['mean_tokens']} tokens a reply "
               f"({r['mean_thinking']} thinking), {r['tok_s']} tok/s, {r['hours']} h", flush=True)
     if not args.smoke and not args.tasks:
         path = os.path.join(os.path.dirname(args.bench), "bench_summary.json")
         with open(path, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"plan": "fit_own_v1_11.2.json", "context": 8192, "sampling": "temperature 1.0, top_p 0.95, top_k 64, thinking on",
-                       "interval": "Wilson 95%", "tasks": results}, f, ensure_ascii=False, indent=2)
+            json.dump({"plan": "fit_own_v1_11.9.json (3.49 bits a weight, int8 keys and values: what the chat loads)", "context": 16384,
+                       "sampling": "temperature 1.0, top_p 0.95, top_k 64, thinking on, one reply an item", "interval": "Wilson 95%",
+                       "cut": "replies that ran out of the 16,384 tokens; over_8k: replies that would not have fitted the chat's default 8,192",
+                       "tasks": results}, f, ensure_ascii=False, indent=2)
 
 
 if __name__ == "__main__":

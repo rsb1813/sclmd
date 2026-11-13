@@ -1,121 +1,74 @@
 {
-  "plan": "fit_own_v1_11.2.json",
-  "context": 8192,
-  "sampling": "temperature 1.0, top_p 0.95, top_k 64, thinking on",
+  "plan": "fit_own_v1_11.9.json (3.49 bits a weight, int8 keys and values: what the chat loads)",
+  "context": 16384,
+  "sampling": "temperature 1.0, top_p 0.95, top_k 64, thinking on, one reply an item",
   "interval": "Wilson 95%",
+  "cut": "replies that ran out of the 16,384 tokens; over_8k: replies that would not have fitted the chat's default 8,192",
   "tasks": [
-    {
-      "task": "gsm8k",
-      "runs": 1,
-      "items": 150,
-      "of": 1319,
-      "correct": 148,
-      "score": 98.7,
-      "low": 95.3,
-      "high": 99.6,
-      "card": null,
-      "no_answer": 1,
-      "cut": 1,
-      "looped": 0,
-      "errors": 0,
-      "mean_tokens": 1045,
-      "mean_thinking": 776,
-      "tok_s": 160.3,
-      "hours": 0.27
-    },
-    {
-      "task": "humaneval",
-      "runs": 1,
-      "items": 164,
-      "of": 164,
-      "correct": 163,
-      "score": 99.4,
-      "low": 96.6,
-      "high": 99.9,
-      "card": null,
-      "no_answer": 0,
-      "cut": 0,
-      "looped": 0,
-      "errors": 0,
-      "mean_tokens": 1200,
-      "mean_thinking": 940,
-      "tok_s": 155.3,
-      "hours": 0.35
-    },
     {
       "task": "mmlu_pro",
       "runs": 1,
-      "items": 36,
+      "items": 11,
       "of": 12032,
-      "correct": 23,
-      "score": 63.9,
-      "low": 47.6,
-      "high": 77.5,
+      "correct": 8,
+      "score": 72.7,
+      "low": 43.4,
+      "high": 90.3,
       "card": 85.2,
-      "no_answer": 5,
-      "cut": 5,
-      "looped": 0,
+      "no_answer": 1,
+      "cut": 0,
+      "looped": 1,
       "errors": 0,
-      "mean_tokens": 3520,
-      "mean_thinking": 3054,
-      "tok_s": 131.0,
-      "hours": 0.27,
+      "over_8k": 1,
+      "score_at_8k": 72.7,
+      "mean_tokens": 2988,
+      "mean_thinking": 2498,
+      "tok_s": 139.2,
+      "hours": 0.07,
       "by": {
         "biology": [
-          2,
-          3
+          1,
+          1
         ],
         "business": [
-          3,
-          3
+          1,
+          1
         ],
         "chemistry": [
           0,
-          3
+          1
         ],
         "computer science": [
-          2,
-          3
+          0,
+          1
         ],
         "economics": [
-          3,
-          3
+          1,
+          1
         ],
         "engineering": [
-          1,
-          3
+          0,
+          1
         ],
         "health": [
-          2,
-          3
+          1,
+          1
         ],
         "history": [
-          2,
-          3
+          1,
+          1
         ],
         "law": [
           1,
-          2
+          1
         ],
         "math": [
-          2,
-          2
+          1,
+          1
         ],
         "other": [
-          2,
-          2
-        ],
-        "philosophy": [
-          0,
-          2
-        ],
-        "physics": [
           1,
-          2
-        ],
-        "psychology": [
-          2,
-          2
+          1
         ]
       }
     }
