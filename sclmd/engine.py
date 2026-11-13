@@ -71,7 +71,7 @@ def words(codes: torch.Tensor, bits: int) -> int:
     return rows // 16 * (4 * pairs if bits == 8 else 3 * pairs)
 
 
-def pack(codes: torch.Tensor, bits: int, strips_at_once: int = 256, device=None, out: torch.Tensor | None = None) -> torch.Tensor:
+def pack(codes: torch.Tensor, bits: int, strips_at_once: int = 64, device=None, out: torch.Tensor | None = None) -> torch.Tensor:
     """codes (uint8 [rows, cols / 2], a code per pair of columns) in the order the kernel reads them (int32), on
     `device` (default: where the codes are), or into `out` (words(codes, bits) long). Done a part of the rows at a
     time, each part moved to the device by itself: the temporaries are 16 times the codes, and the head's codes
