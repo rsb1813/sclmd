@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+.pytest_cache/
+engine/build/
+bench/build/
+logs/
+data/*
+!data/*.json
+
+# never commit weights or tensors, wherever they land
+*.safetensors
+*.pt
+*.pth
+*.bin
+*.gguf
+*.npz
+*.npy
+.claude/worktrees/
