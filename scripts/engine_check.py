@@ -73,10 +73,10 @@ def main():
     for r, s in enumerate(rows):
         eng.crop(0)
         seq = ids[s].tolist()
-        for a in range(0, n, E.MAX_TOKENS):
-            logits, _ = eng.feed(seq[a : a + E.MAX_TOKENS])
-            hidden[r, a : a + E.MAX_TOKENS] = eng.h[: E.MAX_TOKENS].cpu()
-            if a == n - E.MAX_TOKENS:
+        for a in range(0, n, eng.rows):
+            logits, _ = eng.feed(seq[a : a + eng.rows])
+            hidden[r, a : a + eng.rows] = eng.h[: eng.rows].cpu()
+            if a == n - eng.rows:
                 sample.append((r, a, logits.cpu()))
     torch.cuda.synchronize()
     if rows:
@@ -105,7 +105,7 @@ def main():
         # the head's kernel: the engine's logits against PyTorch's from the engine's own last outputs
         worst = 0.0
         for r, a, logits in sample:
-            want = M.logits_of(cfg, hidden[r, a : a + E.MAX_TOKENS].to(DEV), norm, test_embed)
+            want = M.logits_of(cfg, hidden[r, a : a + eng.rows].to(DEV), norm, test_embed)
             worst = max(worst, ((logits.to(DEV) - want).abs().amax(-1) / want.abs().amax(-1)).max().item())
         report["head_kernel_worst"] = worst
         print(f"[engine] head kernel against PyTorch: worst difference {worst:.1e} of the largest logit", flush=True)

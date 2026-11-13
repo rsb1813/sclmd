@@ -1,6 +1,8 @@
-// The engine: one pass of the Gemma 4 decoder over up to eight new tokens, on the GPU, from pair codes.
-// The eight may belong to several sequences (conversations): a pass is made of segments, each a run of rows that are
+// The engine: one pass of the Gemma 4 decoder over up to 32 new tokens (rows), on the GPU, from pair codes.
+// The rows may belong to several sequences (conversations): a pass is made of segments, each a run of rows that are
 // consecutive positions of one sequence, and a row attends only to its own sequence.
+// A pass costs little more for 8 rows than for one, 1.1 times as much for 16 and 1.6 times for 32 (the codes are
+// read and decoded once whatever the rows; scripts/wide_probe.py).
 //
 // All memory is PyTorch's (the caller allocates it and hands over addresses); the kernels run in its CUDA context on
 // the default stream. A pass is one call (sclmd_pass): no Python between the layers.
@@ -18,8 +20,8 @@
 
 #define API extern "C" __declspec(dllexport)
 
-static const int MAX_TOKENS = 8;  // the eight columns of the tensor-core instruction
-static const int MAX_SEGS = 8;    // segments of a pass: at most a sequence a row
+static const int MAX_TOKENS = 32;  // rows of a pass: up to four groups of the eight columns of the tensor-core instruction
+static const int MAX_SEGS = 32;    // segments of a pass: at most a sequence a row
 
 // The rows of a pass by sequence: segment i is rows row0[i] .. row0[i] + cnt[i] - 1 (the segments follow each other
 // and cover every row), positions pos0[i] .. of sequence seq[i].
@@ -76,19 +78,19 @@ struct Model {
     Mat head;
     Rot rot_head;
     const float* norm;  // the final norm [hidden]
-    // work memory
-    float* h;        // [8][hidden] the residual stream of the tokens of this pass (in: the embeddings; out: the last layer's output)
-    float* h2;       // [8][hidden] where the residual stream's next step is written (the two take turns)
-    float* fps;      // [8] the power of two an input was divided by to fit fp16
-    uint64_t* xf;    // [widest input / 16][32] a matrix's input as the instruction reads it
-    float* y;        // [8][widest output] a matrix's output
-    float* y2;       // [8][mlp] (up's output beside gate's)
-    uint16_t* qhat;  // [8][heads * widest head] the queries, normalized and rotated (fp16)
-    float* scores;   // [kv heads * queries][positions in whole tiles] attention scores
+    // work memory; [rows]: the most rows a pass of this model may have (8, 16 or 32: the caller sizes the memory)
+    float* h;        // [rows][hidden] the residual stream of the tokens of this pass (in: the embeddings; out: the last layer's output)
+    float* h2;       // [rows][hidden] where the residual stream's next step is written (the two take turns)
+    float* fps;      // [rows] the power of two an input was divided by to fit fp16
+    uint64_t* xf;    // [rows / 8][widest input / 16][32] a matrix's input as the instruction reads it, eight rows a group
+    float* y;        // [rows][widest output] a matrix's output
+    float* y2;       // [rows][mlp] (up's output beside gate's)
+    uint16_t* qhat;  // [rows][heads * widest head] the queries, normalized and rotated (fp16)
+    float* scores;   // [kv heads * queries][positions in whole tiles] attention scores, segment after segment
     uint16_t* probs; // the same layout: attention weights (fp16)
-    float* attn;     // [8][heads * widest head] attention's output
-    float* hn;       // [8][hidden] the last output after the final norm (what the drafter is handed)
-    float* logits;   // [8][vocab]
+    float* attn;     // [rows][heads * widest head] attention's output
+    float* hn;       // [rows][hidden] the last output after the final norm (what the drafter is handed)
+    float* logits;   // [rows][vocab]
 };
 
 __device__ __forceinline__ void mma(float c[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
@@ -144,7 +146,8 @@ __device__ __forceinline__ float gelu_tanh(float v) {
 //  2. the value: mode 0: RMS norm of h times w; 1: h as it is; 2: gelu(h) * b. Written to v_out if given.
 //  3. signs and the Hadamard transform over the run (with a rotation), over the power of two that brings the whole
 //     input's length under 2^14, so that no value leaves fp16's range (fps[token]); then fp16 in the order the
-//     instruction reads: for tile j, lane 4 * token + t of xf holds the values at columns 16j + 2t, + 1, + 8, + 9.
+//     instruction reads: for tile j, lane 4 * (token % 8) + t of the token's group of eight in xf holds the values
+//     at columns 16j + 2t, + 1, + 8, + 9 (a group is the n / 16 tiles of the input).
 // Sums over the whole input are made by every block for itself: they are small next to the matrix that follows,
 // and a kernel less is worth more.
 __global__ void prep_k(const float* a, const float* b, const float* w, const float* y, const float* post, float scalar, float* h_out,
@@ -197,16 +200,18 @@ __global__ void prep_k(const float* a, const float* b, const float* w, const flo
         const uint64_t word = uint64_t(__half_as_ushort(__float2half(buf[i] * k))) | uint64_t(__half_as_ushort(__float2half(buf[i + 1] * k))) << 16 |
                               uint64_t(__half_as_ushort(__float2half(buf[i + 8] * k))) << 32 |
                               uint64_t(__half_as_ushort(__float2half(buf[i + 9] * k))) << 48;
-        xf[size_t(col >> 4) * 32 + 4 * token + t] = word;
+        xf[(size_t(token >> 3) * (n >> 4) + (col >> 4)) * 32 + 4 * (token & 7) + t] = word;
     }
 }
 
 // y[token][row] = scale[row] * fps[token] * sum over columns of W[row][col] * x[token][col], one block a strip of 16
 // rows, its `segs` warps splitting the strip's tiles (a multiple of 4 each) between them. Up to three matrices that
 // share the input go in one launch: the blocks are the first one's strips, then the second's, then the third's.
+// G: the groups of eight tokens. A tile's codes are read and decoded once and multiplied with each group's inputs.
+template <int G>
 __global__ void gemm_k(Mat m0, Mat m1, Mat m2, float* y0, float* y1, float* y2, const uint64_t* xf, const float* fps, int segs, int tokens) {
     __shared__ uint32_t slut[256];
-    __shared__ float part[8][32][4];
+    __shared__ float part[8][32][4 * G];
     int strip = blockIdx.x;
     Mat m = m0;
     float* y = y0;
@@ -218,40 +223,54 @@ __global__ void gemm_k(Mat m0, Mat m1, Mat m2, float* y0, float* y1, float* y2, 
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int tiles = m.cols / 16, per = tiles / segs, first = warp * per;
-    float c[4] = {0, 0, 0, 0};
+    float c[G][4];
+    for (int g = 0; g < G; ++g) c[g][0] = c[g][1] = c[g][2] = c[g][3] = 0;
     const uint64_t* xw = xf + size_t(first) * 32 + lane;
+    const size_t group = size_t(tiles) * 32;  // a group's inputs follow the group before
     if (m.bits == 8) {
         const uint32_t* cw = m.codes + (size_t(strip) * tiles + first) * 32 + lane;
         for (int j = 0; j < per; j += 4) {
             uint32_t w[4];
-            uint64_t b[4];
-            for (int i = 0; i < 4; ++i) w[i] = cw[size_t(j + i) * 32], b[i] = xw[size_t(j + i) * 32];
-            for (int i = 0; i < 4; ++i)
-                mma(c, slut[w[i] & 255], slut[w[i] >> 8 & 255], slut[w[i] >> 16 & 255], slut[w[i] >> 24], uint32_t(b[i]), uint32_t(b[i] >> 32));
+            for (int i = 0; i < 4; ++i) w[i] = cw[size_t(j + i) * 32];
+            for (int i = 0; i < 4; ++i) {
+                const uint32_t a0 = slut[w[i] & 255], a1 = slut[w[i] >> 8 & 255], a2 = slut[w[i] >> 16 & 255], a3 = slut[w[i] >> 24];
+                for (int g = 0; g < G; ++g) {
+                    const uint64_t b = xw[g * group + size_t(j + i) * 32];
+                    mma(c[g], a0, a1, a2, a3, uint32_t(b), uint32_t(b >> 32));
+                }
+            }
         }
     } else {  // 6 bits a pair: four tiles of a lane are 16 codes in 96 bits, stored as three words
         const uint32_t* cw = m.codes + (size_t(strip) * (tiles / 4) + first / 4) * 96 + lane;
         for (int j = 0; j < per; j += 4) {
             const uint32_t* q = cw + size_t(j / 4) * 96;
             const uint64_t lo = uint64_t(q[0]) | uint64_t(q[32]) << 32, hi = q[64];
-            uint64_t b[4];
-            for (int i = 0; i < 4; ++i) b[i] = xw[size_t(j + i) * 32];
             const uint32_t k10 = uint32_t(lo >> 60 | hi << 4) & 63;
-            mma(c, slut[lo & 63], slut[lo >> 6 & 63], slut[lo >> 12 & 63], slut[lo >> 18 & 63], uint32_t(b[0]), uint32_t(b[0] >> 32));
-            mma(c, slut[lo >> 24 & 63], slut[lo >> 30 & 63], slut[lo >> 36 & 63], slut[lo >> 42 & 63], uint32_t(b[1]), uint32_t(b[1] >> 32));
-            mma(c, slut[lo >> 48 & 63], slut[lo >> 54 & 63], slut[k10], slut[hi >> 2 & 63], uint32_t(b[2]), uint32_t(b[2] >> 32));
-            mma(c, slut[hi >> 8 & 63], slut[hi >> 14 & 63], slut[hi >> 20 & 63], slut[hi >> 26 & 63], uint32_t(b[3]), uint32_t(b[3] >> 32));
+            const uint32_t a[16] = {slut[lo & 63],       slut[lo >> 6 & 63],  slut[lo >> 12 & 63], slut[lo >> 18 & 63],
+                                    slut[lo >> 24 & 63], slut[lo >> 30 & 63], slut[lo >> 36 & 63], slut[lo >> 42 & 63],
+                                    slut[lo >> 48 & 63], slut[lo >> 54 & 63], slut[k10],           slut[hi >> 2 & 63],
+                                    slut[hi >> 8 & 63],  slut[hi >> 14 & 63], slut[hi >> 20 & 63], slut[hi >> 26 & 63]};
+            for (int g = 0; g < G; ++g) {
+                const uint64_t* x = xw + g * group + size_t(j) * 32;
+                const uint64_t b0 = x[0], b1 = x[32], b2 = x[64], b3 = x[96];
+                mma(c[g], a[0], a[1], a[2], a[3], uint32_t(b0), uint32_t(b0 >> 32));
+                mma(c[g], a[4], a[5], a[6], a[7], uint32_t(b1), uint32_t(b1 >> 32));
+                mma(c[g], a[8], a[9], a[10], a[11], uint32_t(b2), uint32_t(b2 >> 32));
+                mma(c[g], a[12], a[13], a[14], a[15], uint32_t(b3), uint32_t(b3 >> 32));
+            }
         }
     }
-    for (int i = 0; i < 4; ++i) part[warp][lane][i] = c[i];
+    for (int g = 0; g < G; ++g)
+        for (int i = 0; i < 4; ++i) part[warp][lane][4 * g + i] = c[g][i];
     __syncthreads();
     if (warp) return;
-    for (int i = 0; i < 4; ++i) {
-        float sum = 0;
-        for (int w = 0; w < segs; ++w) sum += part[w][lane][i];
-        const int row = strip * 16 + (lane >> 2) + (i >= 2 ? 8 : 0), token = 2 * (lane & 3) + (i & 1);
-        if (token < tokens) y[size_t(token) * m.rows + row] = m.scale[row] * fps[token] * sum;
-    }
+    for (int g = 0; g < G; ++g)
+        for (int i = 0; i < 4; ++i) {
+            float sum = 0;
+            for (int w = 0; w < segs; ++w) sum += part[w][lane][4 * g + i];
+            const int row = strip * 16 + (lane >> 2) + (i >= 2 ? 8 : 0), token = 8 * g + 2 * (lane & 3) + (i & 1);
+            if (token < tokens) y[size_t(token) * m.rows + row] = m.scale[row] * fps[token] * sum;
+        }
 }
 
 // What attention does to the projections' outputs, block (vector, token) with head_dim threads. Vector v of a token is
@@ -396,8 +415,13 @@ static int segs_for(int cols) {
 // One launch for a matrix, or for up to three that share the input in xf (b and c may have no rows).
 static void gemm(const uint64_t* xf, const float* fps, int tokens, const Mat& a, float* ya, const Mat& b = Mat{}, float* yb = nullptr,
                  const Mat& c = Mat{}, float* yc = nullptr) {
-    const int segs = segs_for(a.cols);
-    gemm_k<<<(a.rows + b.rows + c.rows) / 16, 32 * segs>>>(a, b, c, ya, yb, yc, xf, fps, segs, tokens);
+    const int segs = segs_for(a.cols), blocks = (a.rows + b.rows + c.rows) / 16;
+    if (tokens <= 8)
+        gemm_k<1><<<blocks, 32 * segs>>>(a, b, c, ya, yb, yc, xf, fps, segs, tokens);
+    else if (tokens <= 16)
+        gemm_k<2><<<blocks, 32 * segs>>>(a, b, c, ya, yb, yc, xf, fps, segs, tokens);
+    else  // a pass of 17 to 24 rows multiplies a fourth group that nothing has written and nothing reads the products of
+        gemm_k<4><<<blocks, 32 * segs>>>(a, b, c, ya, yb, yc, xf, fps, segs, tokens);
 }
 
 // What prep_k is told of the residual step still owed: the matrix output it adds, the norm's weight and the layer's scalar.
@@ -478,7 +502,7 @@ API int sclmd_pass(const Model* mp, int tokens, const Segs* segs) {
         prep(m, h, nullptr, l.in_ln, n, l.rot_in, 0, tokens, owed, spare);
         if (owed.y) std::swap(h, spare);
         tick(P_INPUT);
-        float *yq = m.y, *yk = m.y + size_t(MAX_TOKENS) * nqo, *yv = yk + size_t(MAX_TOKENS) * nkv;
+        float *yq = m.y, *yk = m.y + size_t(tokens) * nqo, *yv = yk + size_t(tokens) * nkv;
         gemm(m.xf, m.fps, tokens, l.q, yq, l.k, yk, l.v, yv);  // a full-attention layer's v has no rows
         tick(P_QKV);
         const Att a = att_for(*segs, l.full, m.heads, m.window - 1);
@@ -540,13 +564,13 @@ struct Drafter {
     Mat pre, post, head;
     Rot rot_pre, rot_out;  // of the joined input, and of the final norm's output (the head's and post's input)
     const float* norm;
-    // work memory, a row a sequence (up to eight)
-    float* in;      // [8][2 * backbone] the token's embedding in the main model, then a hidden state: the main model's last output, or `next`
-    float* h;       // [8][hidden]
-    float* hn;      // [8][hidden] after the final norm
-    float* logits;  // [8][vocab]
-    float* next;    // [8][backbone] the hidden state for the guess after this one
-    float* h2;      // [8][hidden] the residual stream's other state (see sclmd_pass)
+    // work memory, a row a sequence (as many as the main model's passes have rows)
+    float* in;      // [rows][2 * backbone] the token's embedding in the main model, then a hidden state: the main model's last output, or `next`
+    float* h;       // [rows][hidden]
+    float* hn;      // [rows][hidden] after the final norm
+    float* logits;  // [rows][vocab]
+    float* next;    // [rows][backbone] the hidden state for the guess after this one
+    float* h2;      // [rows][hidden] the residual stream's other state (see sclmd_pass)
     float* fps;     // the rest as in Model (it may be the main model's own work memory)
     uint64_t* xf;
     float *y, *y2;

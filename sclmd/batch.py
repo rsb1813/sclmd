@@ -1,13 +1,26 @@
 # Several texts at once on one engine: every pass of the main model carries rows of several sequences.
 #
-# A pass has eight rows. A text that is being written needs one (the token it settled last); a prompt that is still
-# being read takes as many as it is given; rows left over carry the drafter's guesses, which the main model verifies
-# as in generate.py. Whatever the mix, a text's tokens are the ones it would get alone: the engine computes a row the
-# same beside any others, and a choice depends only on (seed, position).
+# A pass has 8, 16 or 32 rows. A text that is being written needs one (the token it settled last); a prompt that is
+# still being read takes as many as it is given; rows left over carry the drafter's guesses, which the main model
+# verifies as in generate.py. A wider pass costs more (COST), so the width is the one whose rows are expected to
+# yield the most tokens for the time. Whatever the mix, a text's tokens are the ones it would get alone: the engine
+# computes a row the same beside any others, and a choice depends only on (seed, position).
 import torch
 
 from . import engine as E
 from .generate import Picker
+
+
+# What a pass of up to 16, 24 or 32 rows costs next to one of up to 8 (scripts/pass_profile.py --rows 32 on the real
+# model at 3 bits a weight: 21.7 ms for 8 rows, 27.0 for 16, 38.3 for 24, 42.4 for 32)
+COST = ((8, 1.0), (16, 1.25), (24, 1.77), (32, 1.95))
+
+
+def cost(rows: int) -> float:
+    return next(c for most, c in COST if rows <= most)
+
+# How often the guess at depth 1, 2, ... is kept: where the batcher starts from; it goes by what it sees after that
+KEEP = (0.75, 0.56, 0.42, 0.32, 0.25, 0.20)
 
 
 class Job:
@@ -47,19 +60,37 @@ class Batcher:
         self.turn = 0
         self.make_room = None  # called when the pool of keys and values is empty: frees some and says so, or says no
         self.passes = self.rows = self.guess_rows = self.kept_rows = 0
+        self.widths = {8: 0, 16: 0, 32: 0}  # passes by width
+        self.sent = [20.0] * len(KEEP)  # guesses sent at each depth, and those kept (starting as if KEEP had been seen 20 times)
+        self.held = [20.0 * k for k in KEEP]
 
     def add(self, job: Job):
         assert job.todo or job.pending is not None, "a job starts with a prompt"
         self.jobs.append(job)
 
     def _share(self, live: list) -> dict:
-        """Rows of the next pass by job. Every text being written gets one (when there are more than eight, in turn);
-        the prompts being read share what is left; then guesses, one more for each writer in turn."""
-        eng = self.eng
+        """Rows of the next pass by job, at the width that is expected to yield the most tokens for its time."""
         at = self.turn % len(live)
         order = live[at:] + live[:at]
+        keep = [h / s for h, s in zip(self.held, self.sent)]
+        best = None
+        for width in (8, 16, 32):
+            if width > self.eng.rows:
+                break
+            rows = self._fill(order, width)
+            total = sum(rows.values())
+            gain = sum(n if j.pending is None else 1 + sum(keep[: n - 1]) for j, n in rows.items())
+            rate = gain / cost(total)
+            if best is None or rate > 1.03 * best[0]:  # a wider pass has to be clearly worth it
+                best = (rate, rows)
+        return best[1]
+
+    def _fill(self, order: list, width: int) -> dict:
+        """Rows of a pass of `width` rows by job. Every text being written gets one (when there are more than fit, in
+        turn); the prompts being read share what is left; then guesses, one more for each writer in turn."""
+        eng, live = self.eng, order
         writers = [j for j in order if j.pending is not None]
-        rows, free = {}, E.MAX_TOKENS
+        rows, free = {}, width
         for j in writers[:free]:
             rows[j] = 1
             free -= 1
@@ -129,6 +160,8 @@ class Batcher:
                 parts.append((j.seq, [j.pending] + guesses.get(j, [])))
         logits, hidden = eng.run(parts)
         self.passes += 1
+        total = sum(len(ids) for _, ids in parts)
+        self.widths[8 if total <= 8 else 16 if total <= 16 else 32] += 1
         row = 0
         for j, (_, ids) in zip(use, parts):
             n, lg, hn = len(ids), logits[row : row + len(ids)], hidden[row : row + len(ids)]
@@ -155,6 +188,9 @@ class Batcher:
                     j.emit(d)
                 kept += 1
             self.guess_rows, self.kept_rows = self.guess_rows + len(drafts), self.kept_rows + kept
+            for k in range(len(drafts)):
+                self.sent[k] += 1
+                self.held[k] += k < kept
             if kept < len(drafts):
                 eng.crop(at - n + 1 + kept, j.seq)
             if len(j.out) >= j.max_new:

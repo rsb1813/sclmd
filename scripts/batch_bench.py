@@ -58,6 +58,7 @@ def main():
     ap.add_argument("--think", action="store_true")
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--no-drafter", action="store_true")
+    ap.add_argument("--rows", type=int, default=32, help="the most rows of a pass (8, 16 or 32)")
     ap.add_argument("--out", default=os.path.join(DATA, "batch_bench.json"))
     args = ap.parse_args()
     counts = [int(c) for c in args.counts.split(",")]
@@ -71,10 +72,10 @@ def main():
         head = head or args.head
     # what the VRAM that is free now leaves for keys and values, after the codes, the head, the drafter and room to load in
     free = torch.cuda.mem_get_info()[0] - VRAM_MARGIN
-    rest = E.fixed_bytes(cfg, head, args.capacity, pool={M.SLIDING: 0, M.FULL: 0}) + (0 if args.no_drafter else E.DRAFTER_BYTES)
+    rest = E.fixed_bytes(cfg, head, args.capacity, pool={M.SLIDING: 0, M.FULL: 0}, rows=args.rows) + (0 if args.no_drafter else E.DRAFTER_BYTES)
     budget = free - P.code_bytes(cfg, plan) - rest - (320 << 20)
     pool = pool_for(cfg, budget)
-    eng = E.Engine.load(args.name, plan, head, args.capacity, sequences=max(counts), pool=pool)
+    eng = E.Engine.load(args.name, plan, head, args.capacity, sequences=max(counts), pool=pool, rows=args.rows)
     drafter = None if args.no_drafter else E.EngineDrafter.load(eng, ckpt("drafter"), args.name, depth=DEPTH)
     torch.cuda.synchronize()
     print(f"[batch] {P.bits_per_weight(cfg, plan):.2f} bits a weight, keys and values {budget / 2**30:.2f} GiB = {pool[M.SLIDING]} tiles "
@@ -105,7 +106,7 @@ def main():
         return [j.out for j in jobs], {"texts": len(jobs), "tokens": tokens, "seconds": round(seconds, 2), "tok_s": round(tokens / seconds, 1),
                                        "tok_s_each": round(tokens / seconds / len(jobs), 1), "passes": batch.passes,
                                        "ms_a_pass": round(1000 * seconds / batch.passes, 1), "rows_a_pass": round(batch.rows / batch.passes, 2),
-                                       "guesses_kept": round(batch.kept_rows / max(batch.guess_rows, 1), 2),
+                                       "guesses_kept": round(batch.kept_rows / max(batch.guess_rows, 1), 2), "widths": dict(batch.widths),
                                        "first_token_s": round(sum(first.values()) / len(first), 2), "ended": [j.done for j in jobs]}
 
     run([0])  # the first run pays for CUDA's and PyTorch's start-up
@@ -115,7 +116,7 @@ def main():
         solo[i] = texts[0]
         print(f"[batch] alone, prompt {i}: {stats['tokens']} tokens, {stats['tok_s']} tok/s, {stats['ms_a_pass']} ms a pass", flush=True)
     report = {"plan": os.path.basename(args.plan), "bits": round(P.bits_per_weight(cfg, plan), 3), "max_new": args.max_new, "think": args.think,
-              "temperature": args.temperature, "drafter": not args.no_drafter, "kv_gib": round(budget / 2**30, 2), "runs": []}
+              "temperature": args.temperature, "drafter": not args.no_drafter, "rows": args.rows, "kv_gib": round(budget / 2**30, 2), "runs": []}
     for count in counts:
         try:
             texts, stats = run(list(range(count)))
@@ -125,7 +126,7 @@ def main():
         stats["same_as_alone"] = all(texts[i] == solo[i][: len(texts[i])] for i in range(count))  # a text that ran out of memory: as far as it got
         report["runs"].append(stats)
         print(f"[batch] {count:2d} at a time: {stats['tok_s']:6.1f} tok/s in all, {stats['tok_s_each']:5.1f} each, {stats['ms_a_pass']} ms a pass, "
-              f"{stats['rows_a_pass']} rows a pass, guesses kept {stats['guesses_kept']}, first token after {stats['first_token_s']} s, "
+              f"{stats['rows_a_pass']} rows a pass (passes by width {stats['widths']}), guesses kept {stats['guesses_kept']}, first token after {stats['first_token_s']} s, "
               f"same tokens as alone: {stats['same_as_alone']}, ended {sorted(set(stats['ended']))}", flush=True)
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)

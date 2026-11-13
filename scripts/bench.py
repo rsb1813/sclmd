@@ -45,7 +45,7 @@ class Replier:
         messages = ([{"role": "system", "content": item["system"]}] if item.get("system") else []) + [{"role": "user", "content": item["prompt"]}]
         out = tok.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, enable_thinking=think)
         prompt = list(out["input_ids"] if hasattr(out, "keys") else out)
-        room = eng.capacity - len(prompt) - E.MAX_TOKENS
+        room = eng.capacity - len(prompt) - eng.rows
         if room < 64:
             return {"id": item["id"], "error": "the prompt does not fit the context", "prompt_tokens": len(prompt)}
         t = time.perf_counter()

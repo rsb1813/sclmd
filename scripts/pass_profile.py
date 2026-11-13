@@ -26,6 +26,7 @@ def main():
     ap.add_argument("--at", default="64,2048", help="context lengths to measure at")
     ap.add_argument("--tokens", default="1,7")
     ap.add_argument("--passes", type=int, default=20)
+    ap.add_argument("--rows", type=int, default=8, help="the rows the engine is made for (8, 16 or 32)")
     args = ap.parse_args()
     cap_vram()
     cfg = M.Config.load(ckpt("orig"))
@@ -35,7 +36,7 @@ def main():
         plan, head = {int(k): v for k, v in p["layers"].items()}, p.get("head") or args.head
     else:
         plan, head = {i: {m: args.rate for m in M.LINEARS} for i in range(cfg.n_layers)}, args.head
-    eng = E.Engine.load(args.name, plan, head, 8192)
+    eng = E.Engine.load(args.name, plan, head, 8192, rows=args.rows)
     filler = load_set("eval_v1")[0].reshape(-1).tolist()
     assert eng.lib.sclmd_profile(None) == len(KINDS)
     for at in [int(a) for a in args.at.split(",")]:

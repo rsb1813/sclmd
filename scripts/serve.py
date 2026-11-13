@@ -143,7 +143,7 @@ class Server:
         if job.done in ("stop", "length") and job.out:
             kept = self.kept[seq] = Kept(seq, req.full[: req.start], job.snapped)
             later = self.canon(req, job.out) if self.canon is not None else None
-            if later is not None and later[: req.start] == kept.base and req.start < len(later) <= eng.capacity - 2 * E.MAX_TOKENS:
+            if later is not None and later[: req.start] == kept.base and req.start < len(later) <= eng.capacity - 2 * eng.rows:
                 # the reply as a later turn writes it is read in from the turn's start, with rows nothing else needs
                 if job.snapped:
                     eng.restore(seq)
@@ -216,7 +216,7 @@ class Server:
                 "conversations_kept": len(self.kept), "sequences": eng.sequences,
                 "keys_and_values": {"gib": round(sum(tile[t] * eng.pool[t] for t in tile) / 2**30, 2),
                                     "free_gib": round(sum(tile[t] * free[t] for t in tile) / 2**30, 2)},
-                "passes": self.batch.passes, "rows_per_pass": round(self.batch.rows / max(self.batch.passes, 1), 2),
+                "passes": self.batch.passes, "passes_by_width": dict(self.batch.widths), "rows_per_pass": round(self.batch.rows / max(self.batch.passes, 1), 2),
                 "guesses_kept": round(self.batch.kept_rows / max(self.batch.guess_rows, 1), 2),
                 "tokens_per_second_while_busy": round(self.totals["completion_tokens"] / max(self.busy_s, 1e-9), 1)}
 
@@ -319,7 +319,7 @@ class App:
         if full[: len(before)] != before or full[len(before) : start] != self.turn:
             raise Refused(500, "the chat template did not write the turn as expected")
         eng = self.server.eng
-        room = eng.capacity - len(full) - E.MAX_TOKENS
+        room = eng.capacity - len(full) - eng.rows
         if room < 16:
             raise Refused(400, f"the conversation is {len(full)} tokens: the context holds {eng.capacity}")
         asked = body.get("max_completion_tokens", body.get("max_tokens"))
@@ -503,6 +503,7 @@ def main() -> None:
     ap.add_argument("--think", action="store_true", help="think unless the request says otherwise")
     ap.add_argument("--head", type=int, default=8)
     ap.add_argument("--no-drafter", action="store_true")
+    ap.add_argument("--rows", type=int, default=32, help="the most rows of a pass (8, 16 or 32): tokens of all requests together")
     ap.add_argument("--reserve", type=float, default=VRAM_MARGIN / 2**30, help="GiB of the VRAM that is free now to leave to other programs")
     cli = ap.parse_args()
     import transformers
@@ -518,7 +519,7 @@ def main() -> None:
     # the VRAM that is free now, less what is left to other programs, the head, the work memory, the drafter and room
     # to load in: that much is shared between the layers' codes and the conversations' keys and values
     free = torch.cuda.mem_get_info()[0] - reserve
-    rest = E.fixed_bytes(cfg, cli.head, context, pool={M.SLIDING: 0, M.FULL: 0}) + (0 if cli.no_drafter else E.DRAFTER_BYTES)
+    rest = E.fixed_bytes(cfg, cli.head, context, pool={M.SLIDING: 0, M.FULL: 0}, rows=cli.rows) + (0 if cli.no_drafter else E.DRAFTER_BYTES)
     both = free - rest - LOAD_ROOM
     least = P.code_bytes(cfg, P.uniform(cfg, 6))
     if both - least < (256 << 20):
@@ -529,12 +530,12 @@ def main() -> None:
     typical = max(cli.typical, cfg.window)
     pool = pool_for(cfg, kv, typical / (cfg.window + E.SPARE))
     with torch.no_grad():
-        eng = E.Engine.load(cli.name, plan, cli.head, context, sequences=cli.sequences, pool=pool)
+        eng = E.Engine.load(cli.name, plan, cli.head, context, sequences=cli.sequences, pool=pool, rows=cli.rows)
         drafter = None if cli.no_drafter else E.EngineDrafter.load(eng, ckpt("drafter"), cli.name, depth=DEPTH)
     stop = (tok.eos_token_id, tok.convert_tokens_to_ids("<turn|>"), tok.convert_tokens_to_ids("<|tool_response>"))
     server = Server(tok, eng, drafter, stop)
     bits = round(P.bits_per_weight(cfg, plan), 2)
-    one = E.tile_bytes(cfg, M.SLIDING) * E.ring_tiles(cfg, M.SLIDING, context) + E.tile_bytes(cfg, M.FULL) * typical // E.TILE
+    one = E.tile_bytes(cfg, M.SLIDING) * E.ring_tiles(cfg, M.SLIDING, context, cli.rows) + E.tile_bytes(cfg, M.FULL) * typical // E.TILE
     facts = {"bits_per_weight": bits, "kl_estimate": None if estimate is None else round(estimate, 3),
              "vram_gib": round(torch.cuda.memory_allocated() / 2**30, 2), "drafter": drafter is not None}
     app = App(server, tok, cli.think, cli.max_tokens, facts)

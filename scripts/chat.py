@@ -23,6 +23,7 @@ DEPTH = 6  # the drafter's generation_config.json: num_assistant_tokens
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SHARES = "own_v1"  # the measurements the plan is fitted from: on text the model wrote itself (on unseen text of that kind a plan
 # fitted from them is KL 0.055 where one of the same size fitted from other people's text is 0.066)
+ROWS = 16  # rows of a pass: a prompt is read 16 tokens at a time (590 tok/s; 8 at a time is 370), for 30 MB more of work memory
 LOAD_ROOM = 320 << 20  # VRAM left over the engine: what loading uses for a moment, and the allocator's leftovers
 
 HELP = """[bold]명령[/]
@@ -100,7 +101,7 @@ class Session:
         before, full = self.render(False), self.render(True)
         start = len(before) + len(self.turn)  # the model's turn begins here: what a later turn's context keeps up to
         assert full[:len(before)] == before and full[len(before):start] == self.turn
-        room = eng.capacity - len(full) - E.MAX_TOKENS
+        room = eng.capacity - len(full) - eng.rows
         if room < 16:
             self.messages.pop()
             raise ContextFull
@@ -299,7 +300,7 @@ def main() -> None:
     if cli.plan == "auto":
         # what is free now, less what PyTorch is kept from (cap_vram), the rest of the engine, and room to load in
         free = torch.cuda.mem_get_info()[0] - reserve
-        rest = E.fixed_bytes(cfg, head, cli.context) + (0 if cli.no_drafter else E.DRAFTER_BYTES)
+        rest = E.fixed_bytes(cfg, head, cli.context, rows=ROWS) + (0 if cli.no_drafter else E.DRAFTER_BYTES)
         budget = free - rest - LOAD_ROOM
         if budget < P.code_bytes(cfg, P.uniform(cfg, 6)):
             console.print(f"[yellow]VRAM이 모자랍니다: 지금 비어 있는 것은 {(free + reserve) / 2**30:.1f}GiB이고, 전부 3bit로도 "
@@ -313,7 +314,7 @@ def main() -> None:
         plan, head = P.read(cli.plan)
         head = head or cli.head
     with torch.no_grad():
-        eng = E.Engine.load(cli.name, plan, head, cli.context)
+        eng = E.Engine.load(cli.name, plan, head, -(-cli.context // E.TILE) * E.TILE, rows=ROWS)
         drafter = None if cli.no_drafter else E.EngineDrafter.load(eng, ckpt("drafter"), cli.name, depth=DEPTH)
         opts = {"temperature": 1.0, "top_p": 0.95, "top_k": 64, "num_predict": 4096, "verbose": True, "showthink": False}
         session = Session(tok, eng, drafter)

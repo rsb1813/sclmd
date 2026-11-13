@@ -9,9 +9,9 @@ from . import codes as CD
 from . import model as M
 
 DLL = os.path.join(os.path.dirname(__file__), "..", "engine", "build", "sclmd.dll")
-MAX_TOKENS = 8
+MAX_TOKENS = 32  # the most rows the kernels take in a pass; an engine is made for 8, 16 or 32 (Engine.rows)
 TILE = 16   # positions of keys and values a sequence is given at a time
-SPARE = 16  # positions a sliding layer keeps past its window: a pass writes up to 8, the drafter reads window + 1
+SPARE = 16  # positions a sliding layer keeps past its window at least: a pass writes its rows while its first row still reads a window back
 DRAFTER_BYTES = 240 << 20  # the drafter at 4 bits a weight (0.47B weights) and its work memory
 
 
@@ -19,10 +19,10 @@ class KVFull(Exception):
     """The pool of keys and values has no tile left for a sequence's next positions."""
 
 
-def ring_tiles(cfg: M.Config, kind: str, capacity: int) -> int:
+def ring_tiles(cfg: M.Config, kind: str, capacity: int, rows: int = 8) -> int:
     """Tiles a sequence can hold of a kind of layer: a sliding layer keeps the last window + SPARE positions (in
-    whole tiles), a full-attention layer every position up to the capacity."""
-    return capacity // TILE if kind == M.FULL else -(-(cfg.window + SPARE) // TILE)
+    whole tiles; with passes of 32 rows, window + 32), a full-attention layer every position up to the capacity."""
+    return capacity // TILE if kind == M.FULL else -(-(cfg.window + max(SPARE, rows)) // TILE)
 
 
 def tile_bytes(cfg: M.Config, kind: str) -> int:
@@ -30,13 +30,15 @@ def tile_bytes(cfg: M.Config, kind: str) -> int:
     return cfg.layer_types.count(kind) * TILE * cfg.kv_heads[kind] * cfg.head_dim[kind] * 2 * 2
 
 
-def fixed_bytes(cfg: M.Config, head_bits: int, capacity: int, pool: dict | None = None) -> int:
+def fixed_bytes(cfg: M.Config, head_bits: int, capacity: int, pool: dict | None = None, rows: int = 8) -> int:
     """VRAM an Engine takes besides the layers' codes: the head's codes, the keys and values, the work memory.
-    pool: tiles of keys and values by kind of layer (default: what one sequence of `capacity` positions can hold)."""
+    pool: tiles of keys and values by kind of layer (default: what one sequence of `capacity` positions can hold);
+    rows: the rows of its passes."""
     head = cfg.vocab * cfg.hidden * head_bits // 16
     kinds = dict.fromkeys(cfg.layer_types)
-    kv = sum(tile_bytes(cfg, t) * (ring_tiles(cfg, t, capacity) if pool is None else pool[t]) for t in kinds)
-    work = MAX_TOKENS * cfg.vocab * 4 + cfg.heads * MAX_TOKENS * (max(capacity, cfg.window + MAX_TOKENS) + 32) * 6 + (32 << 20)
+    kv = sum(tile_bytes(cfg, t) * (ring_tiles(cfg, t, capacity, rows) if pool is None else pool[t]) for t in kinds)
+    # the logits of the main model and the drafter, attention's scores and weights, and the rest
+    work = 2 * rows * cfg.vocab * 4 + cfg.heads * rows * (max(capacity, cfg.window + rows) + 32) * 6 + (32 << 20)
     return head + kv + work
 
 
@@ -154,9 +156,10 @@ class Engine:
     embed: the input embedding table [vocab, hidden] (any device and type; rows are fetched as needed)"""
 
     def __init__(self, cfg: M.Config, layers: list, head: tuple, norm: torch.Tensor, embed: torch.Tensor, capacity: int = 8192,
-                 device: str = "cuda", sequences: int = 1, pool: dict | None = None):
+                 device: str = "cuda", sequences: int = 1, pool: dict | None = None, rows: int = 8):
         assert capacity % TILE == 0, "the capacity is a multiple of 16"
-        self.cfg, self.device, self.capacity, self.sequences = cfg, device, capacity, sequences
+        assert rows in (8, 16, 32), "a pass has 8, 16 or 32 rows"
+        self.cfg, self.device, self.capacity, self.sequences, self.rows = cfg, device, capacity, sequences, rows
         self.lengths = [0] * sequences  # positions each sequence holds
         self.highs = [0] * sequences  # one past the furthest position written since its start: what a sliding layer's ring has lost follows from it
         self._snaps = {}
@@ -170,7 +173,7 @@ class Engine:
         # free, which each sequence holds (tiles[kind][seq][j]: its positions 16j.., j modulo ring; -1: none), and
         # the same table on the GPU for the kernels. Tiles are handed out lowest first: one sequence alone has
         # tile j for its positions 16j..
-        self.ring = {t: ring_tiles(cfg, t, capacity) for t in kinds}
+        self.ring = {t: ring_tiles(cfg, t, capacity, rows) for t in kinds}
         self.pool = {t: sequences * self.ring[t] for t in kinds} if pool is None else {t: int(pool[t]) for t in kinds}
         self.free = {t: list(range(self.pool[t] - 1, -1, -1)) for t in kinds}
         self.tiles = {t: [[-1] * self.ring[t] for _ in range(sequences)] for t in kinds}
@@ -209,13 +212,13 @@ class Engine:
         y_size = max(max(cfg.heads * cfg.head_dim[t] + 2 * cfg.kv_heads[t] * cfg.head_dim[t] for t in cfg.head_dim), cfg.mlp, cfg.hidden)
         x_size = max(cfg.hidden, widest_head, cfg.mlp)
         # attention takes the positions a pass reads in whole tiles of 16: up to 15 more at either end
-        scores = cfg.heads * MAX_TOKENS * (max(capacity, cfg.window + MAX_TOKENS) + 32)
+        scores = cfg.heads * rows * (max(capacity, cfg.window + rows) + 32)
         z = lambda *shape, dtype=torch.float32: torch.zeros(*shape, dtype=dtype, device=device)  # noqa: E731
         # the kernels' work memory, by the names of the DLL's Model (what a pass leaves in them is the last layer's)
-        self.work = dict(h=z(MAX_TOKENS, cfg.hidden), hn=z(MAX_TOKENS, cfg.hidden), logits=z(MAX_TOKENS, cfg.vocab),
-                         h2=z(MAX_TOKENS, cfg.hidden), fps=z(MAX_TOKENS), xf=z(x_size // 16, 32, dtype=torch.int64),
-                         y=z(MAX_TOKENS, y_size), y2=z(MAX_TOKENS, cfg.mlp), qhat=z(MAX_TOKENS, widest_head, dtype=torch.float16),
-                         attn=z(MAX_TOKENS, widest_head), scores=z(scores), probs=z(scores, dtype=torch.float16))
+        self.work = dict(h=z(rows, cfg.hidden), hn=z(rows, cfg.hidden), logits=z(rows, cfg.vocab),
+                         h2=z(rows, cfg.hidden), fps=z(rows), xf=z(rows // 8, x_size // 16, 32, dtype=torch.int64),
+                         y=z(rows, y_size), y2=z(rows, cfg.mlp), qhat=z(rows, widest_head, dtype=torch.float16),
+                         attn=z(rows, widest_head), scores=z(scores), probs=z(scores, dtype=torch.float16))
         self.h, self.hn, self.logits = self.work["h"], self.work["hn"], self.work["logits"]
         m = self.model = Model()
         m.layers = C.cast(self.c_layers, C.c_void_p)
@@ -228,7 +231,7 @@ class Engine:
 
     @classmethod
     def load(cls, name: str, plan: dict, head: int, capacity: int = 8192, device: str = "cuda", sequences: int = 1,
-             pool: dict | None = None) -> "Engine":
+             pool: dict | None = None, rows: int = 8) -> "Engine":
         """The original model with the stored codes `name`: plan is layer -> {matrix: bits a pair}, head the output
         head's bits. The layers come off the disk one at a time; the embedding table stays in RAM."""
         from . import ckpt
@@ -243,7 +246,7 @@ class Engine:
                 yield ck.layer(i, "cpu", skip=M.LINEARS) | {"mats": CD.stored(name, i, {m: plan[i][m] for m in has})}
 
         eng = cls(cfg, layers(), CD.stored(name, "head", {"head": head})["head"], ck.norm("cpu"), ck.embed("cpu"), capacity, device,
-                  sequences, pool)
+                  sequences, pool, rows)
         torch.cuda.empty_cache()  # packing left about 1 GiB reserved and unused: whatever loads next needs it
         return eng
 
@@ -273,7 +276,7 @@ class Engine:
         assert status == 0, f"GPU kernel launch failed ({status})"
 
     def linear(self, mat: Mat, x: torch.Tensor) -> torch.Tensor:
-        """One matrix times x [tokens <= 8, cols] (tests)."""
+        """One matrix times x [tokens <= rows, cols] (tests)."""
         x = x.to(device=self.device, dtype=torch.float32).contiguous()
         y = torch.zeros(x.shape[0], mat.rows, device=self.device)
         rot = self._rot(mat.cols)
@@ -317,10 +320,10 @@ class Engine:
 
     def advance(self, parts: list) -> tuple[torch.Tensor, torch.Tensor]:
         """One pass over the rows that are in self.h: parts is [(sequence, rows)] in row order, each sequence once,
-        up to MAX_TOKENS rows in all; a sequence's rows are its next positions. -> (logits [rows, vocab], outputs
+        up to self.rows rows in all; a sequence's rows are its next positions. -> (logits [rows, vocab], outputs
         after the final norm): views of the engine's memory, which the next pass writes over."""
         total = sum(n for _, n in parts)
-        assert 0 < total <= MAX_TOKENS and len({seq for seq, _ in parts}) == len(parts) and all(n > 0 for _, n in parts)
+        assert 0 < total <= self.rows and len({seq for seq, _ in parts}) == len(parts) and all(n > 0 for _, n in parts)
         segs, row = Segs(), 0
         for i, (seq, n) in enumerate(parts):
             at = self.lengths[seq]
@@ -343,13 +346,13 @@ class Engine:
         return self.advance([(seq, len(ids)) for seq, ids in parts])
 
     def feed(self, ids: list, keep: str = "all", seq: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run tokens at a sequence's next positions, eight a pass -> (logits [n, vocab], last outputs after the final norm).
-        keep="last": only the last pass's rows (a long prompt's logits would not fit: 1 MB a token)."""
+        """Run tokens at a sequence's next positions, a pass's rows at a time -> (logits [n, vocab], last outputs after
+        the final norm). keep="last": only the last pass's rows (a long prompt's logits would not fit: 1 MB a token)."""
         assert self.lengths[seq] + len(ids) <= self.capacity, "past the engine's capacity"
         logits, hidden = [], []
-        for a in range(0, len(ids), MAX_TOKENS):
-            lg, hn = self.run([(seq, ids[a : a + MAX_TOKENS])])
-            if keep == "all" or a + MAX_TOKENS >= len(ids):
+        for a in range(0, len(ids), self.rows):
+            lg, hn = self.run([(seq, ids[a : a + self.rows])])
+            if keep == "all" or a + self.rows >= len(ids):
                 logits.append(lg.clone())
                 hidden.append(hn.clone())
         return torch.cat(logits), torch.cat(hidden)
@@ -504,7 +507,7 @@ class EngineDrafter:
             inv[:rotated] = 1.0 / (theta ** (torch.arange(0, 2 * rotated, 2).float() / hd))
             cl.inv_freq = f32(inv).data_ptr()
             cl.scalar, cl.full, cl.head_dim, cl.kv_heads = float(lay["scalar"]), int(t == M.FULL), hd, cfg.kv_heads[t]
-        z = lambda *shape: self._own(torch.zeros(MAX_TOKENS, *shape, dtype=torch.float32, device=dev))  # noqa: E731  (a row a sequence)
+        z = lambda *shape: self._own(torch.zeros(eng.rows, *shape, dtype=torch.float32, device=dev))  # noqa: E731  (a row a sequence)
         self.inp, self.h, self.hn, self.logits, self.next = z(2 * main.hidden), z(cfg.hidden), z(cfg.hidden), z(cfg.vocab), z(main.hidden)
         self.h2 = z(cfg.hidden)
         c = self.c = DrafterC()
@@ -517,7 +520,7 @@ class EngineDrafter:
             setattr(c, name, getattr(self, name).data_ptr())
         work = eng.work  # wide enough for the main model's matrices: checked here for the drafter's
         widest = max(2 * main.hidden, cfg.mlp, cfg.heads * max(cfg.head_dim.values()))
-        assert work["xf"].shape[0] * 16 >= widest and work["y"].shape[1] >= widest and work["y2"].shape[1] >= cfg.mlp
+        assert work["xf"].shape[1] * 16 >= widest and work["y"].shape[1] >= widest and work["y2"].shape[1] >= cfg.mlp
         assert cfg.heads <= main.heads
         for name in ("fps", "xf", "y", "y2", "qhat", "scores", "probs", "attn"):
             setattr(c, name, work[name].data_ptr())
@@ -558,7 +561,7 @@ class EngineDrafter:
         return self.eng._rot(cols)  # the same rotation as any matrix of the main model with that many columns
 
     def steps(self, token_embeds: torch.Tensor, hiddens: torch.Tensor, lengths: list, seqs: list) -> tuple[torch.Tensor, torch.Tensor]:
-        """One guess for each of up to eight sequences: row r guesses position lengths[r] + 1 of sequence seqs[r] from the
+        """One guess for each of several sequences (up to the engine's rows): row r guesses position lengths[r] + 1 of sequence seqs[r] from the
         token at lengths[r] (its embedding in the main model) and a hidden state -> (logits [rows, vocab], the hidden
         states for the guesses after). Both are the drafter's own memory: the next step writes over them."""
         eng, rows = self.eng, len(lengths)
@@ -586,8 +589,8 @@ class EngineDrafter:
         return out
 
     def guess_many(self, asks: list) -> list:
-        """Guesses for up to eight sequences at once: asks is [(token, hidden, length, sequence, how many)] -> each
-        one's tokens. A step costs the same for eight sequences as for one."""
+        """Guesses for several sequences at once (up to the engine's rows): asks is [(token, hidden, length, sequence,
+        how many)] -> each one's tokens. A step costs about the same for eight sequences as for one."""
         tokens, hidden = [a[0] for a in asks], torch.stack([a[1] for a in asks])
         lengths, seqs, out = [a[2] for a in asks], [a[3] for a in asks], [[] for _ in asks]
         for step in range(max(a[4] for a in asks)):

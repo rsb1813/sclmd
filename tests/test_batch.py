@@ -27,20 +27,23 @@ def test_texts_written_side_by_side_are_the_texts_written_alone(small_e, drafter
     asks = [(ids_of(5 + 4 * i, 40 + i), 20 + 5 * (i % 4), pickers()[i % 3]) for i in range(11)]  # more texts than a pass has rows
     want = [alone(small_e, prompt, max_new, pick) for prompt, max_new, pick in asks]
     for with_drafter in (False, True):
-        eng = small_e.engine(sequences=len(asks))
-        batch = Batcher(eng, engine_drafter(eng, drafter_e) if with_drafter else None)
-        jobs = [Job(seq, prompt, max_new, pick, STOP) for seq, (prompt, max_new, pick) in enumerate(asks)]
-        for j in jobs[:6]:
-            batch.add(j)
-        for _ in range(5):  # the rest arrive while the first are under way
-            batch.step()
-        for j in jobs[6:]:
-            batch.add(j)
-        batch.run()
-        assert [j.out for j in jobs] == want, with_drafter
-        assert all(j.done in ("stop", "length") for j in jobs)
-        if with_drafter:
-            assert batch.guess_rows > 0
+        for rows in (8, 32):
+            eng = small_e.engine(sequences=len(asks), rows=rows)
+            batch = Batcher(eng, engine_drafter(eng, drafter_e) if with_drafter else None)
+            jobs = [Job(seq, prompt, max_new, pick, STOP) for seq, (prompt, max_new, pick) in enumerate(asks)]
+            for j in jobs[:6]:
+                batch.add(j)
+            for _ in range(5):  # the rest arrive while the first are under way
+                batch.step()
+            for j in jobs[6:]:
+                batch.add(j)
+            batch.run()
+            assert [j.out for j in jobs] == want, (with_drafter, rows)
+            assert all(j.done in ("stop", "length") for j in jobs)
+            if with_drafter:
+                assert batch.guess_rows > 0
+            if rows == 32:
+                assert batch.widths[16] + batch.widths[32] > 0  # eleven texts: passes wider than eight rows were worth it
 
 
 def test_a_text_alone_gets_the_drafters_guesses_and_emits_in_order(small_e, drafter_e):  # noqa: F811

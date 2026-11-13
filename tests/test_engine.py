@@ -364,7 +364,7 @@ def test_restore_comes_back_from_further_than_the_ring_keeps(small_e):
     eng = small_e.engine()
     eng.feed(a)
     eng.snapshot()
-    assert eng.feed(b, keep="last")[0].shape[0] == 50 % E.MAX_TOKENS
+    assert eng.feed(b, keep="last")[0].shape[0] == 50 % eng.rows
     eng.restore()
     assert eng.length == 30 and torch.equal(eng.feed(c)[0], want)
 
@@ -465,3 +465,38 @@ def test_the_drafter_guesses_for_several_sequences_at_once(small_e, drafter_e):
         solo = small_e.engine()
         h = solo.feed(ids)[1][-1]
         assert engine_drafter(solo, drafter_e).guess(ids[-1], h, len(ids)) [: len(one[seq])] == one[seq]
+
+
+def test_a_position_is_the_same_bits_in_passes_of_any_width(small_e):
+    ids = ids_of(70, 37)
+    narrow = small_e.engine()
+    want = narrow.feed(ids)[0]
+    for rows in (16, 32):
+        wide = small_e.engine(rows=rows)
+        assert torch.equal(wide.feed(ids)[0], want), rows  # 70 tokens: whole passes and a last one of 6
+        mixed = small_e.engine(rows=rows)
+        got = torch.cat([mixed.feed(ids[a:b])[0] for a, b in ((0, 1), (1, 10), (10, 27), (27, 28), (28, 53), (53, 70))])
+        assert torch.equal(got, want), rows
+
+
+def test_wide_passes_over_several_sequences_and_the_drafter(small_e, drafter_e):
+    texts = [ids_of(20 + 3 * i, 110 + i) for i in range(12)]
+    eng = small_e.engine(sequences=12, rows=32)
+    got = [[] for _ in texts]
+    for a in range(0, 54, 2):  # every pass: two tokens of each sequence that still has some (24 rows at first)
+        parts = [(seq, ids[a : a + 2]) for seq, ids in enumerate(texts) if a < len(ids)]
+        logits, _ = eng.run(parts)
+        row = 0
+        for seq, part in parts:
+            got[seq].append(logits[row : row + len(part)].clone())
+            row += len(part)
+    for seq, ids in enumerate(texts):
+        assert torch.equal(torch.cat(got[seq]), alone(small_e, ids, [])), seq
+    # the drafter guesses for all twelve at once, each as it does alone
+    nat = engine_drafter(eng, drafter_e)
+    hidden = {}
+    for seq, ids in enumerate(texts):
+        solo = small_e.engine()
+        hidden[seq] = solo.feed(ids)[1][-1].clone()
+    asks = [(ids[-1], hidden[seq], len(ids), seq, 3 + seq % 4) for seq, ids in enumerate(texts)]
+    assert nat.guess_many(asks) == [nat.guess(token, h, length, seq)[:depth] for token, h, length, seq, depth in asks]
