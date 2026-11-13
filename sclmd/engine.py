@@ -109,6 +109,7 @@ class Engine:
                  device: str = "cuda"):
         self.cfg, self.device, self.capacity, self.length = cfg, device, capacity, 0
         self.high = 0  # one past the furthest position written since the start: what a sliding layer's ring has lost follows from it
+        self._snap, self._snap_at = None, None
         self.embed_table, self.embed_scale = embed, float(M.embed_scale(cfg, embed.dtype))
         self.keep = []  # every tensor the DLL has the address of
         self.rots = {}
@@ -214,8 +215,9 @@ class Engine:
         rows = self.embed_table[torch.as_tensor(ids, device=self.embed_table.device)]
         return rows.to(device=self.device, dtype=torch.float32) * self.embed_scale
 
-    def feed(self, ids: list) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run tokens at the next positions, eight a pass -> (logits [n, vocab], last outputs after the final norm)."""
+    def feed(self, ids: list, keep: str = "all") -> tuple[torch.Tensor, torch.Tensor]:
+        """Run tokens at the next positions, eight a pass -> (logits [n, vocab], last outputs after the final norm).
+        keep="last": only the last pass's rows (a long prompt's logits would not fit: 1 MB a token)."""
         assert self.length + len(ids) <= self.capacity, "past the engine's capacity"
         assert self._kept(self.length - self.cfg.window + 1), "cropped further back than the sliding layers keep"
         logits, hidden = [], []
@@ -225,9 +227,30 @@ class Engine:
             self._check(self.lib.sclmd_pass(C.byref(self.model), len(part), self.length))
             self.length += len(part)
             self.high = max(self.high, self.length)
-            logits.append(self.logits[: len(part)].clone())
-            hidden.append(self.hn[: len(part)].clone())
+            if keep == "all" or a + MAX_TOKENS >= len(ids):
+                logits.append(self.logits[: len(part)].clone())
+                hidden.append(self.hn[: len(part)].clone())
         return torch.cat(logits), torch.cat(hidden)
+
+    def snapshot(self):
+        """Remembers the present length so that restore() can come back to it however far the text goes on.
+        (crop() cannot: a sliding layer's ring is written over as the text goes on. Its keys and values are copied
+        to RAM here, 0.85 GB for the real model; one snapshot at a time.)"""
+        sliding = [kv for kv, t in zip(self.kv, self.cfg.layer_types) if t == M.SLIDING]
+        if self._snap is None:
+            self._snap = [tuple(torch.empty(t.shape, dtype=t.dtype).pin_memory() for t in kv) for kv in sliding]
+        for kv, saved in zip(sliding, self._snap):
+            for t, to in zip(kv, saved):
+                to.copy_(t)
+        self._snap_at = (self.length, self.high)
+
+    def restore(self):
+        """Back to the snapshot's length: every position from there on is forgotten."""
+        sliding = [kv for kv, t in zip(self.kv, self.cfg.layer_types) if t == M.SLIDING]
+        for kv, saved in zip(sliding, self._snap):
+            for t, src in zip(kv, saved):
+                t.copy_(src)
+        self.length, self.high = self._snap_at
 
     def _kept(self, first: int) -> bool:
         """Whether the sliding layers still hold every position from `first` on: their ring of window + SPARE slots has

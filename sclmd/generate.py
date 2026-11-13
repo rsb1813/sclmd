@@ -15,14 +15,22 @@ class Picker:
         self.temperature, self.top_k, self.top_p, self.seed = temperature, top_k, top_p, seed
 
     def __call__(self, logits: torch.Tensor, position: int) -> int:
+        return self.many(logits[None], position)[0]
+
+    def many(self, logits: torch.Tensor, position: int) -> list:
+        """The tokens at `position`, position + 1, ... from logits [m, vocab], with one wait for the GPU for all of them."""
         if self.temperature <= 0:
-            return int(logits.argmax())
-        vals, idx = (logits.float() / self.temperature).topk(self.top_k)
+            return logits.argmax(-1).tolist()
+        vals, idx = (logits.float() / self.temperature).topk(self.top_k, dim=-1)
         probs = F.softmax(vals, dim=-1)
         probs = probs * (probs.cumsum(-1) - probs < self.top_p)
-        g = torch.Generator().manual_seed((self.seed * 1000003 + position) & 0x7FFFFFFF)
-        u = torch.rand((), generator=g).item() * probs.sum().item()
-        return int(idx[min(int((probs.cumsum(-1) < u).sum()), self.top_k - 1)])
+        cum, idx = probs.cumsum(-1).cpu(), idx.cpu()
+        out = []
+        for j in range(logits.shape[0]):
+            g = torch.Generator().manual_seed((self.seed * 1000003 + position + j) & 0x7FFFFFFF)
+            u = torch.rand((), generator=g).item() * cum[j, -1].item()
+            out.append(int(idx[j, min(int((cum[j] < u).sum()), self.top_k - 1)]))
+        return out
 
 
 class RefTarget:
@@ -74,28 +82,39 @@ def drafter_guess(drafter, target, depth: int):
 def generate(target, prompt: list, max_new: int, pick: Picker, guess=None, stop: tuple = (), stats: dict | None = None) -> list:
     """Tokens after `prompt`. With `guess`, each pass of the main model runs the pending token and the guesses after it."""
     logits, hidden = target.feed(prompt)
-    n = len(prompt)  # positions the main model has run and kept
-    pending = pick(logits[-1], n)  # the token at position n, not yet run
-    last_hidden = hidden[-1]
+    return extend(target, len(prompt), logits[-1], hidden[-1], max_new, pick, guess, stop, stats)
+
+
+@torch.no_grad()
+def extend(target, n: int, logits: torch.Tensor, last_hidden: torch.Tensor, max_new: int, pick: Picker, guess=None, stop: tuple = (),
+           stats: dict | None = None, emit=None, halt=None) -> list:
+    """Tokens after the n positions the main model has run: `logits` and `last_hidden` are its outputs at the last of them.
+    emit(token) is called with each token as it is settled; halt() is asked between passes and ends the text when true.
+    The last token returned has not been run (the main model holds the n positions and the tokens before it)."""
+    pending = pick(logits, n)  # the token at position n, not yet run
     out = []
     passes = 0
     while len(out) < max_new:
         out.append(pending)
-        if pending in stop or len(out) >= max_new:
+        if emit:
+            emit(pending)
+        if pending in stop or len(out) >= max_new or (halt and halt()):
             break
         drafts = list(guess(pending, last_hidden, n))[: max_new - len(out)] if guess else []
         logits, hidden = target.feed([pending] + drafts)  # logits[j] is for position n + j + 1
         passes += 1
+        wants = pick.many(logits, n + 1)  # the main model's own token at each position after the pending one
         kept = 0
         for j, d in enumerate(drafts):
-            want = pick(logits[j], n + j + 1)
-            if want != d or d in stop:
+            if wants[j] != d or d in stop:
                 break
             out.append(d)
+            if emit:
+                emit(d)
             kept += 1
         if kept < len(drafts):
             target.crop(n + 1 + kept)
-        pending = pick(logits[kept], n + kept + 1)
+        pending = wants[kept]
         last_hidden = hidden[kept]
         n += 1 + kept  # a guessed stop token is not kept above: it comes back as `pending` and ends the loop
     if stats is not None:

@@ -293,3 +293,16 @@ def test_packing_a_part_of_the_rows_at_a_time_is_the_same():
     codes = torch.randint(0, 64, (48, 96), generator=torch.Generator().manual_seed(8)).to(torch.uint8)
     for bits in (6, 8):
         assert torch.equal(E.pack(codes, bits, strips_at_once=1), E.pack(codes, bits))
+
+
+def test_restore_comes_back_from_further_than_the_ring_keeps(small_e):
+    a, b, c = ids_of(30, 9), ids_of(50, 10), ids_of(12, 11)  # 50 tokens: more than twice round a sliding layer's ring
+    straight = small_e.engine()
+    straight.feed(a)
+    want = straight.feed(c)[0]
+    eng = small_e.engine()
+    eng.feed(a)
+    eng.snapshot()
+    assert eng.feed(b, keep="last")[0].shape[0] == 50 % E.MAX_TOKENS
+    eng.restore()
+    assert eng.length == 30 and torch.equal(eng.feed(c)[0], want)
