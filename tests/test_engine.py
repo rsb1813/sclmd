@@ -500,3 +500,22 @@ def test_wide_passes_over_several_sequences_and_the_drafter(small_e, drafter_e):
         hidden[seq] = solo.feed(ids)[1][-1].clone()
     asks = [(ids[-1], hidden[seq], len(ids), seq, 3 + seq % 4) for seq, ids in enumerate(texts)]
     assert nat.guess_many(asks) == [nat.guess(token, h, length, seq)[:depth] for token, h, length, seq, depth in asks]
+
+
+def test_a_parked_sequence_comes_back_on_another_number_and_other_tiles(small_e):
+    a, b, more = ids_of(45, 120), ids_of(20, 121), ids_of(10, 122)  # a has gone round the sliding ring
+    want = alone(small_e, a + more, [])[45:]
+    eng = small_e.engine(sequences=3)
+    eng.feed(a[:20], seq=0)
+    eng.feed(b, seq=1)
+    eng.feed(a[20:], seq=0)
+    before = eng.free_tiles()
+    state = eng.park(0)
+    assert eng.lengths[0] == 0 and all(eng.free_tiles()[t] > before[t] for t in before) and state["bytes"] > 0
+    eng.feed(ids_of(30, 123), seq=0)  # the number and the tiles are used by another text meanwhile
+    eng.unpark(2, state)
+    assert eng.lengths[2] == 45 and torch.equal(eng.feed(more, seq=2)[0], want)
+    full = small_e.engine(sequences=2, pool={t: 2 for t in (M.SLIDING, M.FULL)})
+    with pytest.raises(E.KVFull):
+        full.unpark(0, state)
+    assert full.free_tiles() == {M.SLIDING: 2, M.FULL: 2}

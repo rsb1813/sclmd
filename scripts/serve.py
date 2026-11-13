@@ -65,12 +65,22 @@ class Kept:
         return self.base if self.later is None else self.later[: eng.lengths[self.seq]]
 
 
+class Parked:
+    """A kept conversation that has left the GPU: its tokens and the engine's state of it in RAM (Engine.park)."""
+
+    def __init__(self, tokens: list, state: dict, used: float):
+        self.tokens, self.state, self.used = tokens, state, used
+
+
 class Server:
     """The engine's side: requests come in through `inbox`, each becomes a job on a sequence, and run() makes passes
-    while there is anything to do."""
+    while there is anything to do. Conversations whose reply is over stay on their sequences (kept); when sequences or
+    keys and values run short, the one used longest ago moves to RAM (parked, up to `ram` bytes), and comes back
+    when its next turn arrives."""
 
-    def __init__(self, tok, eng: E.Engine, drafter, stop: tuple):
-        self.tok, self.eng, self.stop = tok, eng, stop
+    def __init__(self, tok, eng: E.Engine, drafter, stop: tuple, ram: int = 0):
+        self.tok, self.eng, self.stop, self.ram = tok, eng, stop, ram
+        self.parked = []
         self.batch = Batcher(eng, drafter, DEPTH)
         self.batch.make_room = self._make_room
         self.canon = None  # (request, the reply's tokens) -> the conversation's tokens with the reply as a later turn writes it
@@ -84,11 +94,22 @@ class Server:
         self.inbox.put(req)
 
     def _make_room(self) -> bool:
-        """The pool of keys and values is empty: the conversation that was used longest ago is forgotten."""
+        """The pool of keys and values is empty, or every sequence is taken: the kept conversation that was used
+        longest ago leaves the GPU (to RAM while there is room for it there). False: none is kept."""
         if not self.kept:
             return False
         old = min(self.kept.values(), key=lambda k: k.used)
-        self._forget(old)
+        if self.ram <= 0:
+            self._forget(old)
+            return True
+        if old.job is not None:
+            self.batch.drop(old.job)
+        tokens = old.now(self.eng)
+        del self.kept[old.seq]
+        self.parked.append(Parked(tokens, self.eng.park(old.seq), old.used))
+        self.unused.append(old.seq)
+        while sum(p.state["bytes"] for p in self.parked) > self.ram:  # RAM is full: the oldest parked ones are forgotten
+            self.parked.remove(min(self.parked, key=lambda p: p.used))
         return True
 
     def _forget(self, kept: Kept) -> None:
@@ -107,8 +128,24 @@ class Server:
                 n = len(held)
                 if most < n < len(req.full) and req.full[:n] == held:
                     best, most = k, n
+        back = max((p for p in self.parked if most < len(p.tokens) < len(req.full) and req.full[: len(p.tokens)] == p.tokens),
+                   key=lambda p: len(p.tokens), default=None)
         reused = 0
-        if best is not None:
+        if back is not None:  # the conversation is in RAM: back onto a sequence, making room as needed
+            self.parked.remove(back)
+            if not self.unused and not self._make_room():
+                self.parked.append(back)
+                return False
+            seq = self.unused.pop()
+            while True:
+                try:
+                    eng.unpark(seq, back.state)
+                    reused = len(back.tokens)
+                    break
+                except E.KVFull:
+                    if not self._make_room():  # the texts under way hold too much for it now: it starts anew
+                        break
+        elif best is not None:
             seq = best.seq
             if best.job is not None:
                 self.batch.drop(best.job)
@@ -125,9 +162,7 @@ class Server:
                     reused = 0
         elif self.unused:
             seq = self.unused.pop()
-        elif self.kept:
-            old = min(self.kept.values(), key=lambda k: k.used)
-            self._forget(old)
+        elif self._make_room():
             seq = self.unused.pop()
         else:
             return False
@@ -172,7 +207,7 @@ class Server:
         req.events.put(("done", {"finish_reason": reason, "usage": usage, "timings": timings, "ended": job.done}))
         print(f"[serve] seq {seq}: prompt {len(req.full)} ({req.reused} kept), reply {len(job.out)} tokens, first after "
               f"{timings['first_token_ms'] / 1000:.2f} s, {timings['tokens_per_second']} tok/s, {job.done}; "
-              f"{len(self.active)} under way, {len(self.kept)} kept", flush=True)
+              f"{len(self.active)} under way, {len(self.kept)} kept, {len(self.parked)} in RAM", flush=True)
 
     @torch.no_grad()
     def turn(self, wait: bool = True) -> bool:
@@ -213,7 +248,8 @@ class Server:
         tile = {t: E.tile_bytes(eng.cfg, t) for t in eng.ring}
         free = eng.free_tiles()
         return {"requests": {"under_way": len(self.active), "waiting": len(self.waiting) + self.inbox.qsize(), **self.totals},
-                "conversations_kept": len(self.kept), "sequences": eng.sequences,
+                "conversations_kept": len(self.kept), "conversations_in_ram": len(self.parked),
+                "ram_gib": round(sum(p.state["bytes"] for p in self.parked) / 2**30, 2), "sequences": eng.sequences,
                 "keys_and_values": {"gib": round(sum(tile[t] * eng.pool[t] for t in tile) / 2**30, 2),
                                     "free_gib": round(sum(tile[t] * free[t] for t in tile) / 2**30, 2)},
                 "passes": self.batch.passes, "passes_by_width": dict(self.batch.widths), "rows_per_pass": round(self.batch.rows / max(self.batch.passes, 1), 2),
@@ -497,6 +533,8 @@ def main() -> None:
                     "not set aside here goes to 4-bit matrices (quality)")
     ap.add_argument("--context", type=int, default=8192, help="tokens one conversation can hold (prompt and reply)")
     ap.add_argument("--sequences", type=int, default=32, help="conversations held at once, those kept for their next turn included")
+    ap.add_argument("--ram-gib", type=float, default=24.0, help="RAM for conversations that wait for their next turn after the GPU "
+                    "has run short (0: they are forgotten instead and read again from the start)")
     ap.add_argument("--typical", type=int, default=2048, help="tokens of a typical conversation: how the keys and values are split "
                     "between the two kinds of layer")
     ap.add_argument("--max-tokens", type=int, default=4096, help="the most tokens of a reply when the request does not say (thinking included)")
@@ -533,7 +571,7 @@ def main() -> None:
         eng = E.Engine.load(cli.name, plan, cli.head, context, sequences=cli.sequences, pool=pool, rows=cli.rows)
         drafter = None if cli.no_drafter else E.EngineDrafter.load(eng, ckpt("drafter"), cli.name, depth=DEPTH)
     stop = (tok.eos_token_id, tok.convert_tokens_to_ids("<turn|>"), tok.convert_tokens_to_ids("<|tool_response>"))
-    server = Server(tok, eng, drafter, stop)
+    server = Server(tok, eng, drafter, stop, ram=int(cli.ram_gib * 2**30))
     bits = round(P.bits_per_weight(cfg, plan), 2)
     one = E.tile_bytes(cfg, M.SLIDING) * E.ring_tiles(cfg, M.SLIDING, context, cli.rows) + E.tile_bytes(cfg, M.FULL) * typical // E.TILE
     facts = {"bits_per_weight": bits, "kl_estimate": None if estimate is None else round(estimate, 3),

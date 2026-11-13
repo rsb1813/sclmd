@@ -159,12 +159,22 @@ class Batcher:
             else:
                 parts.append((j.seq, [j.pending] + guesses.get(j, [])))
         logits, hidden = eng.run(parts)
+        # the choices of all texts come off the GPU together: every row's first choice, and for the texts that sample
+        # every row's largest logits (one wait for the pass, not one a text)
+        top = max((j.pick.top_k for j in use if j.pick is not None and j.pick.temperature > 0), default=0)
+        vals, idx = (t.cpu() for t in logits.float().topk(top, dim=-1)) if top else (None, None)
+        first = logits.argmax(-1).cpu() if any(j.pick is not None and j.pick.temperature <= 0 for j in use) else None
+
+        def choose(j: Job, a: int, b: int, position: int) -> list:
+            """Job j's tokens at `position`.. from rows a..b-1 of the pass."""
+            return first[a:b].tolist() if j.pick.temperature <= 0 else j.pick.draw(vals[a:b], idx[a:b], position)
+
         self.passes += 1
         total = sum(len(ids) for _, ids in parts)
         self.widths[8 if total <= 8 else 16 if total <= 16 else 32] += 1
         row = 0
         for j, (_, ids) in zip(use, parts):
-            n, lg, hn = len(ids), logits[row : row + len(ids)], hidden[row : row + len(ids)]
+            n, hn = len(ids), hidden[row : row + len(ids)]
             row += n
             j.passes, j.rows = j.passes + 1, j.rows + n
             self.rows += n
@@ -175,10 +185,10 @@ class Batcher:
                     j.done = "read"
                 elif not j.todo:
                     j.hidden = hn[-1].clone()
-                    j._settle(j.pick(lg[-1], at))
+                    j._settle(choose(j, row - 1, row, at)[0])
                 continue
             drafts = ids[1:]
-            wants = j.pick.many(lg, at - n + 1)  # the main model's own token at each position after the pending one
+            wants = choose(j, row - n, row, at - n + 1)  # the main model's own token at each position after the pending one
             kept = 0
             for d, want in zip(drafts, wants):
                 if want != d or d in j.stop:

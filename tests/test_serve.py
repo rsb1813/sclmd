@@ -131,3 +131,31 @@ def test_the_next_turn_may_come_before_the_reading_ahead_is_done(small_e):  # no
     (reply2, r2), = finish(server, ask(server, full2, len(full2) - 1, 12, Picker(seed=4)))
     assert r2["usage"]["prompt_tokens_details"]["cached_tokens"] == len(full1) - 1 + 8
     assert reply2 == fresh(small_e, full2, 12, Picker(seed=4))
+
+
+def test_conversations_wait_in_ram_when_the_gpu_is_short_and_come_back(small_e):  # noqa: F811
+    cfg = small_e.cfg
+    ring = {t: E.ring_tiles(cfg, t, 96) for t in (M.SLIDING, M.FULL)}
+    # two sequences and keys and values for about one long conversation: the others have to leave the GPU
+    eng = small_e.engine(sequences=2, pool={M.SLIDING: ring[M.SLIDING] + 2, M.FULL: ring[M.FULL] + 2})
+    server = Server(None, eng, None, STOP, ram=1 << 30)
+    firsts = [ids_of(22 + 3 * i, 130 + i) + [5, 6] for i in range(4)]
+    replies = []
+    for full in firsts:  # four conversations, one after the other
+        (reply, _), = finish(server, ask(server, full, len(full) - 1, 10, Picker()))
+        assert reply == fresh(small_e, full, 10, Picker())
+        replies.append(reply)
+    assert len(server.kept) + len(server.parked) == 4 and len(server.parked) >= 2
+    for i in (0, 2, 1, 3):  # each one's next turn: all of it but the new message is found again
+        full2 = firsts[i][: len(firsts[i]) - 1] + ids_of(6, 140 + i) + [5, 6]
+        (reply2, r2), = finish(server, ask(server, full2, len(full2) - 1, 9, Picker(seed=i)))
+        assert r2["usage"]["prompt_tokens_details"]["cached_tokens"] == len(firsts[i]) - 1, i
+        assert reply2 == fresh(small_e, full2, 9, Picker(seed=i)), i
+    # with no RAM allowed they are forgotten instead, and the next turn starts anew
+    eng = small_e.engine(sequences=2, pool={M.SLIDING: ring[M.SLIDING] + 2, M.FULL: ring[M.FULL] + 2})
+    server = Server(None, eng, None, STOP)
+    for full in firsts:
+        finish(server, ask(server, full, len(full) - 1, 10, Picker()))
+    full2 = firsts[0][: len(firsts[0]) - 1] + ids_of(6, 140) + [5, 6]
+    (reply2, r2), = finish(server, ask(server, full2, len(full2) - 1, 9, Picker()))
+    assert not server.parked and r2["usage"]["prompt_tokens_details"]["cached_tokens"] == 0 and reply2 == fresh(small_e, full2, 9, Picker())

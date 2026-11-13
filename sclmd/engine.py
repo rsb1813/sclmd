@@ -373,18 +373,18 @@ class Engine:
         if snap is None or not snap["data"]:
             shape = lambda t: (t.shape[0], self.ring[M.SLIDING], TILE, t.shape[2], t.shape[3])  # noqa: E731
             snap = self._snaps[seq] = {"data": [torch.empty(shape(t), dtype=t.dtype).pin_memory() for t in self.kv_all[M.SLIDING]]}
-        self._copy_tiles(own, snap["data"], out=True)
+        self._copy_tiles(M.SLIDING, own, snap["data"], out=True)
         snap["tiles"], snap["at"] = own, (self.lengths[seq], self.highs[seq])
 
-    def _copy_tiles(self, own: list, data: list, out: bool):
-        """A sequence's sliding tiles `own` to (out) or from the RAM copies `data`, a layer at a time (a copy of
-        all layers at once would need its size again in VRAM when the tiles are not next to each other)."""
+    def _copy_tiles(self, kind: str, own: list, data: list, out: bool):
+        """The tiles `own` of a kind (keys, values) to (out) or from the RAM copies `data`, a layer at a time (a copy
+        of all layers at once would need its size again in VRAM when the tiles are not next to each other)."""
         if not own:
             return
         run = own == list(range(own[0], own[0] + len(own)))  # next to each other in the pool: a slice
         idx = None if run else torch.tensor(own, device=self.device)
-        for t, ram in zip(self.kv_all[M.SLIDING], data):
-            v = self._tiles_view(t, M.SLIDING)
+        for t, ram in zip(self.kv_all[kind], data):
+            v = self._tiles_view(t, kind)
             for lay in range(v.shape[0]):
                 if out:
                     ram[lay, : len(own)].copy_(v[lay, own[0] : own[0] + len(own)] if run else v[lay, idx])
@@ -396,8 +396,38 @@ class Engine:
     def restore(self, seq: int = 0):
         """Back to the snapshot's length: every position from there on is forgotten."""
         snap = self._snaps[seq]
-        self._copy_tiles(snap["tiles"], snap["data"], out=False)
+        self._copy_tiles(M.SLIDING, snap["tiles"], snap["data"], out=False)
         self.lengths[seq], self.highs[seq] = snap["at"]
+
+    def park(self, seq: int) -> dict:
+        """Takes a sequence off the GPU: what it holds comes back as a state in RAM (its keys and values up to its
+        length: 0.82 MB a token for the last 1,040 tokens and 82 KB a token), and its tiles go back to the pool.
+        unpark() puts it on any free sequence later. A snapshot of it is given up."""
+        self.trim(seq)
+        state = {"length": self.lengths[seq], "high": self.highs[seq], "kinds": {}, "bytes": 0}
+        for t in self.ring:
+            js = [j for j, tile in enumerate(self.tiles[t][seq]) if tile >= 0]
+            data = [torch.empty(k.shape[0], len(js), TILE, k.shape[2], k.shape[3], dtype=k.dtype) for k in self.kv_all[t]]
+            self._copy_tiles(t, [self.tiles[t][seq][j] for j in js], data, out=True)
+            state["kinds"][t] = {"js": js, "data": data}
+            state["bytes"] += sum(d.numel() * d.element_size() for d in data)
+        self.release(seq)
+        return state
+
+    def unpark(self, seq: int, state: dict):
+        """Puts a parked sequence on the free sequence `seq`. KVFull, and nothing changed, when the pool is short."""
+        assert self.lengths[seq] == 0 and all(x < 0 for t in self.ring for x in self.tiles[t][seq]), "the sequence is in use"
+        for t, part in state["kinds"].items():
+            if len(part["js"]) > len(self.free[t]):
+                raise KVFull(f"no room for a parked sequence's {len(part['js'])} tiles of {t} keys and values")
+        for t, part in state["kinds"].items():
+            own = [self.free[t].pop() for _ in part["js"]]
+            for j, tile in zip(part["js"], own):
+                self.tiles[t][seq][j] = tile
+            if own:
+                self.tables[t][seq, torch.tensor(part["js"], device=self.device)] = torch.tensor(own, dtype=torch.int32, device=self.device)
+            self._copy_tiles(t, own, part["data"], out=False)
+        self.lengths[seq], self.highs[seq] = state["length"], state["high"]
 
     def kept(self) -> int:
         """Positions a sliding layer keeps of a sequence (its ring); without sliding layers, every position."""

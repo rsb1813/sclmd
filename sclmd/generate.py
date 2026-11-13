@@ -21,15 +21,21 @@ class Picker:
         """The tokens at `position`, position + 1, ... from logits [m, vocab], with one wait for the GPU for all of them."""
         if self.temperature <= 0:
             return logits.argmax(-1).tolist()
-        vals, idx = (logits.float() / self.temperature).topk(self.top_k, dim=-1)
-        probs = F.softmax(vals, dim=-1)
+        vals, idx = logits.float().topk(self.top_k, dim=-1)
+        return self.draw(vals.cpu(), idx.cpu(), position)
+
+    def draw(self, vals: torch.Tensor, idx: torch.Tensor, position: int) -> list:
+        """The tokens at `position`, position + 1, ... from each row's largest logits and their tokens (on the CPU, largest
+        first, at least top_k of them): the arithmetic is the CPU's, so a choice is the same whoever fetched the logits."""
+        k = self.top_k
+        probs = F.softmax(vals[:, :k].float() / self.temperature, dim=-1)
         probs = probs * (probs.cumsum(-1) - probs < self.top_p)
-        cum, idx = probs.cumsum(-1).cpu(), idx.cpu()
+        cum = probs.cumsum(-1)
         out = []
-        for j in range(logits.shape[0]):
+        for j in range(vals.shape[0]):
             g = torch.Generator().manual_seed((self.seed * 1000003 + position + j) & 0x7FFFFFFF)
             u = torch.rand((), generator=g).item() * cum[j, -1].item()
-            out.append(int(idx[j, min(int((cum[j] < u).sum()), self.top_k - 1)]))
+            out.append(int(idx[j, min(int((cum[j] < u).sum()), k - 1)]))
         return out
 
 
