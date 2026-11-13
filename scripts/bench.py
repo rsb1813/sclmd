@@ -25,6 +25,10 @@ PAUSED = 75
 BENCH = os.environ.get("SCLMD_BENCH", os.path.join(ROOT, "data", "bench"))
 PAUSE = os.environ.get("SCLMD_PAUSE", os.path.join(ROOT, "logs", "pause"))
 
+# When a reply counts as a loop here: one piece of at most 32 tokens said 40 times over at least 1,024 tokens. The chat's
+# own guard (6 times over 96 tokens) is a convenience that the user can overrule; here it would cost answers: it ended
+# a reply that was adding two binary numbers column by column, seven like lines in a row.
+LOOP = (40, 1024)
 
 def seed_of(task: str, item: str, run: int) -> int:
     return int.from_bytes(hashlib.sha256(f"{task}/{item}/{run}".encode()).digest()[:4], "little") & 0x3FFFFFFF
@@ -55,7 +59,7 @@ class Replier:
 
         def emit(token: int) -> None:
             said.append(token)
-            if len(said) % 16 == 0 and looping(said):
+            if len(said) % 16 == 0 and looping(said, *LOOP):
                 looped[0] = True
 
         pick = Picker(sampling["temperature"], sampling["top_k"], sampling["top_p"], seed=seed)
@@ -74,7 +78,7 @@ class Replier:
         ended = bool(said) and said[-1] in self.stop
         return {"id": item["id"], "answer": tok.decode(kinds["answer"], skip_special_tokens=True),
                 "think": tok.decode(kinds["think"], skip_special_tokens=True), "prompt_tokens": len(prompt), "tokens": len(said),
-                "think_tokens": len(kinds["think"]), "ended": ended, "looped": looped[0], "open_think": kind == "think",
+                "think_tokens": len(kinds["think"]), "ended": ended, "looped": looped[0], "loop_guard": LOOP[1], "open_think": kind == "think",
                 "seconds": round(seconds, 2), "per_pass": round(stats["tokens"] / max(stats["passes"], 1), 2)}
 
 
@@ -102,7 +106,10 @@ def main():
     done = set()
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
-            done = {json.loads(line)["id"] for line in f if line.strip()}
+            for r in (json.loads(line) for line in f if line.strip()):
+                # a reply that the chat's loop guard ended is answered again (the same seed: the same reply, not cut);
+                # the scorer takes an item's last reply
+                done.discard(r["id"]) if r.get("looped") and r.get("loop_guard", 0) < LOOP[1] else done.add(r["id"])
     todo = [it for it in items if it["id"] not in done]
     print(f"[bench] {args.task} run {args.run}: {len(todo)} of {len(items)} items to answer", flush=True)
     if not todo:

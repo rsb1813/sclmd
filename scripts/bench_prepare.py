@@ -27,7 +27,8 @@ AIME = ("Solve the following math problem. The answer is an integer from 0 to 99
         "response should be of the form 'Answer: $INTEGER' (without quotes).\n\n{question}")
 HUMANEVAL = ("Complete the following Python function. Write the whole function, with any imports it needs, in a single "
              "```python code block.\n\n```python\n{prompt}\n```")
-# LiveCodeBench's own prompt (lcb_runner/prompts/code_generation.py)
+# LiveCodeBench's own prompt (lcb_runner/prompts/code_generation.py: the generic system message and question template,
+# compared with the repository's file on 2026-11-14)
 LCB_SYSTEM = ("You are an expert Python programmer. You will be given a question (problem specification) and will generate a "
               "correct Python program that matches the specification and passes all tests.")
 LCB_STARTER = ("You will use the following starter code to write the solution to the problem and enclose your code within "
@@ -35,7 +36,8 @@ LCB_STARTER = ("You will use the following starter code to write the solution to
 LCB_STDIN = ("Read the inputs from stdin solve the problem and write the answer to stdout (do not directly test on the sample "
              "inputs). Enclose your code within delimiters as follows. Ensure that when the python program runs, it reads the "
              "inputs, runs the algorithm and writes output to STDOUT.\n```python\n# YOUR CODE HERE\n```\n\n")
-# BigBench Extra Hard's suggested suffix (its README)
+# The suffix the BigBench Extra Hard paper describes, written from memory: the repository's README does not give one,
+# so the wording may differ from what the model card's score was measured with
 BBEH = ("{input}\n\nThink step by step, and when you provide the final answer, please use the prefix \"The answer is:\" without any "
         "modification, and provide the answer directly, with no formatting, no bolding, and no markup. For instance: \"The answer "
         "is: 42\" or \"The answer is: yes\". If the question is multiple choice with a single correct answer, the final answer must "

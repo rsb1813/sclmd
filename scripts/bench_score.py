@@ -68,7 +68,8 @@ def same_number(a: str | None, b: str) -> bool:
         return False
 
 
-# BigBench Extra Hard's own matching (bbeh/evaluate.py)
+# BigBench Extra Hard's own matching (bbeh/evaluate.py; compared with the repository's file on 2026-11-14, and its eight
+# examples give the same results here)
 def bbeh_answer(sample: str) -> str:
     answer = sample.strip()
     for prefix in ("The answer is:", "The final answer is ", "The final answer is: ", "The answer is "):
@@ -150,6 +151,9 @@ def _job(memory: int):
     return k32, job
 
 
+RUNNER = "r2"  # in the key of a cached result: results of an earlier way of running programs are not used
+
+
 def run_program(source: str, stdin: str, timeout: float, memory: int = 4 << 30) -> tuple[bool, str]:
     """Runs a Python program the model wrote -> (ended without error in time, its output)."""
     with tempfile.TemporaryDirectory() as folder:
@@ -215,8 +219,45 @@ for _args, _want in _cases:
         break
 print("PASSED" if _ok else "FAILED")
 '''
-IMPORTS = ("from typing import *\nfrom collections import *\nfrom functools import *\nfrom itertools import *\nfrom heapq import *\n"
-           "from bisect import *\nfrom math import *\nimport math, collections, itertools, functools, heapq, bisect, string, re, sys, random\n")
+# What LiveCodeBench's own runner puts before every program (lcb_runner/evaluation/testing_util.py: import_string).
+# The order matters: builtins come after math and operator, so that pow() is the built-in one with its three arguments.
+LCB_IMPORTS = (
+    'from string import *\nfrom re import *\nfrom datetime import *\nfrom collections import *\nfrom heapq import *\nfrom bisect import *\n'
+    'from copy import *\nfrom math import *\nfrom random import *\nfrom statistics import *\nfrom itertools import *\nfrom functools import *\n'
+    'from operator import *\nfrom io import *\nfrom sys import *\nfrom json import *\nfrom builtins import *\nfrom typing import *\n'
+    'import string\nimport re\nimport datetime\nimport collections\nimport heapq\nimport bisect\n'
+    'import copy\nimport math\nimport random\nimport statistics\nimport itertools\nimport functools\n'
+    'import operator\nimport io\nimport sys\nimport json\nsys.setrecursionlimit(50000)\n'
+)
+# ... and how it runs one: an exit() is not an error. The stack is 64 MB here: recursion through @cache needs more than
+# the 2 MB of a Windows main thread (theirs has Linux's 8 MB), and Python's own limit is the header's 50,000.
+LCB_RUN = '''
+import sys as _sys, threading as _threading
+_failed = []
+
+
+def _run():
+    try:
+        exec(compile(_SOURCE, "solution.py", "exec"), {"__name__": "__main__", "__builtins__": __builtins__})
+    except SystemExit:
+        pass
+    except BaseException:
+        import traceback
+        traceback.print_exc()
+        _failed.append(True)
+
+
+_threading.stack_size(64 << 20)
+_thread = _threading.Thread(target=_run)
+_thread.start()
+_thread.join()
+_sys.stdout.flush()
+_sys.exit(1 if _failed else 0)
+'''
+
+
+def lcb_program(source: str) -> str:
+    return f"_SOURCE = {LCB_IMPORTS + chr(10) + chr(10) + source!r}\n" + LCB_RUN
 
 
 def lcb_passes(code: str, t: dict, per_case: float = 6.0) -> bool:
@@ -226,10 +267,11 @@ def lcb_passes(code: str, t: dict, per_case: float = 6.0) -> bool:
             pairs = [([json.loads(line) for line in c["input"].split("\n")], json.loads(c["output"])) for c in cases]
         except json.JSONDecodeError:
             return False
-        ok, out = run_program(IMPORTS + code + DRIVER.format(name=t["func_name"]), json.dumps(pairs), per_case * len(cases))
+        ok, out = run_program(lcb_program(code + DRIVER.format(name=t["func_name"])), json.dumps(pairs), per_case * len(cases))
         return ok and out.strip().endswith("PASSED")
+    program = lcb_program(code)
     for c in cases:
-        ok, out = run_program(code, c["input"], per_case)
+        ok, out = run_program(program, c["input"], per_case)
         if not ok or not same_output(out, c["output"]):
             return False
     return True
@@ -249,7 +291,8 @@ def score_task(bench: str, task: str, tag: str, files: list, run_code: bool) -> 
     cache = json.load(open(cache_path, encoding="utf-8")) if os.path.exists(cache_path) else {}
     rows, by_stratum = [], {}
     for path in files:
-        for r in read(path):
+        # an item's last reply: bench.py answers again what the chat's loop guard had ended
+        for r in {r["id"]: r for r in read(path)}.values():
             it = gold[r["id"]]
             answer = r.get("answer", "")
             got, right = None, False
@@ -273,7 +316,7 @@ def score_task(bench: str, task: str, tag: str, files: list, run_code: bool) -> 
                 t = tests[r["id"]]
                 got = code_of(answer, f"def {t['entry_point']}" if task == "humaneval" else None)
                 if got is not None:
-                    key = f"{r['id']}:{hashlib.sha256(got.encode()).hexdigest()[:16]}"
+                    key = f"{RUNNER}:{r['id']}:{hashlib.sha256(got.encode()).hexdigest()[:16]}"
                     if key not in cache and run_code:
                         cache[key] = humaneval_passes(got, t) if task == "humaneval" else lcb_passes(got, t)
                         os.makedirs(os.path.dirname(cache_path), exist_ok=True)

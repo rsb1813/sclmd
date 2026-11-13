@@ -8,67 +8,79 @@
     {
       "task": "mmlu_pro",
       "runs": 1,
-      "items": 11,
+      "items": 70,
       "of": 12032,
-      "correct": 8,
-      "score": 72.7,
-      "low": 43.4,
-      "high": 90.3,
+      "correct": 54,
+      "score": 77.1,
+      "low": 66.0,
+      "high": 85.4,
       "card": 85.2,
-      "no_answer": 1,
-      "cut": 0,
+      "no_answer": 2,
+      "cut": 1,
       "looped": 1,
       "errors": 0,
-      "over_8k": 1,
-      "score_at_8k": 72.7,
-      "mean_tokens": 2988,
-      "mean_thinking": 2498,
-      "tok_s": 139.2,
-      "hours": 0.07,
+      "over_8k": 7,
+      "score_at_8k": 71.4,
+      "mean_tokens": 3681,
+      "mean_thinking": 3128,
+      "tok_s": 127.9,
+      "hours": 0.56,
       "by": {
         "biology": [
-          1,
-          1
+          4,
+          5
         ],
         "business": [
-          1,
-          1
+          4,
+          5
         ],
         "chemistry": [
-          0,
-          1
+          3,
+          5
         ],
         "computer science": [
-          0,
-          1
+          3,
+          5
         ],
         "economics": [
-          1,
-          1
+          4,
+          5
         ],
         "engineering": [
-          0,
-          1
+          2,
+          5
         ],
         "health": [
-          1,
-          1
+          4,
+          5
         ],
         "history": [
-          1,
-          1
+          4,
+          5
         ],
         "law": [
-          1,
-          1
+          3,
+          5
         ],
         "math": [
-          1,
-          1
+          5,
+          5
         ],
         "other": [
-          1,
-          1
+          5,
+          5
+        ],
+        "philosophy": [
+          4,
+          5
+        ],
+        "physics": [
+          4,
+          5
+        ],
+        "psychology": [
+          5,
+          5
         ]
       }
     }
