@@ -12,6 +12,7 @@ import torch
 from sclmd import DATA, ckpt
 from sclmd import codes as C
 from sclmd import model as M
+from sclmd import quant as Q
 from sclmd.checkpoint import Checkpoint
 from sclmd.stream import Stream, cap_vram
 from scripts.reference import load_set
@@ -83,22 +84,26 @@ def main():
             del w
             continue
         t_run = time.time() - t0
-        hs = {name: v.cpu() for name, v in inputs.h.items()}  # one Hessian on the GPU at a time from here on
+        # from here on the GPU holds one Hessian (and its factor) and one matrix at a time
+        hs = {name: v.cpu() for name, v in inputs.h.items()}
         inputs.h.clear()
+        w = {k: v.cpu() for k, v in w.items()}
+        h = h.cpu()
         torch.cuda.empty_cache()
         fits, errors = {}, {}
         for group in ("attn_in", "o_in", "mlp_in", "down_in"):
             mats = [m for m in M.LINEARS if C.GROUP[m] == group and m in w]
-            hr = C.rotated_hessian(C.rotation(hs[group].shape[0], DEV), hs.pop(group).to(DEV))
+            factor = Q.gptq_factor(C.rotated_hessian(C.rotation(hs[group].shape[0], DEV), hs.pop(group).to(DEV)))
             for mat in mats:
-                wm = w[mat].float()
+                wm = w[mat].to(DEV).float()
                 for b in bits:
-                    f = C.fit(wm, hr, b)
+                    f = C.fit(wm, factor, b)
                     errors[f"{mat}.c{b}"] = f.pop("error")
                     fits[(mat, b)] = {k: v.cpu() for k, v in f.items()}
                 del wm
-            del hr
+            del factor
             torch.cuda.empty_cache()
+        h = h.to(DEV)
         info = {"layer": i, "type": cfg.layer_types[i], "calib": args.calib, "tokens": inputs.tokens, "errors": errors,
                 "input_peak": inputs.peak, "input_norm": inputs.norm, "shapes": {m: list(w[m].shape) for m in M.LINEARS if m in w},
                 "seconds": round(time.time() - t0, 1)}

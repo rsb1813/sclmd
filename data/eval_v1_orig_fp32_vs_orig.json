@@ -3,7 +3,7 @@
   "ckpt": "orig_fp32",
   "against": "orig",
   "tokens": 40960,
-  "seconds": 126.0,
+  "seconds": 144.6,
   "peak_vram_gib": 9.88,
   "categories": {
     "chat_en": {

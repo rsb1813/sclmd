@@ -43,9 +43,22 @@ class BlockHadamard:
         return self._h(w.float()) * self.signs
 
 
+def gptq_factor(h: torch.Tensor, damp: float = 0.01) -> tuple:
+    """What GPTQ needs of a Hessian h [..., K, K] (fp32; damped in place and returned): the upper Cholesky factor of
+    its inverse, the damped Hessian, and the columns no input ever touched."""
+    diag = torch.diagonal(h, dim1=-2, dim2=-1)  # a view: edits below land in h
+    dead = diag == 0
+    diag.masked_fill_(dead, 1)
+    diag += damp * diag.mean(-1, keepdim=True)
+    u = torch.linalg.cholesky(h)  # one factor alive at a time
+    u = torch.cholesky_inverse(u)
+    u = torch.linalg.cholesky(u, upper=True)
+    return u, h, dead
+
+
 def gptq_vq(
     w: torch.Tensor, h: torch.Tensor, codebook: torch.Tensor, group: int, damp: float = 0.01, block: int = 128,
-    refit: bool = False, own_h: bool = False,
+    refit: bool = False, own_h: bool = False, factor: tuple | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """GPTQ with vector rounding: d columns at a time go to the row of `codebook` [C, d] (times the group's scale)
     that is nearest in the metric the error feedback leaves on them, |delta U_BB^-1|^2 with U the Cholesky factor
@@ -53,21 +66,18 @@ def gptq_vq(
     of its columns once earlier feedback has landed (fp16; group >= K: one per row, the rms of the row as given, or
     with `refit` the least-squares scale of the chosen codes under h). Batch dims as in gptq_codes.
     own_h: h (fp32) is the caller's to lose; it is damped in place instead of copied (a 21,504-column Hessian is 1.85 GB).
+    factor: gptq_factor(h)'s result, when several matrices share the Hessian; h is then not looked at.
     Returns codes (long [..., N, K/d]) and scales (fp32 [..., N, K/group or 1])."""
     d = codebook.size(-1)
     *batch, n, k = w.shape
     per_row = group >= k
     assert block % d == 0 and k % d == 0 and (per_row or (block % group == 0 and group % d == 0))
     assert per_row or not refit
-    W, H = w.float().clone(), (h if own_h and h.dtype == torch.float32 else h.float().clone())
-    diag = torch.diagonal(H, dim1=-2, dim2=-1)  # a view: edits below land in H
-    dead = diag == 0
-    diag.masked_fill_(dead, 1)
+    W = w.float().clone()
+    if factor is None:
+        factor = gptq_factor(h if own_h and h.dtype == torch.float32 else h.float().clone(), damp)
+    u, H, dead = factor
     W.masked_fill_(dead.unsqueeze(-2), 0)
-    diag += damp * diag.mean(-1, keepdim=True)
-    u = torch.linalg.cholesky(H)  # one factor alive at a time
-    u = torch.cholesky_inverse(u)
-    u = torch.linalg.cholesky(u, upper=True)
     w0 = W.clone() if refit else None
     cb = codebook.float()
     # every code's d x d diagonal block of U inverted at once, and the codewords in each block's metric: one
@@ -102,7 +112,7 @@ def gptq_vq(
             err[..., i : i + d] = e
         W[..., b1:] -= err @ u[..., b0:b1, b1:]
     if refit:
-        del W, u, inv_all, ct_all  # the refit's [..., N, K] temporaries were the VRAM peak
+        del W, inv_all, ct_all  # the refit's [..., N, K] temporaries were the VRAM peak
         q = cb[codes].flatten(-2)
         qh = q @ H
         num = w0.mul_(qh).sum(-1, keepdim=True)

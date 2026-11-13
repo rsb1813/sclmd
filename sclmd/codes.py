@@ -36,14 +36,16 @@ def pair_codebook(w: torch.Tensor, bits: int) -> torch.Tensor:
     return Q.kmeans(sample, 1 << bits, iters=25)
 
 
-def fit(w: torch.Tensor, hr: torch.Tensor, bits: int) -> dict:
-    """Pair codes of w [rows, cols] under the rotated Hessian hr (not modified).
+def fit(w: torch.Tensor, factor: tuple, bits: int) -> dict:
+    """Pair codes of w [rows, cols] under a rotated Hessian given as Q.gptq_factor's result (shared by the matrices
+    with that input).
     Returns codes (uint8 [rows, cols / 2]), scales (fp32 [rows]), book (fp32 [2**bits, 2]) and error: the share of the
     output's energy that is lost, tr(D H D^T) / tr(W H W^T) with D the difference."""
     rows, cols = w.shape
+    hr = factor[1]
     wr = rotation(cols, w.device).rotate(w)
     book = pair_codebook(wr, bits)
-    codes, scales = Q.gptq_vq(wr, hr.clone(), book, cols, refit=True, own_h=True)
+    codes, scales = Q.gptq_vq(wr, None, book, cols, refit=True, factor=factor)
     d = Q.vq_codes_dequant(codes, scales, book) - wr
     error = ((d @ hr) * d).sum().item() / ((wr @ hr) * wr).sum().item()
     return {"codes": codes.to(torch.uint8), "scales": scales.reshape(rows).float(), "book": book.float(), "error": error}
