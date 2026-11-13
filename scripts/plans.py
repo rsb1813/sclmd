@@ -30,6 +30,20 @@ def main():
         for i in range(b, b + 10):
             plan[i] = {m: 8 for m in plan[i]}
         write(f"c6_l{b}-{b + 9}_8", plan, note=f"every matrix at 3 bits, layers {b}-{b + 9} at 4")
+    # the same with the head at 4 bits as well (the measurements on the model's own text)
+    write("c6_head8", uniform(cfg, 6), head=8, note="everything at 3 bits, the head at 4")
+    write("c8_head8", uniform(cfg, 8), head=8, note="everything at 4 bits (does not fit the VRAM)")
+    for m in M.LINEARS:
+        plan = uniform(cfg, 6)
+        for i in plan:
+            if m in plan[i]:
+                plan[i][m] = 8
+        write(f"h8_{m}8", plan, head=8, note=f"every matrix at 3 bits, {m} and the head at 4")
+    for b in range(0, cfg.n_layers, 10):
+        plan = uniform(cfg, 6)
+        for i in range(b, b + 10):
+            plan[i] = {m: 8 for m in plan[i]}
+        write(f"h8_l{b}-{b + 9}_8", plan, head=8, note=f"every matrix at 3 bits, layers {b}-{b + 9} and the head at 4")
     print(sorted(os.listdir(FOLDER)))
 
 

@@ -81,7 +81,8 @@ def main():
         report["against"][ref_name] = by_category(result, category, names)
         del ref, ref_embed, test_embed
         torch.cuda.empty_cache()
-    with open(os.path.join(DATA, f"codes_{args.name}_{tag}.json"), "w", encoding="utf-8") as f:
+    where = "" if args.set == "eval_v1" else args.set + "_"  # the evaluation set's reports carry no set name
+    with open(os.path.join(DATA, f"{where}codes_{args.name}_{tag}.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
     a, b = report["against"]["orig_fp32"], report["against"]["orig"]
     print(f"{tag}: KL vs fp32 original {a['all']['kl']:.4f} (top1 {a['all']['top1']:.4f}), vs bf16 original {b['all']['kl']:.4f} (top1 {b['all']['top1']:.4f}), "

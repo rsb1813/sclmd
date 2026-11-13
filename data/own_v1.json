@@ -1,0 +1,82 @@
+{
+  "plan": "fit_11.1.json",
+  "temperature": 1.0,
+  "seed": 0,
+  "sequences": [
+    {
+      "category": "think_en",
+      "thinking": true,
+      "prompt_tokens": 104,
+      "reply_tokens": 1536,
+      "ended": false,
+      "tok_s": 185.7,
+      "tokens_per_pass": 5.47
+    },
+    {
+      "category": "think_en",
+      "thinking": true,
+      "prompt_tokens": 66,
+      "reply_tokens": 1536,
+      "ended": false,
+      "tok_s": 119.7,
+      "tokens_per_pass": 3.48
+    },
+    {
+      "category": "think_ko",
+      "thinking": true,
+      "prompt_tokens": 137,
+      "reply_tokens": 1536,
+      "ended": false,
+      "tok_s": 191.8,
+      "tokens_per_pass": 5.61
+    },
+    {
+      "category": "think_ko",
+      "thinking": true,
+      "prompt_tokens": 71,
+      "reply_tokens": 1536,
+      "ended": false,
+      "tok_s": 153.1,
+      "tokens_per_pass": 4.44
+    },
+    {
+      "category": "chat_en",
+      "thinking": false,
+      "prompt_tokens": 44,
+      "reply_tokens": 1363,
+      "ended": true,
+      "tok_s": 128.7,
+      "tokens_per_pass": 3.71
+    },
+    {
+      "category": "chat_ko",
+      "thinking": false,
+      "prompt_tokens": 50,
+      "reply_tokens": 1179,
+      "ended": true,
+      "tok_s": 94.2,
+      "tokens_per_pass": 2.7
+    },
+    {
+      "category": "code_en",
+      "thinking": false,
+      "prompt_tokens": 63,
+      "reply_tokens": 1536,
+      "ended": false,
+      "tok_s": 164.0,
+      "tokens_per_pass": 4.77
+    },
+    {
+      "category": "code_ko",
+      "thinking": false,
+      "prompt_tokens": 50,
+      "reply_tokens": 1536,
+      "ended": false,
+      "tok_s": 136.9,
+      "tokens_per_pass": 3.98
+    }
+  ],
+  "seq_len": 1728,
+  "total_tokens": 13824,
+  "targets": 11758
+}
