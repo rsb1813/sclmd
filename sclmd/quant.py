@@ -166,3 +166,9 @@ def q4_0(w: torch.Tensor) -> torch.Tensor:
     inv = torch.where(d != 0, 1 / d, torch.zeros_like(d))
     q = torch.clamp(torch.round(g * inv) + 8, 0, 15) - 8
     return (q * d.half().float()).reshape(n, k)
+
+
+def vq_dequant(w_norm: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor:
+    """A row-normalized [N, K] weight with each group of d columns moved to its nearest codeword."""
+    d = codebook.size(1)
+    return codebook[vq_assign(w_norm.reshape(-1, d), codebook)].reshape(w_norm.shape)
