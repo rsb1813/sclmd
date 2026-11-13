@@ -32,7 +32,7 @@ class Layer(C.Structure):
 class Model(C.Structure):
     _fields_ = ([("layers", C.c_void_p)] + [(n, C.c_int) for n in ("n_layers", "hidden", "mlp", "heads", "window", "vocab")] +
                 [("eps", C.c_float), ("softcap", C.c_float), ("head", Mat), ("rot_head", Rot), ("norm", C.c_void_p)] +
-                [(p, C.c_void_p) for p in ("h", "x", "fps", "xf", "y", "y2", "qhat", "scores", "attn", "hn", "logits")])
+                [(p, C.c_void_p) for p in ("h", "x", "fps", "xf", "y", "y2", "qhat", "scores", "probs", "attn", "hn", "logits")])
 
 
 _lib = None
@@ -138,14 +138,14 @@ class Engine:
         widest_head = cfg.heads * max(cfg.head_dim.values())
         y_size = max(max(cfg.heads * cfg.head_dim[t] + 2 * cfg.kv_heads[t] * cfg.head_dim[t] for t in cfg.head_dim), cfg.mlp, cfg.hidden)
         x_size = max(cfg.hidden, widest_head, cfg.mlp)
-        scores = max(cfg.kv_heads[t] * (cfg.heads // cfg.kv_heads[t]) * MAX_TOKENS * (capacity if t == M.FULL else cfg.window + MAX_TOKENS)
-                     for t in cfg.head_dim)
+        # attention takes the positions a pass reads in whole tiles of 16: up to 15 more at either end
+        scores = cfg.heads * MAX_TOKENS * (max(capacity, cfg.window + MAX_TOKENS) + 32)
         z = lambda *shape, dtype=torch.float32: torch.zeros(*shape, dtype=dtype, device=device)  # noqa: E731
         # the kernels' work memory, by the names of the DLL's Model (what a pass leaves in them is the last layer's)
         self.work = dict(h=z(MAX_TOKENS, cfg.hidden), hn=z(MAX_TOKENS, cfg.hidden), logits=z(MAX_TOKENS, cfg.vocab),
                          x=z(MAX_TOKENS, x_size), fps=z(MAX_TOKENS), xf=z(x_size // 16, 32, dtype=torch.int64),
-                         y=z(MAX_TOKENS, y_size), y2=z(MAX_TOKENS, cfg.mlp), qhat=z(MAX_TOKENS, widest_head),
-                         attn=z(MAX_TOKENS, widest_head), scores=z(scores))
+                         y=z(MAX_TOKENS, y_size), y2=z(MAX_TOKENS, cfg.mlp), qhat=z(MAX_TOKENS, widest_head, dtype=torch.float16),
+                         attn=z(MAX_TOKENS, widest_head), scores=z(scores), probs=z(scores, dtype=torch.float16))
         self.h, self.hn, self.logits = self.work["h"], self.work["hn"], self.work["logits"]
         m = self.model = Model()
         m.layers = C.cast(self.c_layers, C.c_void_p)
@@ -171,7 +171,9 @@ class Engine:
                 has = [m for m in M.LINEARS if not (m == "v" and cfg.layer_types[i] == M.FULL)]
                 yield ck.layer(i, "cpu", skip=M.LINEARS) | {"mats": CD.stored(name, i, {m: plan[i][m] for m in has})}
 
-        return cls(cfg, layers(), CD.stored(name, "head", {"head": head})["head"], ck.norm("cpu"), ck.embed("cpu"), capacity, device)
+        eng = cls(cfg, layers(), CD.stored(name, "head", {"head": head})["head"], ck.norm("cpu"), ck.embed("cpu"), capacity, device)
+        torch.cuda.empty_cache()  # packing left about 1 GiB reserved and unused: whatever loads next needs it
+        return eng
 
     def bytes(self) -> int:
         """VRAM held: the codes, the keys and values, the work memory."""

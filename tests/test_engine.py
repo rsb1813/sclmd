@@ -1,6 +1,6 @@
 # The engine (engine/sclmd.cu through sclmd/engine.py) against the reference decoder on a small random Gemma 4.
 # The reference gets the same stored matrices and the engine's two roundings (a matrix's input and the kept keys and
-# values are fp16), so what is left between the two is the order of float32 sums.
+# values, attention's queries and weights are fp16), so what is left between the two is the order of float32 sums.
 import os
 
 import pytest
@@ -47,9 +47,9 @@ class Stored:
         return ((x16 @ self.unit.t()) * (self.scales * fps)).reshape(*x.shape[:-1], -1)
 
 
-class RoundedCache(M.Cache):
-    def extend(self, layer, k, v):
-        return super().extend(layer, k.half().float(), v.half().float())
+def fp16(t: torch.Tensor) -> torch.Tensor:
+    """What the engine keeps as fp16: the queries, keys and values of attention, and its weights."""
+    return t.half().float()
 
 
 class Reference:
@@ -57,7 +57,7 @@ class Reference:
 
     def __init__(self, cfg, layers, head, norm, embed):
         self.cfg, self.layers, self.head, self.norm, self.table = cfg, layers, head, norm, embed
-        self.cache, self.shared = RoundedCache(), {}
+        self.cache, self.shared = M.Cache(), {}
 
     def embed(self, ids):
         return self.table[torch.tensor(ids, device=DEV)] * M.embed_scale(self.cfg, self.table.dtype)
@@ -67,7 +67,7 @@ class Reference:
         pos = torch.arange(start, start + len(ids), device=DEV)
         h = self.embed(ids)[None]
         for i, w in enumerate(self.layers):
-            h = M.layer_forward(cfg, i, w, h, pos, self.cache, self.shared, linear=lambda x, m: m(x))
+            h = M.layer_forward(cfg, i, w, h, pos, self.cache, self.shared, linear=lambda x, m: m(x), rounded=fp16)
         self.cache.length = start + len(ids)
         hn = M.rms_norm(h[0], self.norm, cfg.eps)
         logits = self.head(hn)
@@ -132,9 +132,46 @@ def test_one_matrix_times_up_to_eight_inputs():
 
 
 # How close the two can be. Sums in another order differ in the last bit, and now and then that turns a value's
-# rounding to fp16 the other way: one such flip moves a matrix's output by about 1e-4 of its size. Within one layer
-# that is all there is; over the layers the flips add up and attention's sharp softmax multiplies them.
-ONE_LAYER, WHOLE_MODEL = 1e-3, 1e-2
+# rounding to fp16 the other way: one such flip moves a matrix's output by about 1e-4 of its size, and a flipped
+# attention weight near one moves attention's output by 5e-4. Within one layer that is all there is; over the layers
+# the flips add up and attention's sharp softmax multiplies them. (The kernels themselves are checked without
+# flips: test_one_matrix..., test_attention_kernels...)
+ONE_LAYER, WHOLE_MODEL = 5e-3, 2e-2
+
+
+def test_attention_kernels_against_pytorch_on_the_engines_own_buffers(small_e):
+    # after a pass of a one-layer engine its work memory holds that layer's queries, scores, weights and attention output
+    base = small_e.cfg
+    g = torch.Generator().manual_seed(4)
+    for i in (1, 2):  # a sliding layer and a full-attention one
+        t = base.layer_types[i]
+        cfg = M.Config(**{**vars(base), "n_layers": 1, "layer_types": [t]})
+        eng = E.Engine(cfg, [small_e.eng_layers[i]], small_e.head.stored(), small_e.norm, small_e.embed, capacity=96)
+        hd, kvh, heads, slots = cfg.head_dim[t], cfg.kv_heads[t], cfg.heads, eng.kv[0][0].shape[0]
+        rep, pos = heads // kvh, 0
+        for n in (1, 1, 8, 3, 8, 8, 8, 5):
+            eng.h[:n] = (torch.randn(n, base.hidden, generator=g) * 3).to(DEV)
+            assert eng.lib.sclmd_pass(E.C.byref(eng.model), n, pos) == 0
+            lo = 0 if t == M.FULL else max(pos - cfg.window + 1, 0)
+            first_tile = lo & ~15
+            stride, nq = ((pos + n - 1 >> 4) + 1) * 16 - first_tile, rep * n
+            q = eng.work["qhat"].view(-1)[: n * heads * hd].view(n, heads, hd).double()
+            scores = eng.work["scores"][: kvh * nq * stride].view(kvh, nq, stride)
+            probs = eng.work["probs"][: kvh * nq * stride].view(kvh, nq, stride)
+            attn = eng.work["attn"].view(-1)[: n * heads * hd].view(n, heads, hd).double()
+            slot = torch.arange(first_tile, first_tile + stride, device=DEV) % slots
+            keys, values = eng.kv[0][0][slot].double(), eng.kv[0][1][slot].double()  # [positions, key heads, head_dim]
+            for kh in range(kvh):
+                for query in range(nq):
+                    token, head = query // rep, kh * rep + query % rep
+                    a = (max(pos + token - cfg.window + 1, 0) if t == M.SLIDING else 0) - first_tile
+                    b = pos + token - first_tile + 1  # the positions this query reads, as indices
+                    where = (i, pos, n, kh, query)
+                    assert close(scores[kh, query, a:b].double(), keys[a:b, kh] @ q[token, head], 1e-5), where
+                    assert torch.equal(probs[kh, query, a:b], torch.softmax(scores[kh, query, a:b], -1).half()), where
+                    assert not probs[kh, query, :a].any() and not probs[kh, query, b:].any(), where
+                    assert close(attn[token, head], probs[kh, query].double() @ values[:, kh], 1e-5), where
+            pos += n
 
 
 def test_each_layer_alone_matches_the_reference_on_the_same_inputs(small_e):
@@ -144,13 +181,13 @@ def test_each_layer_alone_matches_the_reference_on_the_same_inputs(small_e):
         t = base.layer_types[i]
         cfg = M.Config(**{**vars(base), "n_layers": 1, "layer_types": [t]})
         eng = E.Engine(cfg, [small_e.eng_layers[i]], small_e.head.stored(), small_e.norm, small_e.embed, capacity=96)
-        cache, taps, pos, width = RoundedCache(), {}, 0, cfg.heads * cfg.head_dim[t]
+        cache, taps, pos, width = M.Cache(), {}, 0, cfg.heads * cfg.head_dim[t]
         for n in (1, 1, 8, 3, 8, 8, 8, 5):  # 42 positions: twice round a sliding layer's ring of 21
             h = (torch.randn(n, base.hidden, generator=g) * 3).to(DEV)
             eng.h[:n] = h
             assert eng.lib.sclmd_pass(E.C.byref(eng.model), n, pos) == 0
             positions = torch.arange(pos, pos + n, device=DEV)
-            want = M.layer_forward(cfg, 0, small_e.ref_layers[i], h[None], positions, cache, linear=lambda x, m: m(x),
+            want = M.layer_forward(cfg, 0, small_e.ref_layers[i], h[None], positions, cache, linear=lambda x, m: m(x), rounded=fp16,
                                    tap=lambda name, x: taps.__setitem__(name, x[0]))[0]
             where = (i, pos, n)
             slot = positions % eng.kv[0][0].shape[0]

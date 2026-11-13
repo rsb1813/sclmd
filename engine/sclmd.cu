@@ -59,8 +59,9 @@ struct Model {
     uint64_t* xf;    // [widest input / 16][32] a matrix's input as the instruction reads it
     float* y;        // [8][widest output] a matrix's output
     float* y2;       // [8][mlp] (up's output beside gate's)
-    float* qhat;     // [8][heads * widest head] the queries, normalized and rotated
-    float* scores;   // [kv heads * queries][positions] attention scores, then weights
+    uint16_t* qhat;  // [8][heads * widest head] the queries, normalized and rotated (fp16)
+    float* scores;   // [kv heads * queries][positions in whole tiles] attention scores
+    uint16_t* probs; // the same layout: attention weights (fp16)
     float* attn;     // [8][heads * widest head] attention's output
     float* hn;       // [8][hidden] the last output after the final norm (what the drafter is handed)
     float* logits;   // [8][vocab]
@@ -205,12 +206,12 @@ __global__ void residual_k(float* h, const float* y, const float* w, int n, floa
 
 // What attention does to the projections' outputs, block (vector, token) with head_dim threads. Vector v of a token is
 // one of its `heads` query heads (v < heads), `kvh` key heads or `kvh` value heads:
-//   query: RMS norm times q_norm, rotary position -> qhat[token][head][head_dim]
+//   query: RMS norm times q_norm, rotary position -> qhat[token][head][head_dim] (fp16)
 //   key:   RMS norm times k_norm, rotary position -> keys[slot of the position][head] (fp16)
 //   value: RMS norm                               -> values[slot][head] (fp16); the value's source is yv (or yk when null)
 // The rotary position turns pair (d, d + head_dim / 2) by pos * inv_freq[d].
 __global__ void heads_k(const float* yq, const float* yk, const float* yv, const float* q_norm, const float* k_norm, const float* inv_freq,
-                        float* qhat, uint16_t* keys, uint16_t* values, int heads, int kvh, int pos0, int slots, float eps) {
+                        uint16_t* qhat, uint16_t* keys, uint16_t* values, int heads, int kvh, int pos0, int slots, float eps) {
     const int hd = blockDim.x, v = blockIdx.x, token = blockIdx.y, d = threadIdx.x, half = hd / 2;
     const int kind = v < heads ? 0 : v < heads + kvh ? 1 : 2, head = kind == 0 ? v : kind == 1 ? v - heads : v - heads - kvh;
     const float* src = kind == 0 ? yq + (size_t(token) * heads + head) * hd
@@ -229,52 +230,89 @@ __global__ void heads_k(const float* yq, const float* yk, const float* yv, const
     const float turned = d < half ? -buf[d + half] : buf[d - half];
     const float out = buf[d] * cosf(ang) + turned * sinf(ang);
     if (kind == 0)
-        qhat[(size_t(token) * heads + head) * hd + d] = out;
+        qhat[(size_t(token) * heads + head) * hd + d] = __half_as_ushort(__float2half(out));
     else
         keys[(size_t(slot) * kvh + head) * hd + d] = __half_as_ushort(__float2half(out));
 }
 
-// Attention scores: block (chunk, key head) takes blockDim / nq of the positions lo + r (r from chunk * that many) and
-// all nq = rep * tokens queries of the key head's `rep` query heads; a thread one (position, query) pair.
-// -> scores[(key head * nq + query)][r], query = token * rep + head within the group.
-__global__ void scores_k(const float* qhat, const uint16_t* keys, float* scores, int heads, int kvh, int hd, int tokens, int lo, int npos,
-                         int slots) {
-    const int rep = heads / kvh, nq = rep * tokens, per = blockDim.x / nq;
-    const int r = blockIdx.x * per + threadIdx.x / nq, query = threadIdx.x % nq, kh = blockIdx.y;
-    if (r >= npos || threadIdx.x >= per * nq) return;
-    const int token = query / rep, head = kh * rep + query % rep;
-    const float* q = qhat + (size_t(token) * heads + head) * hd;
-    const uint16_t* k = keys + (size_t((lo + r) % slots) * kvh + kh) * hd;
-    float acc = 0;
-    for (int d = 0; d < hd; ++d) acc += q[d] * __half2float(__ushort_as_half(k[d]));
-    scores[(size_t(kh) * nq + query) * npos + r] = acc;
+// Attention runs on the tensor cores too, in three kernels. The positions a pass reads are taken in tiles of 16 that
+// start at multiples of 16 (`base` is the first tile's position, `stride` the number of positions in the tiles), so a
+// query's sums are made of the same tiles in the same order whichever pass it is computed in (alone, or among
+// eight). Positions in the tiles that a query may not read, or that hold nothing yet, get weight zero.
+// A key head's queries are numbered query = token * rep + (head within the key head's `rep` query heads); eight of
+// them are the eight columns of the instruction, and each group of eight has a warp.
+
+// Scores: block (position tile, key head). scores[(key head * nq + query) * stride + (position - base)] = query . key.
+__global__ void scores_k(const uint16_t* qhat, const uint16_t* keys, float* scores, int heads, int kvh, int hd, int tokens, int base,
+                         int stride, int slots) {
+    const int rep = heads / kvh, nq = rep * tokens;
+    const int tile = blockIdx.x, kh = blockIdx.y, group = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int p0 = base + 16 * tile;
+    // the left operand: rows are the tile's positions (this lane: g and g + 8), columns sixteen of the head's values
+    const uint16_t* ka = keys + (size_t((p0 + g) % slots) * kvh + kh) * hd + 2 * t;
+    const uint16_t* kb = keys + (size_t((p0 + g + 8) % slots) * kvh + kh) * hd + 2 * t;
+    // the right operand: column g is query group * 8 + g
+    const int query = group * 8 + g;
+    const bool has = query < nq;
+    const uint16_t* qa = qhat + (size_t(has ? query / rep : 0) * heads + kh * rep + (has ? query % rep : 0)) * hd + 2 * t;
+    float c[4] = {0, 0, 0, 0};
+    for (int j = 0; j < hd; j += 16) {
+        const uint32_t b0 = has ? *(const uint32_t*)(qa + j) : 0, b1 = has ? *(const uint32_t*)(qa + j + 8) : 0;
+        mma(c, *(const uint32_t*)(ka + j), *(const uint32_t*)(kb + j), *(const uint32_t*)(ka + j + 8), *(const uint32_t*)(kb + j + 8), b0, b1);
+    }
+    for (int i = 0; i < 4; ++i) {  // c[i]: position p0 + g (+ 8), query group * 8 + 2t (+ 1)
+        const int q = group * 8 + 2 * t + (i & 1), r = 16 * tile + g + (i >= 2 ? 8 : 0);
+        if (q < nq) scores[(size_t(kh) * nq + q) * stride + r] = c[i];
+    }
 }
 
-// The softmax over the positions a query may read and the weighted sum of their values, block (query, key head) with
-// head_dim threads. Token t at position pos0 + t reads positions up to its own, and in a sliding layer the last
-// `window` of them. -> out[token][head][head_dim]
-__global__ void attend_k(float* scores, const uint16_t* values, float* out, int heads, int kvh, int tokens, int pos0, int lo, int npos,
-                         int slots, int window) {
-    const int hd = blockDim.x, rep = heads / kvh, nq = rep * tokens, query = blockIdx.x, kh = blockIdx.y;
-    const int token = query / rep, head = kh * rep + query % rep, pos = pos0 + token;
-    float* s = scores + (size_t(kh) * nq + query) * npos;
-    const int first = (window > 0 && pos - window + 1 > lo ? pos - window + 1 : lo) - lo, last = pos - lo;  // inclusive, as indices
-    // a thread takes the positions that are its own number modulo the block: the sums then add up in the same order
-    // whichever pass a position is computed in (alone, or as one of eight)
-    const int mine = first + ((int(threadIdx.x) - (lo + first) % hd + hd) % hd);
+// The softmax of a query's scores over the positions it may read, as fp16 in the same layout: block (query, key head).
+// Token t at position pos0 + t reads positions up to its own, and in a sliding layer the last `window` of them.
+__global__ void softmax_k(const float* scores, uint16_t* probs, int heads, int kvh, int tokens, int pos0, int base, int stride, int window) {
+    const int n = blockDim.x, rep = heads / kvh, nq = rep * tokens, query = blockIdx.x, kh = blockIdx.y, pos = pos0 + query / rep;
+    const float* s = scores + (size_t(kh) * nq + query) * stride;
+    uint16_t* p = probs + (size_t(kh) * nq + query) * stride;
+    const int first = (window > 0 && pos - window + 1 > 0 ? pos - window + 1 : 0) - base, last = pos - base;  // inclusive, as indices
+    // a thread takes the positions that are its own number modulo the block, so the sums add up in the same order in any pass
+    const int mine = first + ((int(threadIdx.x) - (base + first) % n + n) % n);
     float mx = -INFINITY;
-    for (int r = mine; r <= last; r += hd) mx = fmaxf(mx, s[r]);
+    for (int r = mine; r <= last; r += n) mx = fmaxf(mx, s[r]);
     mx = block_max(mx);
     float sum = 0;
-    for (int r = mine; r <= last; r += hd) sum += expf(s[r] - mx);
+    for (int r = mine; r <= last; r += n) sum += expf(s[r] - mx);
     sum = block_sum(sum);
-    for (int r = mine; r <= last; r += hd) s[r] = expf(s[r] - mx) / sum;
-    __syncthreads();
-    float acc = 0;
-    const int d = threadIdx.x;
-    for (int r = first; r <= last; ++r)
-        acc += s[r] * __half2float(__ushort_as_half(values[(size_t((lo + r) % slots) * kvh + kh) * hd + d]));
-    out[(size_t(token) * heads + head) * hd + d] = acc;
+    for (int r = threadIdx.x; r < stride; r += n)
+        p[r] = r >= first && r <= last ? __half_as_ushort(__float2half(expf(s[r] - mx) / sum)) : 0;
+}
+
+// The weighted sum of the values: block (sixteen of the head's values, key head); a warp walks the position tiles.
+// -> out[token][head][head_dim]
+__global__ void attend_k(const uint16_t* probs, const uint16_t* values, float* out, int heads, int kvh, int hd, int tokens, int base,
+                         int stride, int slots) {
+    const int rep = heads / kvh, nq = rep * tokens;
+    const int dt = blockIdx.x, kh = blockIdx.y, group = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    // the right operand: rows are the tile's positions, column g is query group * 8 + g
+    const int query = group * 8 + g;
+    const bool has = query < nq;
+    const uint16_t* pq = probs + (size_t(kh) * nq + (has ? query : 0)) * stride + 2 * t;
+    // the left operand: rows are values 16 dt + g and + 8 of the head, columns the tile's positions 2t, 2t + 1, 2t + 8, 2t + 9
+    const size_t col = size_t(kh) * hd + 16 * dt + g, row = size_t(kvh) * hd;
+    int sa = (base + 2 * t) % slots;  // the slot of position 2t of the tile; a sliding layer's slots go round
+    float c[4] = {0, 0, 0, 0};
+    for (int r = 0; r < stride; r += 16) {
+        const int sb = sa + 1 < slots ? sa + 1 : sa + 1 - slots, sc = sa + 8 < slots ? sa + 8 : sa + 8 - slots,
+                  sd = sc + 1 < slots ? sc + 1 : sc + 1 - slots;
+        const uint16_t *va = values + sa * row + col, *vb = values + sb * row + col, *vc = values + sc * row + col, *vd = values + sd * row + col;
+        const uint32_t b0 = has ? *(const uint32_t*)(pq + r) : 0, b1 = has ? *(const uint32_t*)(pq + r + 8) : 0;
+        mma(c, uint32_t(va[0]) | uint32_t(vb[0]) << 16, uint32_t(va[8]) | uint32_t(vb[8]) << 16, uint32_t(vc[0]) | uint32_t(vd[0]) << 16,
+            uint32_t(vc[8]) | uint32_t(vd[8]) << 16, b0, b1);
+        sa += 16;
+        while (sa >= slots) sa -= slots;
+    }
+    for (int i = 0; i < 4; ++i) {  // c[i]: value 16 dt + g (+ 8), query group * 8 + 2t (+ 1)
+        const int q = group * 8 + 2 * t + (i & 1), d = 16 * dt + g + (i >= 2 ? 8 : 0);
+        if (q < nq) out[(size_t(q / rep) * heads + kh * rep + q % rep) * hd + d] = c[i];
+    }
 }
 
 // The soft cap on the logits: tanh(v / cap) * cap.
@@ -328,10 +366,12 @@ API int sclmd_pass(const Model* mp, int tokens, int pos0) {
         if (l.v.rows) gemm(l.v, m.xf, m.fps, yv, tokens);
         heads_k<<<dim3(m.heads + 2 * kvh, tokens), hd>>>(yq, yk, l.v.rows ? yv : nullptr, l.q_norm, l.k_norm, l.inv_freq, m.qhat, l.keys,
                                                        l.values, m.heads, kvh, pos0, l.slots, m.eps);
-        const int last = pos0 + tokens - 1, lo = l.full ? 0 : (pos0 - m.window + 1 > 0 ? pos0 - m.window + 1 : 0), npos = last - lo + 1;
-        const int rep = m.heads / kvh, nq = rep * tokens, per = 1024 / nq;
-        scores_k<<<dim3((npos + per - 1) / per, kvh), 1024>>>(m.qhat, l.keys, m.scores, m.heads, kvh, hd, tokens, lo, npos, l.slots);
-        attend_k<<<dim3(nq, kvh), hd>>>(m.scores, l.values, m.attn, m.heads, kvh, tokens, pos0, lo, npos, l.slots, l.full ? 0 : m.window);
+        const int last = pos0 + tokens - 1, lo = l.full ? 0 : (pos0 - m.window + 1 > 0 ? pos0 - m.window + 1 : 0);
+        const int base = lo & ~15, stride = ((last >> 4) + 1) * 16 - base;  // the positions read, in whole tiles of 16
+        const int nq = m.heads / kvh * tokens, groups = (nq + 7) / 8;
+        scores_k<<<dim3(stride / 16, kvh), 32 * groups>>>(m.qhat, l.keys, m.scores, m.heads, kvh, hd, tokens, base, stride, l.slots);
+        softmax_k<<<dim3(nq, kvh), 256>>>(m.scores, m.probs, m.heads, kvh, tokens, pos0, base, stride, l.full ? 0 : m.window);
+        attend_k<<<dim3(hd / 16, kvh), 32 * groups>>>(m.probs, l.values, m.attn, m.heads, kvh, hd, tokens, base, stride, l.slots);
         input(m, m.attn, nullptr, nullptr, nqo, l.rot_o, 1, tokens);
         gemm(l.o, m.xf, m.fps, m.y, tokens);
         residual_k<<<tokens, 1024>>>(m.h, m.y, l.post_attn_ln, n, m.eps, 1.0f);

@@ -133,9 +133,10 @@ class Cache:
 
 
 def attend(cfg: Config, layer_type: str, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_pos: torch.Tensor, kv_pos: torch.Tensor,
-           window: int | None = None) -> torch.Tensor:
+           window: int | None = None, rounded=None) -> torch.Tensor:
     """q: [batch, heads, n, head_dim], k and v: [batch, kv_heads, m, head_dim] -> [batch, n, heads * head_dim].
-    A query sees keys at q_pos and before; in a sliding layer only the last `window` of them."""
+    A query sees keys at q_pos and before; in a sliding layer only the last `window` of them.
+    rounded: applied to the attention weights (see layer_forward)."""
     window = cfg.window if window is None else window
     rep = cfg.heads // k.shape[1]
     b, _, n, d = q.shape
@@ -147,12 +148,14 @@ def attend(cfg: Config, layer_type: str, q: torch.Tensor, k: torch.Tensor, v: to
         seen &= dist < window
     scores = scores.float().masked_fill(~seen, float("-inf"))
     w = F.softmax(scores, dim=-1).to(q.dtype)
+    if rounded is not None:
+        w = rounded(w)
     out = torch.matmul(w, v[:, :, None])  # [b, kv_heads, rep, n, d]
     return out.reshape(b, cfg.heads, n, d).transpose(1, 2).reshape(b, n, cfg.heads * d)
 
 
 def layer_forward(cfg: Config, i: int, w: dict, h: torch.Tensor, positions: torch.Tensor, cache: Cache | None = None,
-                  shared: dict | None = None, tap=None, linear=F.linear, see: tuple | None = None) -> torch.Tensor:
+                  shared: dict | None = None, tap=None, linear=F.linear, see: tuple | None = None, rounded=None) -> torch.Tensor:
     """One decoder layer over h [batch, n, hidden] at `positions` [n].
     see: (positions, window) the mask uses instead of the queries' own (the drafter: it sits one position past the
          last key it may read).
@@ -160,7 +163,9 @@ def layer_forward(cfg: Config, i: int, w: dict, h: torch.Tensor, positions: torc
     shared: layer type -> (keys, values, their positions). Layers without keys of their own read it; the last layer of
             each type with keys writes it.
     tap(name, tensor): called with the input of each group of matrices ("attn_in", "o_in", "mlp_in", "down_in").
-    linear(x, weight): the matrix product; quantized paths pass their own."""
+    linear(x, weight): the matrix product; quantized paths pass their own.
+    rounded(tensor): applied to what attention multiplies: the queries, keys, values and weights (the engine keeps
+        them as fp16; a test of it passes that rounding)."""
     t = cfg.layer_types[i]
     b, n, _ = h.shape
     hd, kvh = cfg.head_dim[t], cfg.kv_heads[t]
@@ -170,6 +175,8 @@ def layer_forward(cfg: Config, i: int, w: dict, h: torch.Tensor, positions: torc
     if tap:
         tap("attn_in", x)
     q = rotate(rms_norm(linear(x, w["q"]).view(b, n, cfg.heads, hd), w["q_norm"], cfg.eps), cos, sin).transpose(1, 2)
+    if rounded is not None:
+        q = rounded(q)
     if i >= cfg.n_layers - cfg.kv_shared:
         k, v, kv_pos = shared[t]
     else:
@@ -177,13 +184,15 @@ def layer_forward(cfg: Config, i: int, w: dict, h: torch.Tensor, positions: torc
         v = linear(x, w["v"]).view(b, n, kvh, hd) if "v" in w else k
         k = rotate(rms_norm(k, w["k_norm"], cfg.eps), cos, sin).transpose(1, 2)
         v = rms_norm(v, None, cfg.eps).transpose(1, 2)
+        if rounded is not None:
+            k, v = rounded(k), rounded(v)
         kv_pos = positions
         if cache is not None:
             k, v = cache.extend(i, k, v)
             kv_pos = torch.arange(k.shape[2], device=h.device)
         if shared is not None and i == cfg.last_of(t):
             shared[t] = (k, v, kv_pos)
-    a = attend(cfg, t, q, k, v, positions, kv_pos) if see is None else attend(cfg, t, q, k, v, see[0], kv_pos, see[1])
+    a = attend(cfg, t, q, k, v, positions, kv_pos, rounded=rounded) if see is None else attend(cfg, t, q, k, v, see[0], kv_pos, see[1], rounded)
     if tap:
         tap("o_in", a)
     h = h + rms_norm(linear(a, w["o"]), w["post_attn_ln"], cfg.eps)
