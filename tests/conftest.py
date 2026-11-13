@@ -32,3 +32,16 @@ def small():
     model = randomize(Gemma4ForCausalLM(config).eval(), 0)
     model.lm_head.weight = model.model.embed_tokens.weight
     return model, config.to_dict()
+
+
+@pytest.fixture(scope="session")
+def small_drafter():
+    """(transformers drafter for the `small` model, its text config as a dict)."""
+    from transformers import Gemma4AssistantConfig, Gemma4AssistantForCausalLM, Gemma4TextConfig
+
+    text = dict(TEXT, hidden_size=32, intermediate_size=64, num_hidden_layers=4, num_kv_shared_layers=4, final_logit_softcapping=None,
+                layer_types=["sliding_attention"] * 3 + ["full_attention"], vocab_size_per_layer_input=0)
+    config = Gemma4AssistantConfig(text_config=Gemma4TextConfig(**text), backbone_hidden_size=TEXT["hidden_size"])
+    model = randomize(Gemma4AssistantForCausalLM(config).eval(), 1)
+    model.lm_head.weight = model.model.embed_tokens.weight
+    return model, config.text_config.to_dict()

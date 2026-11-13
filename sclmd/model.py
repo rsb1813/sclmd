@@ -132,9 +132,11 @@ class Cache:
         self.length = length
 
 
-def attend(cfg: Config, layer_type: str, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_pos: torch.Tensor, kv_pos: torch.Tensor) -> torch.Tensor:
+def attend(cfg: Config, layer_type: str, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_pos: torch.Tensor, kv_pos: torch.Tensor,
+           window: int | None = None) -> torch.Tensor:
     """q: [batch, heads, n, head_dim], k and v: [batch, kv_heads, m, head_dim] -> [batch, n, heads * head_dim].
-    A query sees keys at its own position and before; in a sliding layer only the last `window` of them."""
+    A query sees keys at q_pos and before; in a sliding layer only the last `window` of them."""
+    window = cfg.window if window is None else window
     rep = cfg.heads // k.shape[1]
     b, _, n, d = q.shape
     qg = q.reshape(b, k.shape[1], rep, n, d)
@@ -142,7 +144,7 @@ def attend(cfg: Config, layer_type: str, q: torch.Tensor, k: torch.Tensor, v: to
     dist = q_pos[:, None] - kv_pos[None, :]
     seen = dist >= 0
     if layer_type == SLIDING:
-        seen &= dist < cfg.window
+        seen &= dist < window
     scores = scores.float().masked_fill(~seen, float("-inf"))
     w = F.softmax(scores, dim=-1).to(q.dtype)
     out = torch.matmul(w, v[:, :, None])  # [b, kv_heads, rep, n, d]
@@ -150,8 +152,10 @@ def attend(cfg: Config, layer_type: str, q: torch.Tensor, k: torch.Tensor, v: to
 
 
 def layer_forward(cfg: Config, i: int, w: dict, h: torch.Tensor, positions: torch.Tensor, cache: Cache | None = None,
-                  shared: dict | None = None, tap=None, linear=F.linear) -> torch.Tensor:
+                  shared: dict | None = None, tap=None, linear=F.linear, see: tuple | None = None) -> torch.Tensor:
     """One decoder layer over h [batch, n, hidden] at `positions` [n].
+    see: (positions, window) the mask uses instead of the queries' own (the drafter: it sits one position past the
+         last key it may read).
     cache: earlier positions' keys and values (decode); None means h holds the sequence from its start.
     shared: layer type -> (keys, values, their positions). Layers without keys of their own read it; the last layer of
             each type with keys writes it.
@@ -179,7 +183,7 @@ def layer_forward(cfg: Config, i: int, w: dict, h: torch.Tensor, positions: torc
             kv_pos = torch.arange(k.shape[2], device=h.device)
         if shared is not None and i == cfg.last_of(t):
             shared[t] = (k, v, kv_pos)
-    a = attend(cfg, t, q, k, v, positions, kv_pos)
+    a = attend(cfg, t, q, k, v, positions, kv_pos) if see is None else attend(cfg, t, q, k, v, see[0], kv_pos, see[1])
     if tap:
         tap("o_in", a)
     h = h + rms_norm(linear(a, w["o"]), w["post_attn_ln"], cfg.eps)
