@@ -9,6 +9,7 @@
 #define NOMINMAX
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 
@@ -342,6 +343,28 @@ static void input(const Model& m, const float* a, const float* b, const float* w
     rotate_k<<<dim3(n / rot.block, tokens), rot.block>>>(m.x, rot.signs, m.fps, m.xf, n);
 }
 
+// Where a pass's time goes (sclmd_profile): with a table set, the pass waits for the GPU after every launch and adds
+// the time to the launch's kind. The waits make the pass slower as a whole; the shares are what is looked at.
+enum { P_INPUT, P_QKV, P_HEADS, P_SCORES, P_SOFTMAX, P_ATTEND, P_O, P_RESIDUAL, P_GATE_UP, P_DOWN, P_HEAD, P_KINDS };
+static double* g_prof = nullptr;
+static std::chrono::steady_clock::time_point g_prof_t;
+
+static inline void tick(int kind) {
+    if (!g_prof) return;
+    cudaDeviceSynchronize();
+    const auto now = std::chrono::steady_clock::now();
+    g_prof[kind] += std::chrono::duration<double>(now - g_prof_t).count();
+    g_prof_t = std::chrono::steady_clock::now();
+}
+
+// times: P_KINDS seconds to add to, or null to stop.
+API int sclmd_profile(double* times) {
+    g_prof = times;
+    cudaDeviceSynchronize();
+    g_prof_t = std::chrono::steady_clock::now();
+    return P_KINDS;
+}
+
 // One matrix times a given input (tests): x[tokens][cols] -> y[tokens][rows], with the model's work memory.
 API int sclmd_linear(const Model* m, const Mat* mat, const Rot* rot, const float* x, float* y, int tokens) {
     input(*m, x, nullptr, nullptr, mat->cols, *rot, 1, tokens);
@@ -360,28 +383,42 @@ API int sclmd_pass(const Model* mp, int tokens, int pos0) {
         const int hd = l.head_dim, kvh = l.kv_heads, nqo = m.heads * hd, nkv = kvh * hd;
         // attention
         input(m, m.h, nullptr, l.in_ln, n, l.rot_in, 0, tokens);
+        tick(P_INPUT);
         float *yq = m.y, *yk = m.y + size_t(MAX_TOKENS) * nqo, *yv = yk + size_t(MAX_TOKENS) * nkv;
         gemm(l.q, m.xf, m.fps, yq, tokens);
         gemm(l.k, m.xf, m.fps, yk, tokens);
         if (l.v.rows) gemm(l.v, m.xf, m.fps, yv, tokens);
+        tick(P_QKV);
         heads_k<<<dim3(m.heads + 2 * kvh, tokens), hd>>>(yq, yk, l.v.rows ? yv : nullptr, l.q_norm, l.k_norm, l.inv_freq, m.qhat, l.keys,
                                                        l.values, m.heads, kvh, pos0, l.slots, m.eps);
+        tick(P_HEADS);
         const int last = pos0 + tokens - 1, lo = l.full ? 0 : (pos0 - m.window + 1 > 0 ? pos0 - m.window + 1 : 0);
         const int base = lo & ~15, stride = ((last >> 4) + 1) * 16 - base;  // the positions read, in whole tiles of 16
         const int nq = m.heads / kvh * tokens, groups = (nq + 7) / 8;
         scores_k<<<dim3(stride / 16, kvh), 32 * groups>>>(m.qhat, l.keys, m.scores, m.heads, kvh, hd, tokens, base, stride, l.slots);
+        tick(P_SCORES);
         softmax_k<<<dim3(nq, kvh), 256>>>(m.scores, m.probs, m.heads, kvh, tokens, pos0, base, stride, l.full ? 0 : m.window);
+        tick(P_SOFTMAX);
         attend_k<<<dim3(hd / 16, kvh), 32 * groups>>>(m.probs, l.values, m.attn, m.heads, kvh, hd, tokens, base, stride, l.slots);
+        tick(P_ATTEND);
         input(m, m.attn, nullptr, nullptr, nqo, l.rot_o, 1, tokens);
+        tick(P_INPUT);
         gemm(l.o, m.xf, m.fps, m.y, tokens);
+        tick(P_O);
         residual_k<<<tokens, 1024>>>(m.h, m.y, l.post_attn_ln, n, m.eps, 1.0f);
+        tick(P_RESIDUAL);
         // feed-forward
         input(m, m.h, nullptr, l.pre_ff_ln, n, l.rot_mlp, 0, tokens);
+        tick(P_INPUT);
         gemm(l.gate, m.xf, m.fps, m.y, tokens);
         gemm(l.up, m.xf, m.fps, m.y2, tokens);
+        tick(P_GATE_UP);
         input(m, m.y, m.y2, nullptr, m.mlp, l.rot_down, 2, tokens);
+        tick(P_INPUT);
         gemm(l.down, m.xf, m.fps, m.y, tokens);
+        tick(P_DOWN);
         residual_k<<<tokens, 1024>>>(m.h, m.y, l.post_ff_ln, n, m.eps, l.scalar);
+        tick(P_RESIDUAL);
     }
     input_k<<<tokens, 1024>>>(m.h, nullptr, m.norm, m.hn, m.fps, n, m.eps, 0);
     rotate_k<<<dim3(n / m.rot_head.block, tokens), m.rot_head.block>>>(m.hn, m.rot_head.signs, m.fps, m.xf, n);
@@ -390,6 +427,7 @@ API int sclmd_pass(const Model* mp, int tokens, int pos0) {
         const size_t count = size_t(tokens) * m.vocab;
         softcap_k<<<unsigned((count + 1023) / 1024), 1024>>>(m.logits, count, m.softcap);
     }
+    tick(P_HEAD);
     return int(cudaGetLastError());
 }
 
