@@ -9,21 +9,28 @@ import numpy as np
 import torch
 
 from sclmd import DATA, ckpt
+from sclmd import model as M
+from sclmd import quant as Q
 from sclmd.checkpoint import Checkpoint
 from sclmd.stream import Stream, cap_vram, compare
 
 
 def load_set(name: str):
     z = np.load(os.path.join(DATA, name, "tokens.npz"))
-    return torch.from_numpy(z["tokens"].astype(np.int64)), z["category"], [str(x) for x in z["names"]]
+    return torch.from_numpy(z["tokens"].astype(np.int64)), z["category"], [str(x) for x in z["names"]], torch.from_numpy(z["target"])
 
 
 def by_category(result: dict, category, names) -> dict:
-    out = {}
-    for ci, name in enumerate(names):
-        rows = [i for i, c in enumerate(category) if c == ci]
-        out[name] = {k: float(np.mean([v[i] for i in rows])) for k, v in result.items()}
-    out["all"] = {k: float(np.mean(v)) for k, v in result.items()}
+    """Per category and over all sequences: each measure averaged over the sequences, weighted by their targets."""
+    w = np.array(result["targets"])
+
+    def mean(rows):
+        ww = w[rows]
+        out = {k: float(np.nansum(np.array(v)[rows] * ww) / ww.sum()) for k, v in result.items() if k != "targets"}
+        return out | {"targets": int(ww.sum())}
+
+    out = {name: mean([i for i, c in enumerate(category) if c == ci]) for ci, name in enumerate(names)}
+    out["all"] = mean(list(range(len(w))))
     return out
 
 
@@ -32,28 +39,35 @@ def main():
     ap.add_argument("--set", default="eval_v1")
     ap.add_argument("--ckpt", default="orig", help="orig or qat")
     ap.add_argument("--batch", type=int, default=2)
+    ap.add_argument("--quant", help="q4_0: every matrix of the layers rounded to llama.cpp's Q4_0 grid (no fitting)")
+    ap.add_argument("--against", default="orig", help="the checkpoint whose stored outputs are the reference")
     args = ap.parse_args()
     cap_vram()
-    ids, category, names = load_set(args.set)
+    ids, category, names, target = load_set(args.set)
     ck = Checkpoint(ckpt(args.ckpt))
+    weights = None
+    if args.quant == "q4_0":
+        weights = lambda i, w: {k: (Q.q4_0(v).to(v.dtype) if k in M.LINEARS else v) for k, v in w.items()}  # noqa: E731
+    elif args.quant:
+        raise SystemExit(f"unknown --quant {args.quant}")
+    name = args.ckpt + (f"_{args.quant}" if args.quant else "")
     t = time.time()
-    out = Stream(ck, batch=args.batch).run(ids, log=lambda s: print(s, flush=True))
+    out = Stream(ck, batch=args.batch).run(ids, weights=weights, log=lambda s: print(s, flush=True))
     seconds = time.time() - t
     hidden = out["hidden"]
-    path = os.path.join(DATA, f"{args.set}_{args.ckpt}.pt")
-    torch.save({"hidden": hidden.cpu(), "shared": out["shared"]}, path)
+    torch.save({"hidden": hidden.cpu(), "shared": out["shared"]}, os.path.join(DATA, f"{args.set}_{name}.pt"))
 
     embed, norm = ck.embed("cuda"), ck.norm("cuda")
-    if args.ckpt == "orig":
+    if name == args.against:
         ref_hidden, ref_embed, ref_norm = hidden, embed, norm
     else:
-        ref = Checkpoint(ckpt("orig"))
-        ref_hidden = torch.load(os.path.join(DATA, f"{args.set}_orig.pt"), weights_only=True)["hidden"]
+        ref = Checkpoint(ckpt(args.against))
+        ref_hidden = torch.load(os.path.join(DATA, f"{args.set}_{args.against}.pt"), weights_only=True)["hidden"]
         ref_embed, ref_norm = ref.embed("cuda"), ref.norm("cuda")
-    result = compare(ck.cfg, ref_hidden, hidden, ref_norm, ref_embed, ids, test_norm=norm, test_embed=embed)
-    report = {"set": args.set, "ckpt": args.ckpt, "tokens": int(ids.numel()), "seconds": round(seconds, 1),
+    result = compare(ck.cfg, ref_hidden, hidden, ref_norm, ref_embed, ids, target, test_norm=norm, test_embed=embed)
+    report = {"set": args.set, "ckpt": name, "against": args.against, "tokens": int(ids.numel()), "seconds": round(seconds, 1),
               "peak_vram_gib": round(torch.cuda.max_memory_allocated() / 2**30, 2), "categories": by_category(result, category, names)}
-    with open(os.path.join(DATA, f"{args.set}_{args.ckpt}.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(DATA, f"{args.set}_{name}_vs_{args.against}.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
     print(json.dumps(report, ensure_ascii=False, indent=2))
 

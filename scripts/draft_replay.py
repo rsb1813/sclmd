@@ -42,12 +42,12 @@ def main():
     ap.add_argument("--set", default="eval_v1")
     ap.add_argument("--ref", default="orig", help="whose stored outputs to draft from (data/<set>_<ref>.pt)")
     ap.add_argument("--drafter", default="drafter")
-    ap.add_argument("--stride", type=int, default=2)
+    ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--places", type=int, default=128, help="places drafted together")
     args = ap.parse_args()
     cap_vram()
     dev = "cuda"
-    ids, category, names = load_set(args.set)
+    ids, category, names, target = load_set(args.set)
     stored = torch.load(os.path.join(DATA, f"{args.set}_{args.ref}.pt"), weights_only=True)
     ck = Checkpoint(ckpt(args.ref))
     cfg, embed, norm = ck.cfg, ck.embed(dev), ck.norm(dev)
@@ -62,7 +62,13 @@ def main():
         last = M.rms_norm(stored["hidden"][q].to(dev), norm, cfg.eps)  # [n, hidden]: what the drafter is handed
         shared = {t: (k[q : q + 1].to(dev), v[q : q + 1].to(dev), torch.arange(n, device=dev)) for t, (k, v) in stored["shared"].items()}
         tok = ids[q].to(dev)
-        places = torch.arange(0, n - DEPTH - 1, args.stride, device=dev)  # t: the last position the main model has run
+        # t: the last position the main model has run. Only places whose next token is the model's own count
+        places = torch.arange(0, n - DEPTH - 1, device=dev)
+        places = places[target[q, 1 : n - DEPTH].to(dev)][:: args.stride]
+        if places.numel() == 0:
+            for k in keys:
+                per_seq[k].append(float("nan"))
+            continue
         acc = {k: [] for k in keys}
         for a in range(0, places.numel(), args.places):
             t = places[a : a + args.places]
@@ -91,8 +97,8 @@ def main():
               "tokens_per_verification": {}, "accept_by_depth": {k: (depth_sum[k] / count).tolist() for k in keys}}
     for ci, name in enumerate(names):
         rows = [i for i, c in enumerate(category) if c == ci]
-        report["tokens_per_verification"][name] = {k: float(np.mean([per_seq[k][i] for i in rows])) for k in keys}
-    report["tokens_per_verification"]["all"] = {k: float(np.mean(per_seq[k])) for k in keys}
+        report["tokens_per_verification"][name] = {k: float(np.nanmean([per_seq[k][i] for i in rows])) for k in keys}
+    report["tokens_per_verification"]["all"] = {k: float(np.nanmean(per_seq[k])) for k in keys}
     with open(os.path.join(DATA, f"draft_replay_{args.set}_{args.ref}_{args.drafter}.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
     print(json.dumps(report, ensure_ascii=False, indent=2))

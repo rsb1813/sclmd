@@ -69,21 +69,29 @@ def logits_chunks(cfg: M.Config, hidden: torch.Tensor, norm: torch.Tensor, embed
 
 @torch.no_grad()
 def compare(cfg: M.Config, ref_hidden: torch.Tensor, hidden: torch.Tensor, norm: torch.Tensor, embed: torch.Tensor, ids: torch.Tensor,
-            test_norm: torch.Tensor | None = None, test_embed: torch.Tensor | None = None) -> dict:
+            target: torch.Tensor, test_norm: torch.Tensor | None = None, test_embed: torch.Tensor | None = None) -> dict:
     """A path's next-token distributions against the reference's, per sequence, from the two last-layer outputs
-    [sequences, n, hidden size]: KL(reference || path), agreement of the first choice, and both perplexities on `ids`."""
+    [sequences, n, hidden size]: KL(reference || path), agreement of the first choice, and both perplexities on `ids`.
+    Only positions whose next token is a target (target [sequences, n], bool) count: elsewhere the model was never
+    trained to predict. A sequence without targets gives nan."""
     s, n, d = hidden.shape
     test_norm = norm if test_norm is None else test_norm
     test_embed = embed if test_embed is None else test_embed
-    kl, top1, nll_ref, nll = (torch.zeros(s, dtype=torch.float64) for _ in range(4))
+    kl, top1, nll_ref, nll, count = (torch.zeros(s, dtype=torch.float64) for _ in range(5))
     for q in range(s):
-        target = ids[q, 1:].to(embed.device)
+        nxt = ids[q, 1:].to(embed.device)
+        use = target[q, 1:].to(embed.device)
         for (a, lr), (_, lt) in zip(logits_chunks(cfg, ref_hidden[q], norm, embed), logits_chunks(cfg, hidden[q], test_norm, test_embed)):
-            pr, pt = F.log_softmax(lr, dim=-1), F.log_softmax(lt, dim=-1)
+            u = use[a : a + lr.shape[0]]
+            m = u.shape[0]  # the last position has no next token
+            if not u.any():
+                continue
+            pr, pt = F.log_softmax(lr[:m][u], dim=-1), F.log_softmax(lt[:m][u], dim=-1)
+            tg = nxt[a : a + m][u]
             kl[q] += (pr.exp() * (pr - pt)).sum(-1).double().sum().cpu()
             top1[q] += (pr.argmax(-1) == pt.argmax(-1)).double().sum().cpu()
-            tg = target[a : a + pr.shape[0]]
-            m = tg.shape[0]  # the last position has no next token
-            nll_ref[q] -= pr[:m].gather(1, tg[:, None]).double().sum().cpu()
-            nll[q] -= pt[:m].gather(1, tg[:, None]).double().sum().cpu()
-    return {"kl": (kl / n).tolist(), "top1": (top1 / n).tolist(), "ppl_ref": (nll_ref / (n - 1)).exp().tolist(), "ppl": (nll / (n - 1)).exp().tolist()}
+            nll_ref[q] -= pr.gather(1, tg[:, None]).double().sum().cpu()
+            nll[q] -= pt.gather(1, tg[:, None]).double().sum().cpu()
+            count[q] += int(u.sum())
+    return {"kl": (kl / count).tolist(), "top1": (top1 / count).tolist(), "ppl_ref": (nll_ref / count).exp().tolist(),
+            "ppl": (nll / count).exp().tolist(), "targets": count.tolist()}

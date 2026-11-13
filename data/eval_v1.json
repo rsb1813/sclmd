@@ -3,69 +3,47 @@
   "doc_max": 1024,
   "skip": null,
   "categories": {
-    "en_web": {
-      "source": "HuggingFaceFW/fineweb-edu sample-10BT",
-      "license": "ODC-By",
-      "sequences": 2,
-      "documents": 6,
-      "skipped": 0
-    },
-    "ko_wiki": {
-      "source": "wikimedia/wikipedia 20231101.ko",
-      "license": "CC BY-SA 3.0",
-      "sequences": 2,
-      "documents": 5,
-      "skipped": 0
-    },
-    "multi_wiki": {
-      "source": "wikimedia/wikipedia 20231101.{ja,zh,de,fr}",
-      "license": "CC BY-SA 3.0",
-      "sequences": 1,
-      "documents": 2,
-      "skipped": 0
-    },
     "chat_en": {
       "source": "HuggingFaceH4/ultrachat_200k train_sft",
       "license": "MIT",
-      "sequences": 2,
-      "documents": 5,
-      "skipped": 0
+      "sequences": 4,
+      "documents": 16,
+      "skipped": 0,
+      "targets": 5131
     },
     "chat_ko": {
       "source": "nlpai-lab/kullm-v2",
       "license": "Apache-2.0",
-      "sequences": 2,
-      "documents": 28,
-      "skipped": 0
+      "sequences": 4,
+      "documents": 44,
+      "skipped": 0,
+      "targets": 6734
     },
     "code_inst": {
       "source": "m-a-p/CodeFeedback-Filtered-Instruction",
       "license": "Apache-2.0",
-      "sequences": 2,
-      "documents": 8,
-      "skipped": 0
-    },
-    "code_raw": {
-      "source": "local CPython 3.14 standard library sources",
-      "license": "PSF-2.0",
-      "sequences": 1,
-      "documents": 3,
-      "skipped": 0
+      "sequences": 4,
+      "documents": 18,
+      "skipped": 0,
+      "targets": 5684
     },
     "math": {
       "source": "openai/gsm8k main",
       "license": "MIT",
-      "sequences": 2,
-      "documents": 19,
-      "skipped": 0
+      "sequences": 4,
+      "documents": 40,
+      "skipped": 0,
+      "targets": 5048
     },
     "tools": {
       "source": "glaiveai/glaive-function-calling-v2",
       "license": "Apache-2.0",
-      "sequences": 2,
-      "documents": 11,
-      "skipped": 0
+      "sequences": 4,
+      "documents": 25,
+      "skipped": 0,
+      "targets": 3270
     }
   },
-  "total_tokens": 32768
+  "total_tokens": 40960,
+  "targets": 25867
 }
