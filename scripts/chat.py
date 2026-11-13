@@ -32,7 +32,7 @@ HELP = """[bold]명령[/]
   /show                  지금 설정과 문맥 사용량
   /think, /nothink       생각 과정을 쓸지 (다음 답부터; 바꾸면 대화를 처음부터 다시 읽음)
   /showthink, /hidethink 생각 과정을 펼쳐 보일지, 한 줄로 접을지 (기본: 접음)
-  /system <글>           시스템 프롬프트 (새 문맥부터 적용)
+  /system <글>           시스템 프롬프트 (다음 답부터; 대화 중에 바꾸면 처음부터 다시 읽음)
   /temperature <수>      기본 1.0 (모델 공식값). 0이면 가장 확률 높은 토큰만 고름
   /top_p <수>, /top_k <수>  temperature가 0보다 클 때 고르는 범위 (기본 0.95, 64: 모델 공식값)
   /num_predict <수>      답 하나의 최대 토큰 수 (기본 4096)
@@ -196,7 +196,7 @@ def command(line: str, session: Session, opts: dict, console: Console) -> bool:
                           f"시스템 프롬프트: {session.system or '(없음)'}[/]", highlight=False)
         elif key == "system":
             session.system = value
-            console.print("[grey62]시스템 프롬프트를 바꿨습니다" + ("." if not session.messages else " (/clear 뒤부터 적용).") + "[/]")
+            console.print("[grey62]시스템 프롬프트를 바꿨습니다" + ("." if not session.messages else " (다음 답부터 적용: 대화를 처음부터 다시 읽습니다).") + "[/]")
         elif key in ("think", "nothink"):
             session.think = key == "think"
         elif key in ("showthink", "hidethink"):

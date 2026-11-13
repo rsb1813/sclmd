@@ -17,7 +17,7 @@ From scratch, in this order (Python runs from the parent project's environment, 
 | Pair codes for every layer, at 3 and 4 bits | `python -m scripts.quantize` | 23 min, 28 GB |
 | The output head's and the drafter's codes | `python -m scripts.quantize_head`, `python -m scripts.quantize_drafter` | 3 min each |
 | The engine | `engine\build.bat` (CUDA toolkit and MSVC) | |
-| What each matrix is worth at 4 bits (already in `data/`) | `sh scripts/sweep.sh` | 50 min |
+| What each matrix is worth at 4 bits, on text the model writes itself (the reports are already in `data/`): a plan to write with, the text, the original over it, the measurements | `python -m scripts.plans`, `sh scripts/sweep.sh`, `python -m scripts.allocate --gib 11.1`, `python -m scripts.own_text`, `python -m scripts.reference --set own_v1` (and again with `--quant fp32`), `sh scripts/sweep_own.sh` | 50 + 25 min |
 | Chat | `chat.bat` | 15 s to load |
 
-Checks: `python -m pytest` (small random models, a GPU for the engine's tests), `python -m scripts.engine_check` (the real model on the engine against the same codes in PyTorch and against the original), `python -m scripts.say "..." --check` (text with the drafter equals text without).
+Checks: `python -m pytest` (small random models, a GPU for the engine's tests), `python -m scripts.engine_check` (the real model on the engine against the same codes in PyTorch and against the original), `python -m scripts.say "..." --check` (text with the drafter equals text without), `python -m scripts.long_recall` (facts from the start and middle of a 7,000-token prompt).
