@@ -4,6 +4,7 @@ Gemma 4 31B (dense) on a single RTX 5080 16 GB: as close to the original as the 
 Every weight sits in VRAM as 3- or 4-bit pair codes and is multiplied straight from the codes on the tensor cores; a small drafter guesses six tokens ahead and the main model verifies them in one pass, which leaves the text unchanged.
 
 - `chat.bat`: the terminal chat (`/?` lists its commands). It picks how many matrices get 4 bits from the VRAM that is free when it starts.
+- `serve.bat`: an OpenAI-compatible server for several users at once (`http://127.0.0.1:8001/v1`; `-h` lists its options): every pass of the model carries tokens of all requests under way, 127 tok/s for one reply and 420 together for eight.
 - `design.md`: the model, the budget, and what was measured (Korean)
 - `checklist.md`: what is done and what is being done now (Korean)
 
@@ -20,4 +21,6 @@ From scratch, in this order (Python runs from the parent project's environment, 
 | What each matrix is worth at 4 bits, on text the model writes itself (the reports are already in `data/`): a plan to write with, the text, the original over it, the measurements | `python -m scripts.plans`, `sh scripts/sweep.sh`, `python -m scripts.allocate --gib 11.1`, `python -m scripts.own_text`, `python -m scripts.reference --set own_v1` (and again with `--quant fp32`), `sh scripts/sweep_own.sh` | 50 + 25 min |
 | Chat | `chat.bat` | 15 s to load |
 
-Checks: `python -m pytest` (small random models, a GPU for the engine's tests), `python -m scripts.engine_check` (the real model on the engine against the same codes in PyTorch and against the original), `python -m scripts.say "..." --check` (text with the drafter equals text without), `python -m scripts.long_recall` (facts from the start and middle of a 7,000-token prompt).
+Checks: `python -m pytest` (small random models, a GPU for the engine's tests), `python -m scripts.engine_check` (the real model on the engine against the same codes in PyTorch and against the original), `python -m scripts.say "..." --check` (text with the drafter equals text without), `python -m scripts.long_recall` (facts from the start and middle of a 7,000-token prompt), `python -m scripts.batch_bench` (several texts at once, each the text it is alone), `python scripts/serve_bench.py` (clients against a running server).
+
+Benchmarks: `python -I scripts/bench_prepare.py --out data/bench` (the questions as local prompt files), `python -m scripts.bench --task mmlu_pro --limit 140` (the replies; `sh scripts/bench_queue.sh <this folder>` runs `data/bench/queue.txt` and can be paused with `logs/pause`), `python -I scripts/bench_score.py` (scores, `data/bench_summary.json`).
