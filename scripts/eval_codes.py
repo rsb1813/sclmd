@@ -1,0 +1,90 @@
+# The model with some layers' matrices replaced by their fitted pair codes, scored against the original.
+# Computed in float32 (as the engine's sums are), and scored against both the original in float32 (what the codes
+# alone cost) and the original in bf16 (the reference; the float32 original itself is KL 0.018 away from it).
+import argparse
+import json
+import os
+import time
+
+import torch
+
+from sclmd import DATA, ckpt
+from sclmd import codes as C
+from sclmd import model as M
+from sclmd.checkpoint import Checkpoint
+from sclmd.stream import Stream, cap_vram, compare
+from scripts.quantize import parse_layers
+from scripts.reference import by_category, load_set
+
+
+def plan_of(args, cfg) -> dict:
+    """layer -> {matrix: bits}."""
+    if args.plan:
+        with open(args.plan, encoding="utf-8") as f:
+            return {int(k): v for k, v in json.load(f)["layers"].items()}
+    mats = args.mats.split(",") if args.mats else list(M.LINEARS)
+    return {i: {m: args.rate for m in mats} for i in parse_layers(args.layers, cfg.n_layers)}
+
+
+@torch.no_grad()
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--name", default="v1")
+    ap.add_argument("--set", default="eval_v1")
+    ap.add_argument("--layers", help="e.g. 30 or 0-59 or 2,17")
+    ap.add_argument("--rate", type=int, default=6, help="bits a pair for --layers (6 or 8)")
+    ap.add_argument("--mats", help="only these matrices of --layers (default: all)")
+    ap.add_argument("--plan", help="a JSON file {layers: {layer: {matrix: bits}}} instead of --layers")
+    ap.add_argument("--tag", help="name of the report (default: from the arguments)")
+    ap.add_argument("--batch", type=int, default=2)
+    args = ap.parse_args()
+    cap_vram()
+    ck = Checkpoint(ckpt("orig"))
+    plan = plan_of(args, ck.cfg)
+    tag = args.tag or (os.path.splitext(os.path.basename(args.plan))[0] if args.plan else f"l{args.layers}_c{args.rate}" + (f"_{args.mats}" if args.mats else ""))
+    ids, category, names, target = load_set(args.set)
+
+    def weights(i, w):
+        if i not in plan:
+            return w
+        fitted = C.load_layer(args.name, i, {m: b for m, b in plan[i].items() if m in w})
+        return {k: fitted.get(k, v) for k, v in w.items()}
+
+    t = time.time()
+    hidden = Stream(ck, batch=args.batch).run(ids, weights=weights, dtype=torch.float32)["hidden"].cpu()
+    seconds = time.time() - t
+    torch.cuda.empty_cache()
+    embed, norm = ck.embed("cuda"), ck.norm("cuda")
+    report = {"set": args.set, "codes": args.name, "tag": tag, "seconds": round(seconds, 1),
+              "bits_per_weight": bits_per_weight(ck.cfg, plan), "against": {}}
+    for ref_name, dtype in (("orig_fp32", torch.float32), ("orig", None)):
+        ref = torch.load(os.path.join(DATA, f"{args.set}_{ref_name}.pt"), weights_only=True)["hidden"]
+        e, nw = (embed.float(), norm.float())
+        re_, rn = (e, nw) if dtype is not None else (embed, norm)
+        result = compare(ck.cfg, ref, hidden, rn, re_, ids, target, test_norm=nw, test_embed=e)
+        report["against"][ref_name] = by_category(result, category, names)
+        del ref
+    with open(os.path.join(DATA, f"codes_{args.name}_{tag}.json"), "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    a, b = report["against"]["orig_fp32"], report["against"]["orig"]
+    print(f"{tag}: KL vs fp32 original {a['all']['kl']:.4f} (top1 {a['all']['top1']:.4f}), vs bf16 original {b['all']['kl']:.4f} (top1 {b['all']['top1']:.4f}), "
+          f"ppl {a['all']['ppl']:.3f} | " + " ".join(f"{c} {v['kl']:.4f}" for c, v in a.items() if c != "all"), flush=True)
+
+
+def bits_per_weight(cfg, plan: dict) -> float:
+    """Average over the layers' matrices in the plan (bits a pair / 2)."""
+    total = bits = 0
+    for i, mats in plan.items():
+        t = cfg.layer_types[i]
+        qo, kv = cfg.heads * cfg.head_dim[t] * cfg.hidden, cfg.kv_heads[t] * cfg.head_dim[t] * cfg.hidden
+        size = {"q": qo, "o": qo, "k": kv, "v": kv, "gate": cfg.mlp * cfg.hidden, "up": cfg.mlp * cfg.hidden, "down": cfg.mlp * cfg.hidden}
+        for m, b in mats.items():
+            if m == "v" and t == M.FULL:
+                continue
+            total += size[m]
+            bits += size[m] * b / 2
+    return bits / total if total else 0.0
+
+
+if __name__ == "__main__":
+    main()

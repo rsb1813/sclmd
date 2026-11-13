@@ -45,26 +45,29 @@ class BlockHadamard:
 
 def gptq_vq(
     w: torch.Tensor, h: torch.Tensor, codebook: torch.Tensor, group: int, damp: float = 0.01, block: int = 128,
-    refit: bool = False,
+    refit: bool = False, own_h: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """GPTQ with vector rounding: d columns at a time go to the row of `codebook` [C, d] (times the group's scale)
     that is nearest in the metric the error feedback leaves on them, |delta U_BB^-1|^2 with U the Cholesky factor
     gptq_codes uses, i.e. the cost that remains after the later columns have compensated. A group's scale is the rms
     of its columns once earlier feedback has landed (fp16; group >= K: one per row, the rms of the row as given, or
     with `refit` the least-squares scale of the chosen codes under h). Batch dims as in gptq_codes.
+    own_h: h (fp32) is the caller's to lose; it is damped in place instead of copied (a 21,504-column Hessian is 1.85 GB).
     Returns codes (long [..., N, K/d]) and scales (fp32 [..., N, K/group or 1])."""
     d = codebook.size(-1)
     *batch, n, k = w.shape
     per_row = group >= k
     assert block % d == 0 and k % d == 0 and (per_row or (block % group == 0 and group % d == 0))
     assert per_row or not refit
-    W, H = w.float().clone(), h.float().clone()
+    W, H = w.float().clone(), (h if own_h and h.dtype == torch.float32 else h.float().clone())
     diag = torch.diagonal(H, dim1=-2, dim2=-1)  # a view: edits below land in H
     dead = diag == 0
     diag.masked_fill_(dead, 1)
     W.masked_fill_(dead.unsqueeze(-2), 0)
     diag += damp * diag.mean(-1, keepdim=True)
-    u = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(H)), upper=True)
+    u = torch.linalg.cholesky(H)  # one factor alive at a time
+    u = torch.cholesky_inverse(u)
+    u = torch.linalg.cholesky(u, upper=True)
     w0 = W.clone() if refit else None
     cb = codebook.float()
     # every code's d x d diagonal block of U inverted at once, and the codewords in each block's metric: one

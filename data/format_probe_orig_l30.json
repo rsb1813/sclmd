@@ -1,0 +1,121 @@
+{
+  "layer": 30,
+  "ckpt": "orig",
+  "set": "eval_v1",
+  "fit_tokens": {
+    "attn_in": 20480,
+    "o_in": 20480,
+    "mlp_in": 20480,
+    "down_in": 20480
+  },
+  "matrices": {
+    "down": {
+      "q4_0": {
+        "bpw": 4.5,
+        "output_error": 0.0028228267364917587,
+        "weight_error": 0.008256871680257193
+      },
+      "gptqh_v2c8": {
+        "bpw": 4.0,
+        "output_error": 0.002057640086120532,
+        "weight_error": 0.01587707698949109
+      },
+      "gptqh_v2c7": {
+        "bpw": 3.5,
+        "output_error": 0.004053172104332659,
+        "weight_error": 0.031203053423861874
+      },
+      "gptqh_v2c6": {
+        "bpw": 3.0,
+        "output_error": 0.00784080692747546,
+        "weight_error": 0.060100805815333135
+      },
+      "gptq_v2c6": {
+        "bpw": 3.0,
+        "output_error": 0.013173195963293787,
+        "weight_error": 0.0824523721497415
+      }
+    },
+    "q": {
+      "q4_0": {
+        "bpw": 4.5,
+        "output_error": 0.003916230128769895,
+        "weight_error": 0.00816108340902572
+      },
+      "gptqh_v2c8": {
+        "bpw": 4.0,
+        "output_error": 0.0010989212577351328,
+        "weight_error": 0.013118450930170684
+      },
+      "gptqh_v2c7": {
+        "bpw": 3.5,
+        "output_error": 0.002157991957363123,
+        "weight_error": 0.025673756983615986
+      },
+      "gptqh_v2c6": {
+        "bpw": 3.0,
+        "output_error": 0.004217576495745236,
+        "weight_error": 0.049562703388055795
+      },
+      "gptq_v2c6": {
+        "bpw": 3.0,
+        "output_error": 0.006732588112052593,
+        "weight_error": 0.061592114187913376
+      }
+    },
+    "o": {
+      "q4_0": {
+        "bpw": 4.5,
+        "output_error": 0.0030493842828306214,
+        "weight_error": 0.007585509316508484
+      },
+      "gptqh_v2c8": {
+        "bpw": 4.0,
+        "output_error": 0.0009519793296190963,
+        "weight_error": 0.01505986254576075
+      },
+      "gptqh_v2c7": {
+        "bpw": 3.5,
+        "output_error": 0.0018979897430163562,
+        "weight_error": 0.029543573882420723
+      },
+      "gptqh_v2c6": {
+        "bpw": 3.0,
+        "output_error": 0.0036930417317998323,
+        "weight_error": 0.056588640246272845
+      },
+      "gptq_v2c6": {
+        "bpw": 3.0,
+        "output_error": 0.00543615499906555,
+        "weight_error": 0.07139744429831352
+      }
+    },
+    "k": {
+      "q4_0": {
+        "bpw": 4.5,
+        "output_error": 0.0030704652970004994,
+        "weight_error": 0.008564117527660068
+      },
+      "gptqh_v2c8": {
+        "bpw": 4.0,
+        "output_error": 0.0008033612503970595,
+        "weight_error": 0.013073917347674333
+      },
+      "gptqh_v2c7": {
+        "bpw": 3.5,
+        "output_error": 0.0015862746460498253,
+        "weight_error": 0.025650229054396647
+      },
+      "gptqh_v2c6": {
+        "bpw": 3.0,
+        "output_error": 0.003131185619639697,
+        "weight_error": 0.050052826118132374
+      },
+      "gptq_v2c6": {
+        "bpw": 3.0,
+        "output_error": 0.007578471718019694,
+        "weight_error": 0.07839563016902695
+      }
+    }
+  }
+}

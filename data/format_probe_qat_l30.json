@@ -1,0 +1,57 @@
+{
+  "layer": 30,
+  "ckpt": "qat",
+  "set": "eval_v1",
+  "fit_tokens": {
+    "attn_in": 20480,
+    "o_in": 20480,
+    "mlp_in": 20480,
+    "down_in": 20480
+  },
+  "matrices": {
+    "gate": {
+      "q4_0": {
+        "bpw": 4.5,
+        "output_error": 0.000867093526217423,
+        "weight_error": 0.002536807149807896
+      },
+      "gptqh_v2c8": {
+        "bpw": 4.0,
+        "output_error": 0.00168721323462627,
+        "weight_error": 0.012684191076646817
+      },
+      "gptqh_v2c7": {
+        "bpw": 3.5,
+        "output_error": 0.003322764300420761,
+        "weight_error": 0.024871253812766114
+      },
+      "gptqh_v2c6": {
+        "bpw": 3.0,
+        "output_error": 0.006520577911594146,
+        "weight_error": 0.048350788263208135
+      }
+    },
+    "q": {
+      "q4_0": {
+        "bpw": 4.5,
+        "output_error": 0.0008699476870766062,
+        "weight_error": 0.002558574017144394
+      },
+      "gptqh_v2c8": {
+        "bpw": 4.0,
+        "output_error": 0.0011858217711001378,
+        "weight_error": 0.01329698132645046
+      },
+      "gptqh_v2c7": {
+        "bpw": 3.5,
+        "output_error": 0.0023469006710546674,
+        "weight_error": 0.026185810695930407
+      },
+      "gptqh_v2c6": {
+        "bpw": 3.0,
+        "output_error": 0.004588932346367926,
+        "weight_error": 0.05066019534415108
+      }
+    }
+  }
+}

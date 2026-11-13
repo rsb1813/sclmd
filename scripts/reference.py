@@ -45,19 +45,27 @@ def main():
     cap_vram()
     ids, category, names, target = load_set(args.set)
     ck = Checkpoint(ckpt(args.ckpt))
-    weights = None
+    weights, dtype = None, None
     if args.quant == "q4_0":
         weights = lambda i, w: {k: (Q.q4_0(v).to(v.dtype) if k in M.LINEARS else v) for k, v in w.items()}  # noqa: E731
+    elif args.quant == "fp32":  # the same weights in float32 arithmetic: how much of any KL is bf16's rounding
+        dtype = torch.float32
     elif args.quant:
         raise SystemExit(f"unknown --quant {args.quant}")
     name = args.ckpt + (f"_{args.quant}" if args.quant else "")
     t = time.time()
-    out = Stream(ck, batch=args.batch).run(ids, weights=weights, log=lambda s: print(s, flush=True))
+    out = Stream(ck, batch=args.batch).run(ids, weights=weights, log=lambda s: print(s, flush=True), dtype=dtype)
     seconds = time.time() - t
     hidden = out["hidden"]
-    torch.save({"hidden": hidden.cpu(), "shared": out["shared"]}, os.path.join(DATA, f"{args.set}_{name}.pt"))
+    if name == args.ckpt or args.quant == "fp32":  # kept: the drafter replay and later comparisons read them
+        torch.save({"hidden": hidden.cpu(), "shared": out["shared"]}, os.path.join(DATA, f"{args.set}_{name}.pt"))
 
+    del out
+    hidden = hidden.cpu()
+    torch.cuda.empty_cache()
     embed, norm = ck.embed("cuda"), ck.norm("cuda")
+    if dtype is not None:
+        embed, norm = embed.to(dtype), norm.to(dtype)
     if name == args.against:
         ref_hidden, ref_embed, ref_norm = hidden, embed, norm
     else:

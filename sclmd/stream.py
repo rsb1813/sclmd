@@ -26,12 +26,13 @@ class Stream:
         self.ckpt, self.cfg, self.device, self.batch = ckpt, ckpt.cfg, device, batch
 
     @torch.no_grad()
-    def run(self, ids: torch.Tensor, n_layers: int | None = None, weights=None, tap=None, log=None) -> dict:
+    def run(self, ids: torch.Tensor, n_layers: int | None = None, weights=None, tap=None, log=None, dtype=None) -> dict:
         """ids [sequences, n], every sequence from position 0.
         weights(i, w) -> w: replaces a layer's weights (quantized variants).
         tap(i, name, tensor, rows): the input of each group of matrices of layer i, for the sequences `rows`.
         Returns "hidden" (the last layer's output, before the final norm) and "shared" (the keys and values the drafter
-        attends to: layer type -> (keys, values))."""
+        attends to: layer type -> (keys, values)).
+        dtype: compute in this type instead of the checkpoint's (float32: the arithmetic without bf16's rounding)."""
         cfg, dev = self.cfg, self.device
         n_layers = cfg.n_layers if n_layers is None else n_layers
         ids = ids.to(dev)
@@ -40,12 +41,16 @@ class Stream:
         embed = self.ckpt.embed(dev)
         h = torch.cat([embed[ids[a : a + self.batch]] * M.embed_scale(cfg, embed.dtype) for a in range(0, s, self.batch)])
         del embed
+        if dtype is not None:
+            h = h.to(dtype)
         shared_all = {}
         t0 = time.time()
         for i in range(n_layers):
             w = self.ckpt.layer(i, dev)
             if weights is not None:
                 w = weights(i, w)
+            if dtype is not None:
+                w = {k: v.to(dtype) for k, v in w.items()}
             for a in range(0, s, self.batch):
                 rows = slice(a, min(a + self.batch, s))
                 shared = {}

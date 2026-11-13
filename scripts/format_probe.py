@@ -42,8 +42,9 @@ class Inputs:
 
 
 def rotated(rot, h):
-    """R^T H R: the Hessian in the basis the weight is quantized in."""
-    return rot.rotate(rot.rotate(h).t().contiguous())
+    """R^T H R: the Hessian in the basis the weight is quantized in. Uses up h."""
+    h = rot.rotate(h).t().contiguous()
+    return rot.rotate(h)
 
 
 def pair_codebook(w: torch.Tensor, bits: int) -> torch.Tensor:
@@ -55,27 +56,30 @@ def pair_codebook(w: torch.Tensor, bits: int) -> torch.Tensor:
     return Q.kmeans(sample, 1 << bits, iters=25)
 
 
-def variants(w: torch.Tensor, h: torch.Tensor, which: list):
-    """Yield (name, bits per weight, the weight as stored)."""
+def variants(w: torch.Tensor, h_cpu: torch.Tensor, which: list):
+    """Yield (name, bits per weight, the weight as stored). The Hessian stays on the CPU and a copy goes to the GPU
+    for each fit, which uses it up."""
     n, k = w.shape
     rot = Q.BlockHadamard(k, seed=17 + k, device=DEV)
-    wr, hr = None, None
     for name in which:
         if name == "q4_0":
             yield name, 4.5, Q.q4_0(w)
             continue
         kind, bits = name.split("_")[0], int(name.split("c")[-1])  # e.g. gptq_v2c6, gptqh_v2c8, near_v2c6
         use_rot = kind.endswith("h")
-        if use_rot and wr is None:
-            wr, hr = rot.rotate(w), rotated(rot, h)
-        ww, hh = (wr, hr) if use_rot else (w.float(), h)
+        ww = rot.rotate(w) if use_rot else w.float()
         cb = pair_codebook(ww, bits)
         if kind.startswith("near"):  # nearest codeword, no error feedback
             wn, s = Q.row_normalize(ww)
             wq = Q.vq_dequant(wn, cb) * s
         else:
-            codes, scales = Q.gptq_vq(ww, hh, cb, k, refit=True)
+            hh = h_cpu.to(DEV)
+            if use_rot:
+                hh = rotated(rot, hh)
+            codes, scales = Q.gptq_vq(ww, hh, cb, k, refit=True, own_h=True)
+            del hh
             wq = Q.vq_codes_dequant(codes, scales, cb)
+        del ww
         yield name, bits / 2, rot.unrotate(wq) if use_rot else wq
 
 
@@ -93,6 +97,7 @@ def main():
     inputs = Inputs(args.layer)
     with torch.no_grad():
         Stream(ck, batch=2).run(ids, n_layers=args.layer + 1, tap=inputs)
+        inputs.h = {name: h.cpu() for name, h in inputs.h.items()}
         torch.cuda.empty_cache()
         w_all = ck.layer(args.layer)
         report = {"layer": args.layer, "ckpt": args.ckpt, "set": args.set, "fit_tokens": inputs.count, "matrices": {}}
@@ -100,7 +105,7 @@ def main():
             if mat not in w_all:
                 continue
             group = GROUP[mat]
-            w, h = w_all[mat].to(DEV).float(), inputs.h[group]
+            w, h = w_all[mat].to(DEV).float(), inputs.h[group]  # h is on the CPU
             x = torch.cat(inputs.test[group])[:TEST_ROWS].to(DEV)
             ref = x @ w.t()
             denom = ref.pow(2).sum().item()
