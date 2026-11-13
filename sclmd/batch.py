@@ -31,8 +31,11 @@ class Job:
     that position needs."""
 
     def __init__(self, seq: int, prompt: list, max_new: int, pick: Picker | None, stop: tuple = (), emit=None, start: int | None = None,
-                 only_read: bool = False):
+                 only_read: bool = False, base: list | None = None):
         self.seq, self.todo, self.max_new, self.pick, self.stop, self.emit, self.start = seq, list(prompt), max_new, pick, tuple(stop), emit, start
+        self.base = list(base or []) + list(prompt)  # everything before the reply, from the sequence's first position (base: what it held already)
+        self.resume = None  # after starting over: the token to go on with once everything is read again
+        self.held = None  # after starting over: it waits until a job has ended (the count of ended jobs it was held at)
         self.only_read = only_read  # no reply: the job is over ("read") when its tokens are in, and takes only rows nothing else wants
         self.out = []  # the reply so far
         self.pending = None  # its last token: settled, not yet run
@@ -60,6 +63,8 @@ class Batcher:
         self.turn = 0
         self.make_room = None  # called when the pool of keys and values is empty: frees some and says so, or says no
         self.passes = self.rows = self.guess_rows = self.kept_rows = 0
+        self.starved = 0  # jobs that had to wait for keys and values in the last pass
+        self.ended = self.restarts = 0  # jobs that have ended; times a job had to start over for lack of memory
         self.widths = {8: 0, 16: 0, 32: 0}  # passes by width
         self.sent = [20.0] * len(KEEP)  # guesses sent at each depth, and those kept (starting as if KEEP had been seen 20 times)
         self.held = [20.0 * k for k in KEEP]
@@ -120,26 +125,47 @@ class Batcher:
                 j.done = "cancelled"
             if j.done is None and eng.lengths[j.seq] >= eng.capacity:
                 j.done = "length"  # the sequence is as long as it can be
+        self.ended += sum(j.done is not None for j in self.jobs)
         self.jobs = [j for j in self.jobs if j.done is None]
-        live = list(self.jobs)
-        if not live:
+        if not self.jobs:
             return False
+        live = [j for j in self.jobs if j.held is None or self.ended > j.held]  # in the order they came
+        if not live:  # only jobs that wait for another to end, and none will: they try again
+            for j in self.jobs:
+                j.held = None
+            live = list(self.jobs)
         rows = self._share(live)
         self.turn += 1
-        # the tiles the pass needs: when the pool is short, the jobs that came last wait
+        # The tiles the pass needs. When the pool is short (and make_room frees nothing more), the jobs get theirs in
+        # the order they came and the others wait for a pass in which there are some. When not one can go on, the
+        # last to come that holds any gives them up and starts over once a job has ended (_start_over); a job that
+        # is the only one holding any cannot be helped and ends ("full").
         while True:
-            use = [j for j in live if rows.get(j)]
-            try:
-                eng._provide([(j.seq, eng.lengths[j.seq], rows[j]) for j in use])
-                break
-            except E.KVFull:
-                if self.make_room is not None and self.make_room():
+            use, free = [], eng.free_tiles()
+            for j in live:  # in the order they came
+                if not rows.get(j):
                     continue
-                if len(use) == 1:  # nothing else holds what it lacks back: it cannot go on
-                    use[0].done = "full"
-                    self.jobs.remove(use[0])
-                    return True
-                rows.pop(use[-1])
+                need = eng.lacks(j.seq, eng.lengths[j.seq], rows[j])
+                if any(need[t] > free[t] for t in need) and j.pending is not None and rows[j] > 1:
+                    rows[j] = 1  # without its guesses it may need none
+                    need = eng.lacks(j.seq, eng.lengths[j.seq], 1)
+                if all(need[t] <= free[t] for t in need):
+                    free = {t: free[t] - need[t] for t in need}
+                    use.append(j)
+            self.starved = sum(1 for j in live if rows.get(j)) - len(use)
+            if not self.starved or self.make_room is None or not self.make_room():
+                break
+        if not use:
+            holders = [j for j in self.jobs if any(x >= 0 for t in eng.ring for x in eng.tiles[t][j.seq])]
+            if len(holders) > 1:
+                self._start_over(holders[-1])
+            else:
+                victim = holders[-1] if holders else live[-1]
+                victim.done = "full"
+                self.jobs.remove(victim)
+                self.ended += 1
+            return True
+        eng._provide([(j.seq, eng.lengths[j.seq], rows[j]) for j in use])
         # a turn start that the reply is about to write over is copied to RAM first
         for j in use:
             if j.start is not None and not j.snapped:
@@ -183,6 +209,8 @@ class Batcher:
                 j.todo, j.read = j.todo[n:], j.read + n
                 if not j.todo and j.only_read:
                     j.done = "read"
+                elif not j.todo and j.resume is not None:  # started over, and back where it was
+                    j.hidden, j.pending, j.resume = hn[-1].clone(), j.resume, None
                 elif not j.todo:
                     j.hidden = hn[-1].clone()
                     j._settle(choose(j, row - 1, row, at)[0])
@@ -210,6 +238,16 @@ class Batcher:
                 j._settle(wants[kept])  # a guessed stop token is not kept above: it comes back here and ends the text
         self.jobs = [j for j in self.jobs if j.done is None]
         return True
+
+    def _start_over(self, job: Job):
+        """The job gives its sequence's memory up. Later it reads everything again, its own reply so far included,
+        and goes on with the token it had settled last: the same text as if it had never stopped."""
+        self.eng.release(job.seq)
+        job.todo = job.base + job.out[:-1] if job.pending is not None or job.resume is not None else list(job.base)
+        if job.out and not job.only_read:
+            job.resume = job.out[-1]
+        job.pending, job.hidden, job.snapped, job.held = None, None, False, self.ended
+        self.restarts += 1
 
     def drop(self, job: Job):
         """Takes a job out between passes (its sequence keeps what it has read)."""

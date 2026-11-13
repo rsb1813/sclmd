@@ -11,11 +11,11 @@
     {
       "texts": 1,
       "tokens": 150,
-      "seconds": 1.13,
-      "tok_s": 132.3,
-      "tok_s_each": 132.3,
+      "seconds": 1.15,
+      "tok_s": 130.6,
+      "tok_s_each": 130.6,
       "passes": 42,
-      "ms_a_pass": 27.0,
+      "ms_a_pass": 27.3,
       "rows_a_pass": 7.38,
       "guesses_kept": 0.45,
       "widths": {
@@ -30,35 +30,13 @@
       "same_as_alone": true
     },
     {
-      "texts": 2,
-      "tokens": 300,
-      "seconds": 1.45,
-      "tok_s": 207.5,
-      "tok_s_each": 103.8,
-      "passes": 56,
-      "ms_a_pass": 25.8,
-      "rows_a_pass": 8.46,
-      "guesses_kept": 0.62,
-      "widths": {
-        "8": 54,
-        "16": 1,
-        "32": 1
-      },
-      "first_token_s": 0.1,
-      "ended": [
-        "length",
-        "length"
-      ],
-      "same_as_alone": true
-    },
-    {
       "texts": 4,
       "tokens": 600,
-      "seconds": 1.81,
-      "tok_s": 331.9,
-      "tok_s_each": 83.0,
+      "seconds": 1.77,
+      "tok_s": 339.1,
+      "tok_s_each": 84.8,
       "passes": 56,
-      "ms_a_pass": 32.3,
+      "ms_a_pass": 31.6,
       "rows_a_pass": 16.62,
       "guesses_kept": 0.69,
       "widths": {
@@ -78,11 +56,11 @@
     {
       "texts": 8,
       "tokens": 1200,
-      "seconds": 3.02,
-      "tok_s": 397.0,
-      "tok_s_each": 49.6,
+      "seconds": 2.87,
+      "tok_s": 418.5,
+      "tok_s_each": 52.3,
       "passes": 93,
-      "ms_a_pass": 32.5,
+      "ms_a_pass": 30.8,
       "rows_a_pass": 17.17,
       "guesses_kept": 0.82,
       "widths": {
@@ -106,11 +84,11 @@
     {
       "texts": 12,
       "tokens": 1800,
-      "seconds": 4.01,
-      "tok_s": 449.3,
-      "tok_s_each": 37.4,
+      "seconds": 3.76,
+      "tok_s": 478.2,
+      "tok_s_each": 39.9,
       "passes": 83,
-      "ms_a_pass": 48.3,
+      "ms_a_pass": 45.3,
       "rows_a_pass": 30.31,
       "guesses_kept": 0.76,
       "widths": {
@@ -132,42 +110,6 @@
         "length",
         "length",
         "length"
-      ],
-      "same_as_alone": true
-    },
-    {
-      "texts": 16,
-      "tokens": 2258,
-      "seconds": 5.2,
-      "tok_s": 434.2,
-      "tok_s_each": 27.1,
-      "passes": 117,
-      "ms_a_pass": 44.4,
-      "rows_a_pass": 25.79,
-      "guesses_kept": 0.8,
-      "widths": {
-        "8": 24,
-        "16": 2,
-        "32": 91
-      },
-      "first_token_s": 0.65,
-      "ended": [
-        "full",
-        "full",
-        "full",
-        "full",
-        "full",
-        "full",
-        "length",
-        "length",
-        "full",
-        "full",
-        "full",
-        "full",
-        "full",
-        "full",
-        "full",
-        "full"
       ],
       "same_as_alone": true
     }

@@ -64,7 +64,8 @@ def test_cancelled_and_out_of_memory_texts_end_and_the_others_go_on(small_e):  #
     ring = {t: E.ring_tiles(cfg, t, 96) for t in (M.SLIDING, M.FULL)}
     a, b, c = ids_of(40, 51), ids_of(40, 52), ids_of(10, 53)
     want = alone(small_e, a, 30, Picker())
-    # room for one long text and one tile more: the second long one runs out, the first is not disturbed
+    # room for one long text and one tile more: the second long one cannot go on beside the first, and nothing frees
+    # memory for it when the first is done either (its sequence keeps what it holds): it ends for lack of memory
     eng = small_e.engine(sequences=3, pool={M.SLIDING: ring[M.SLIDING] + 1, M.FULL: ring[M.FULL] + 1})
     batch = Batcher(eng)
     first, second, third = Job(0, a, 30, Picker(), STOP), Job(1, b, 30, Picker(), STOP), Job(2, c, 30, Picker(), STOP)
@@ -77,6 +78,63 @@ def test_cancelled_and_out_of_memory_texts_end_and_the_others_go_on(small_e):  #
     batch.run()
     assert first.out == want and first.done in ("stop", "length")
     assert second.done == "full" and third.done == "cancelled"
+
+
+def test_texts_wait_for_keys_and_values_and_go_on_when_some_are_freed(small_e):  # noqa: F811
+    cfg = small_e.cfg
+    ring = {t: E.ring_tiles(cfg, t, 96) for t in (M.SLIDING, M.FULL)}
+    texts = [ids_of(40, 57), ids_of(40, 58), ids_of(36, 59)]
+    want = [alone(small_e, t, 24, Picker()) for t in texts]
+    eng = small_e.engine(sequences=3, pool={M.SLIDING: ring[M.SLIDING] + 1, M.FULL: ring[M.FULL] + 1})  # one long text at a time
+    batch = Batcher(eng)
+    jobs = [Job(seq, t, 24, Picker(), STOP) for seq, t in enumerate(texts)]
+    freed = []
+
+    def make_room() -> bool:  # what the server does: a text that is over gives its memory up
+        for j in jobs:
+            if j.done is not None and j.seq not in freed:
+                eng.release(j.seq)
+                freed.append(j.seq)
+                return True
+        return False
+
+    batch.make_room = make_room
+    for j in jobs:
+        batch.add(j)
+    waited = 0
+    while batch.step():
+        waited += batch.starved > 0
+    assert [j.out for j in jobs] == want and all(j.done in ("stop", "length") for j in jobs)
+    assert waited > 0 and freed == [0, 1]
+
+
+def test_a_text_that_starts_over_for_lack_of_memory_goes_on_with_the_same_tokens(small_e, drafter_e):  # noqa: F811
+    cfg = small_e.cfg
+    ring = {t: E.ring_tiles(cfg, t, 96) for t in (M.SLIDING, M.FULL)}
+    texts = [ids_of(10, 150), ids_of(11, 151), ids_of(9, 152)]  # short prompts: the three are writing when memory runs out
+    picks = [Picker(), Picker(temperature=1.0, top_k=64, top_p=0.95, seed=5), Picker()]
+    want = [generate(small_e.engine(), t, 30, pick, stop=()) for t, pick in zip(texts, picks)]
+    for with_drafter in (False, True):
+        eng = small_e.engine(sequences=3, pool={M.SLIDING: ring[M.SLIDING] + 1, M.FULL: ring[M.FULL] + 1})
+        batch = Batcher(eng, engine_drafter(eng, drafter_e) if with_drafter else None)
+        seen = [[] for _ in texts]
+        jobs = [Job(seq, t, 30, pick, (), emit=seen[seq].append) for seq, (t, pick) in enumerate(zip(texts, picks))]
+        freed = []
+
+        def make_room() -> bool:
+            for j in jobs:
+                if j.done is not None and j.seq not in freed:
+                    eng.release(j.seq)
+                    freed.append(j.seq)
+                    return True
+            return False
+
+        batch.make_room = make_room
+        for j in jobs:
+            batch.add(j)
+        batch.run()
+        assert batch.restarts > 0  # each held a tile and needed another: the last to come gave its up and began again
+        assert [j.out for j in jobs] == want and seen == want  # and nothing was said twice
 
 
 def test_a_turn_start_can_be_come_back_to_after_a_long_reply(small_e):  # noqa: F811

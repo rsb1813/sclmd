@@ -121,8 +121,10 @@ class Server:
 
     def _place(self, req: Request) -> bool:
         """A sequence for the request: the kept conversation it continues, else an unused one, else the one kept
-        longest. False: every sequence is writing (the request waits)."""
+        longest. False: every sequence is writing, or texts under way are waiting for keys and values (the request waits)."""
         eng, best, most = self.eng, None, 0
+        if self.batch.starved and self.active:
+            return False
         for k in self.kept.values():
             for held in (k.now(eng), k.base):  # as far as the sequence has got, else back at its last turn's start
                 n = len(held)
@@ -167,7 +169,8 @@ class Server:
         else:
             return False
         req.reused = reused
-        req.job = Job(seq, req.full[reused:], req.max_new, req.pick, self.stop, emit=lambda t, q=req.events: q.put(("token", t)), start=req.start)
+        req.job = Job(seq, req.full[reused:], req.max_new, req.pick, self.stop, emit=lambda t, q=req.events: q.put(("token", t)),
+                      start=req.start, base=req.full[:reused])
         self.batch.add(req.job)
         self.active.append(req)
         return True
@@ -186,7 +189,7 @@ class Server:
                     eng.crop(req.start, seq)
                     eng.trim(seq)
                     kept.later = later
-                    kept.job = Job(seq, later[req.start :], 0, None, start=req.start, only_read=True)
+                    kept.job = Job(seq, later[req.start :], 0, None, start=req.start, only_read=True, base=later[: req.start])
                     kept.job.snapped = job.snapped
                     self.batch.add(kept.job)
         else:  # cancelled or out of memory: nothing of it is kept
@@ -252,7 +255,7 @@ class Server:
                 "ram_gib": round(sum(p.state["bytes"] for p in self.parked) / 2**30, 2), "sequences": eng.sequences,
                 "keys_and_values": {"gib": round(sum(tile[t] * eng.pool[t] for t in tile) / 2**30, 2),
                                     "free_gib": round(sum(tile[t] * free[t] for t in tile) / 2**30, 2)},
-                "passes": self.batch.passes, "passes_by_width": dict(self.batch.widths), "rows_per_pass": round(self.batch.rows / max(self.batch.passes, 1), 2),
+                "started_over_for_memory": self.batch.restarts, "passes": self.batch.passes, "passes_by_width": dict(self.batch.widths), "rows_per_pass": round(self.batch.rows / max(self.batch.passes, 1), 2),
                 "guesses_kept": round(self.batch.kept_rows / max(self.batch.guess_rows, 1), 2),
                 "tokens_per_second_while_busy": round(self.totals["completion_tokens"] / max(self.busy_s, 1e-9), 1)}
 
@@ -474,22 +477,43 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 if stopped:
                     continue
-                piece = pieces.add(event[1])
-                if piece is None:
-                    continue
-                kind, new = piece
-                text[kind] += new
-                if kind == "think":
-                    if stream:
-                        chunk({"reasoning_content": new})
-                    continue
-                cut = min((text["answer"].find(s) for s in stops if s in text["answer"]), default=-1)
-                if cut >= 0:  # a stop string: the answer ends before it, and the engine is told to stop
-                    text["answer"], stopped, req.cancelled = text["answer"][:cut], True, True
-                upto = len(text["answer"]) if stopped else len(text["answer"]) - hold
-                if stream and upto > sent:
-                    chunk({"content": text["answer"][sent:upto]})
-                    sent = upto
+                # the tokens that have come by now are taken together: the engine's thread is not kept from running
+                # by a wake-up for every token
+                tokens, last = [event[1]], None
+                try:
+                    while last is None:
+                        more = req.events.get_nowait()
+                        if more[0] == "token":
+                            tokens.append(more[1])
+                        else:
+                            last = more
+                except queue.Empty:
+                    pass
+                new = {"think": "", "answer": ""}
+                for token in tokens:
+                    piece = pieces.add(token)
+                    if piece is not None:
+                        new[piece[0]] += piece[1]
+                        text[piece[0]] += piece[1]
+                if new["think"] and stream:
+                    chunk({"reasoning_content": new["think"]})
+                if new["answer"]:
+                    cut = min((text["answer"].find(s) for s in stops if s in text["answer"]), default=-1)
+                    if cut >= 0:  # a stop string: the answer ends before it, and the engine is told to stop
+                        text["answer"], stopped, req.cancelled = text["answer"][:cut], True, True
+                    upto = len(text["answer"]) if stopped else len(text["answer"]) - hold
+                    if stream and upto > sent:
+                        chunk({"content": text["answer"][sent:upto]})
+                        sent = upto
+                if last is not None:
+                    event = last
+                    if event[0] == "error":
+                        if stream:
+                            self.wfile.write(b"data: " + json.dumps({"error": {"message": event[2], "type": "server_error"}}).encode() + b"\n\n")
+                            break
+                        return self._error(event[1], event[2])
+                    result = event[1]
+                    break
             if event[0] == "done":
                 if stream and len(text["answer"]) > sent:
                     chunk({"content": text["answer"][sent:]})
@@ -544,8 +568,12 @@ def main() -> None:
     ap.add_argument("--rows", type=int, default=32, help="the most rows of a pass (8, 16 or 32): tokens of all requests together")
     ap.add_argument("--reserve", type=float, default=VRAM_MARGIN / 2**30, help="GiB of the VRAM that is free now to leave to other programs")
     cli = ap.parse_args()
+    import sys
+
     import transformers
     from transformers import AutoTokenizer
+
+    sys.setswitchinterval(0.0005)  # the engine's thread does not wait 5 ms for an HTTP thread that holds the interpreter
 
     transformers.logging.set_verbosity_error()
     reserve = int(cli.reserve * 2**30)

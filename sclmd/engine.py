@@ -301,6 +301,11 @@ class Engine:
         rows = self.embed_table[torch.as_tensor(ids, device=self.embed_table.device)]
         return rows.to(device=self.device, dtype=torch.float32) * self.embed_scale
 
+    def lacks(self, seq: int, pos: int, n: int) -> dict:
+        """Tiles by kind the sequence would have to be given to write positions pos .. pos + n - 1."""
+        return {t: sum(self.tiles[t][seq][j] < 0 for j in dict.fromkeys((q >> 4) % ring for q in range(pos, pos + n)))
+                for t, ring in self.ring.items()}
+
     def _provide(self, need: list):
         """Tiles for the positions a pass is about to write: need is [(sequence, first position, count)]. All or none."""
         want = {t: [] for t in self.ring}
