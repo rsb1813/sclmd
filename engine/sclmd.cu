@@ -146,19 +146,18 @@ __device__ __forceinline__ size_t slot_of(const int32_t* tiles, int ring, int se
 // ordinary fp16 number (without the boost a weight under 2e-3 would fall among the smallest, which have few bits).
 #define BOOST 4096.0f
 
-// int8 values as the fp16 the tensor-core instruction takes: table[b] is the half-precision bits of int8(b). Filled by
-// the block that uses it (256 entries in its shared memory).
-__device__ __forceinline__ void fill_table(uint16_t* table) {
-    for (int i = threadIdx.x; i < 256; i += blockDim.x) table[i] = __half_as_ushort(__float2half(float(int8_t(i))));
-    __syncthreads();
+// Two int8 values (the low two bytes of w: the first in the low half) as the two fp16 the tensor-core instruction
+// takes, in one register: a byte b is put in an fp16 as 1024 + (b ^ 0x80) and 1152 is taken away, which is exact.
+// (A table of the 256 fp16 in shared memory, which this replaced, gave the same bits two lookups a word slower:
+// bench/attn_bench.cu, 1.3-1.5x on the scores and the weighted sum.)
+__device__ __forceinline__ uint32_t i8x2(uint32_t w) {
+    const uint32_t x = __byte_perm(w ^ 0x8080u, 0x64646464u, 0x4140);
+    const __half2 h = __hsub2(*(const __half2*)&x, __halves2half2(__ushort_as_half(0x6480), __ushort_as_half(0x6480)));
+    return *(const uint32_t*)&h;
 }
 
 // Two neighbouring int8 values (read as one 16-bit word) as two fp16 in one register.
-__device__ __forceinline__ uint32_t two(const uint16_t* table, uint16_t w) {
-    return uint32_t(table[w & 255]) | uint32_t(table[w >> 8]) << 16;
-}
-
-__device__ __forceinline__ uint32_t two(const uint16_t* table, const int8_t* p) { return two(table, *(const uint16_t*)p); }
+__device__ __forceinline__ uint32_t two(uint16_t w) { return i8x2(w); }
 
 // The attention kernels ask for the loads of several steps of their loops before the first is used. A warp waits at
 // the first value that has not come from memory, so a step's loads at a time is a wait a step; with the loads of many
@@ -562,7 +561,7 @@ __global__ void heads_k(const float* yq, const float* yk, const float* yv, const
 // STEPS steps of a query group's sum over a head's values, from value j on up to value `to`, while as many are left:
 // the loads of all of them, then the products in order.
 template <int STEPS>
-__device__ __forceinline__ void scores_steps(float c[4], int& j, int to, const uint16_t* table, const int8_t* ka, const int8_t* kb,
+__device__ __forceinline__ void scores_steps(float c[4], int& j, int to, const int8_t* ka, const int8_t* kb,
                                              const uint16_t* qa, bool has) {
     for (; j + 16 * STEPS <= to; j += 16 * STEPS) {
         uint16_t w[STEPS][4];
@@ -575,18 +574,18 @@ __device__ __forceinline__ void scores_steps(float c[4], int& j, int to, const u
             b0[u] = has ? *(const uint32_t*)(qa + at) : 0, b1[u] = has ? *(const uint32_t*)(qa + at + 8) : 0;
         }
 #pragma unroll
-        for (int u = 0; u < STEPS; ++u) mma(c, two(table, w[u][0]), two(table, w[u][1]), two(table, w[u][2]), two(table, w[u][3]), b0[u], b1[u]);
+        for (int u = 0; u < STEPS; ++u) mma(c, two(w[u][0]), two(w[u][1]), two(w[u][2]), two(w[u][3]), b0[u], b1[u]);
     }
 }
 
 // The steps from value j up to `to` with the loads of up to AHEAD steps on their way together.
 template <int AHEAD>
-__device__ __forceinline__ void scores_plain(float c[4], int& j, int to, const uint16_t* table, const int8_t* ka, const int8_t* kb,
+__device__ __forceinline__ void scores_plain(float c[4], int& j, int to, const int8_t* ka, const int8_t* kb,
                                              const uint16_t* qa, bool has) {
-    scores_steps<AHEAD>(c, j, to, table, ka, kb, qa, has);
-    if (AHEAD > 8) scores_steps<8>(c, j, to, table, ka, kb, qa, has);
-    if (AHEAD > 2) scores_steps<2>(c, j, to, table, ka, kb, qa, has);
-    scores_steps<1>(c, j, to, table, ka, kb, qa, has);
+    scores_steps<AHEAD>(c, j, to, ka, kb, qa, has);
+    if (AHEAD > 8) scores_steps<8>(c, j, to, ka, kb, qa, has);
+    if (AHEAD > 2) scores_steps<2>(c, j, to, ka, kb, qa, has);
+    scores_steps<1>(c, j, to, ka, kb, qa, has);
 }
 
 // A layer that keeps its values only (Layer::keys is null): a key is the value times k_norm, turned by its position
@@ -640,11 +639,11 @@ template <int AHEAD, bool MADE>
 __device__ __forceinline__ void scores_body(const uint16_t* qhat, const int8_t* keys, const float* kscale, float* scores, const int32_t* tiles,
                                             const Att& a, int heads, int kvh, int hd, int ring, const uint16_t* trig = nullptr,
                                             const float* k_norm = nullptr, int turned = 0) {
-    __shared__ uint16_t table[256];
     __shared__ float kn[MADE ? 256 : 1];
-    if (MADE)
+    if (MADE) {
         for (int i = threadIdx.x; i < 2 * turned; i += blockDim.x) kn[i] = k_norm[i < turned ? i : hd / 2 + i - turned];
-    fill_table(table);
+        __syncthreads();
+    }
     int seg = 0;
     for (int i = 1; i < a.n; ++i)
         if (int(blockIdx.x) >= a.tile0[i]) seg = i;
@@ -670,10 +669,10 @@ __device__ __forceinline__ void scores_body(const uint16_t* qhat, const int8_t* 
         for (int first = 0; first < hd; first += half) {
             scores_made<4>(c, j, first + turned, first, half, turned, ka, kb, ta, tb, kn, t, qa, has);
             scores_made<1>(c, j, first + turned, first, half, turned, ka, kb, ta, tb, kn, t, qa, has);
-            scores_plain<AHEAD>(c, j, first + half, table, ka, kb, qa, has);
+            scores_plain<AHEAD>(c, j, first + half, ka, kb, qa, has);
         }
     } else {
-        scores_plain<AHEAD>(c, j, hd, table, ka, kb, qa, has);
+        scores_plain<AHEAD>(c, j, hd, ka, kb, qa, has);
     }
     float* out = scores + a.off[seg];
     const float sa = kscale[(slot + g) * kvh + kh], sb = kscale[(slot + g + 8) * kvh + kh];
@@ -691,6 +690,103 @@ __global__ void scores32_k(const uint16_t* qhat, const int8_t* keys, const float
 __global__ void scores_made32_k(const uint16_t* qhat, const int8_t* values, const float* vscale, float* scores, const int32_t* tiles, Att a,
                                 int heads, int kvh, int hd, int ring, const uint16_t* trig, const float* k_norm, int turned) {
     scores_body<32, true>(qhat, values, vscale, scores, tiles, a, heads, kvh, hd, ring, trig, k_norm, turned);
+}
+
+// The scores of a pass with many query groups: the kernels above have every warp (a group) make the fp16 of a key
+// tile for itself, so a tile is made as many times as there are groups. Here a block of eight warps (eight groups,
+// each with its queries in registers) makes each tile once, in shared memory, and the warps read it with ldmatrix:
+// the products are the same, in the same order, so the scores are the same bits (bench/attn_bench.cu: a full layer
+// at 16,384 positions, 32 rows 1.23 -> 0.24 ms, 16 rows 0.62 -> 0.13; keyless 1.50 -> 0.44, 0.75 -> 0.23).
+// Block (ONCE_TILES tiles of a segment, key head, eight groups); the segments' runs of blocks follow each other.
+static const int ONCE_TILES = 16;
+// Query groups a key head from which scores() takes this way. The real model at a 2,048-position context, scores a
+// pass: 8 rows (sliding layers 2 groups) 1.49 ms from 2 groups, 1.31 from 3; 16 rows (4 groups) 1.53 from 3, 1.86 from 5.
+static const int ONCE_FROM = 3;
+
+__device__ __forceinline__ void ldsm4(uint32_t r[4], const void* p) {
+    const uint32_t s = uint32_t(__cvta_generic_to_shared(p));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(s));
+}
+
+// 16 positions x HD values of key head kh from int8 memory (the tile's first position's row: src) into the shared
+// tile (rows of HD + 8 fp16) as the fp16 scores_body would make: 256 threads, thread i takes row i / 16 and HD / 16
+// values from HD / 16 * (i % 16). MADE: the keys made of the values (a run is all turned or none: turned % 32 == 0).
+template <int HD, bool MADE>
+__device__ __forceinline__ void key_tile(uint16_t* sh, const int8_t* src, int kvh, int kh, int pos, const uint16_t* trig, const float* kn,
+                                         int turned) {
+    constexpr int NB = HD / 16, NW = NB / 4;
+    const int i = threadIdx.x, p = i >> 4, d0 = (i & 15) * NB;
+    const int8_t* row = src + (size_t(p) * kvh + kh) * HD;
+    uint32_t ws[NW], o[NB / 2];
+#pragma unroll
+    for (int k = 0; k < NB / 16; ++k) ((uint4*)ws)[k] = ((const uint4*)(row + d0))[k];
+    const int half = HD / 2, h = d0 >= half, e0 = d0 - h * half;
+    if (MADE && e0 < turned) {
+        uint32_t ps[NW];
+        const int8_t* prow = row + d0 + (h ? -half : half);
+#pragma unroll
+        for (int k = 0; k < NB / 16; ++k) ((uint4*)ps)[k] = ((const uint4*)prow)[k];
+        const uint64_t* tr = (const uint64_t*)(trig + size_t(pos + p) * turned * 2);
+        const float sign = h ? 1.0f : -1.0f;
+#pragma unroll
+        for (int k = 0; k < NB / 2; ++k) {
+            const int e = e0 + 2 * k;
+            o[k] = made(uint16_t(ws[k >> 1] >> (16 * (k & 1))), uint16_t(ps[k >> 1] >> (16 * (k & 1))), tr[e >> 1], kn + h * turned + e,
+                        kn + (1 - h) * turned + e, sign);
+        }
+    } else {
+#pragma unroll
+        for (int k = 0; k < NW; ++k) o[2 * k] = i8x2(ws[k] & 0xffff), o[2 * k + 1] = i8x2(ws[k] >> 16);
+    }
+    uint4* dst = (uint4*)(sh + p * (HD + 8) + d0);
+#pragma unroll
+    for (int k = 0; k < NB / 8; ++k) dst[k] = make_uint4(o[4 * k], o[4 * k + 1], o[4 * k + 2], o[4 * k + 3]);
+}
+
+template <int HD, bool MADE>
+__global__ void __launch_bounds__(256) scores_once_k(const uint16_t* qhat, const int8_t* keys, const float* kscale, float* scores,
+                                                     const int32_t* tiles, Att a, int heads, int kvh, int ring, const uint16_t* trig,
+                                                     const float* k_norm, int turned) {
+    constexpr int SROW = HD + 8, STEPS = HD / 16;
+    __shared__ __align__(16) uint16_t sh[16 * SROW];
+    __shared__ float kn[MADE ? 256 : 1];
+    int seg = 0, c0 = 0;
+    for (int i = 0, c = 0; i < a.n; c += (a.stride[i] / 16 + ONCE_TILES - 1) / ONCE_TILES, ++i)
+        if (int(blockIdx.x) >= c) seg = i, c0 = c;
+    const int rep = heads / kvh, nq = rep * a.cnt[seg], stride = a.stride[seg];
+    if (int(blockIdx.z) * 64 >= nq) return;  // the whole block: no group of it has a query in this segment
+    if (MADE)
+        for (int i = threadIdx.x; i < 2 * turned; i += blockDim.x) kn[i] = k_norm[i < turned ? i : HD / 2 + i - turned];
+    const int kh = blockIdx.y, group = blockIdx.z * 8 + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int query = group * 8 + g;
+    const bool has = query < nq, any = group * 8 < nq;
+    const uint16_t* qa = qhat + (size_t(a.row0[seg] + (has ? query / rep : 0)) * heads + kh * rep + (has ? query % rep : 0)) * HD + 2 * t;
+    uint32_t b0[STEPS], b1[STEPS];
+#pragma unroll
+    for (int u = 0; u < STEPS; ++u) b0[u] = has ? *(const uint32_t*)(qa + 16 * u) : 0, b1[u] = has ? *(const uint32_t*)(qa + 16 * u + 8) : 0;
+    float* out = scores + a.off[seg];
+    const int lrow = (lane & 7) + ((lane >> 3) & 1) * 8, lcol = (lane >> 4) * 8;
+    const int t0 = (blockIdx.x - c0) * ONCE_TILES, t1 = min(stride / 16, t0 + ONCE_TILES);
+    for (int tile = t0; tile < t1; ++tile) {
+        const size_t slot = slot_of(tiles, ring, a.seq[seg], a.base[seg] + 16 * tile);
+        __syncthreads();  // (the first: kn is written)
+        key_tile<HD, MADE>(sh, keys + slot * kvh * HD, kvh, kh, a.base[seg] + 16 * tile, trig, kn, turned);
+        __syncthreads();
+        if (!any) continue;
+        float c[4] = {0, 0, 0, 0};
+#pragma unroll
+        for (int u = 0; u < STEPS; ++u) {
+            uint32_t r[4];
+            ldsm4(r, sh + lrow * SROW + 16 * u + lcol);
+            mma(c, r[0], r[1], r[2], r[3], b0[u], b1[u]);
+        }
+        const float sa = kscale[(slot + g) * kvh + kh], sb = kscale[(slot + g + 8) * kvh + kh];
+        for (int i = 0; i < 4; ++i) {
+            const int q = group * 8 + 2 * t + (i & 1), r = 16 * tile + g + (i >= 2 ? 8 : 0);
+            if (q < nq) out[(size_t(kh) * nq + q) * stride + r] = c[i] * (i >= 2 ? sb : sa);
+        }
+    }
 }
 
 // The softmax of a query's scores over the positions it may read, as fp16 in the same layout: block (query of the
@@ -727,7 +823,7 @@ __global__ void softmax_k(const float* scores, uint16_t* probs, const float* vsc
 }
 
 // The weighted sum of the values: block (sixteen of the head's values, key head, segment); a warp walks the position
-// tiles. -> out[row][head][head_dim]. The values are int8 (as fp16 through the table); their scales are in the weights.
+// tiles. -> out[row][head][head_dim]. The values are int8 (as fp16 by i8x2); their scales are in the weights.
 // A warp's time is its own chain of steps (the tiles are added in order): a block that took several sixteens, so that
 // its warps shared what they read, was no faster (measured).
 // What attend_k's steps are told: where the sequence's tiles are, and a lane's place in a tile's values and weights.
@@ -743,8 +839,8 @@ struct Walk {
 // TILES position tiles of a query group's weighted sum, from position r on, while as many are left: the loads of all
 // of them (first where the tiles are, then their values and weights), then the products in order.
 template <int TILES>
-__device__ __forceinline__ void attend_tiles(float c[4], int& r, int stride, const uint16_t* table, const Walk& k) {
-#define PAIR(x, y) (uint32_t(table[x]) | uint32_t(table[y]) << 16)
+__device__ __forceinline__ void attend_tiles(float c[4], int& r, int stride, const Walk& k) {
+#define PAIR(x, y) i8x2(uint32_t(x) | uint32_t(y) << 8)
 #define LOW(w) ((w) & 255)
 #define HIGH(w) ((w) >> 8)
     for (; r + 16 * TILES <= stride; r += 16 * TILES) {
@@ -776,8 +872,6 @@ __device__ __forceinline__ void attend_tiles(float c[4], int& r, int stride, con
 template <int AHEAD>
 __device__ __forceinline__ void attend_body(const uint16_t* probs, const int8_t* values, float* out, const int32_t* tiles, const Att& a,
                                             int heads, int kvh, int hd, int ring) {
-    __shared__ uint16_t table[256];
-    fill_table(table);
     const int seg = blockIdx.z, rep = heads / kvh, nq = rep * a.cnt[seg], stride = a.stride[seg], base = a.base[seg];
     // a block's warps are groups of queries; with more groups than a block takes, the blocks of a sixteen follow each other
     const int dt = blockIdx.x % (hd / 16), group = (blockIdx.x / (hd / 16)) * (blockDim.x >> 5) + (threadIdx.x >> 5);
@@ -795,10 +889,10 @@ __device__ __forceinline__ void attend_body(const uint16_t* probs, const int8_t*
                  16 * row, 2 * t * row + col, row, (base >> 4) % ring, ring, has};
     float c[4] = {0, 0, 0, 0};
     int r = 0;
-    attend_tiles<AHEAD>(c, r, stride, table, k);
-    if (AHEAD > 8) attend_tiles<8>(c, r, stride, table, k);
-    if (AHEAD > 2) attend_tiles<2>(c, r, stride, table, k);
-    attend_tiles<1>(c, r, stride, table, k);
+    attend_tiles<AHEAD>(c, r, stride, k);
+    if (AHEAD > 8) attend_tiles<8>(c, r, stride, k);
+    if (AHEAD > 2) attend_tiles<2>(c, r, stride, k);
+    attend_tiles<1>(c, r, stride, k);
     for (int i = 0; i < 4; ++i) {  // c[i]: value 16 dt + 2g (+ 1), query group * 8 + 2t (+ 1)
         const int q = group * 8 + 2 * t + (i & 1), d = 16 * dt + 2 * g + (i >= 2 ? 1 : 0);
         if (q < nq) out[(size_t(a.row0[seg] + q / rep) * heads + kh * rep + q % rep) * hd + d] = c[i] * (1.0f / BOOST);
@@ -812,6 +906,88 @@ __device__ __forceinline__ void attend_body(const uint16_t* probs, const int8_t*
     }
 ATTEND_K(attend32_k, 32, )
 #undef ATTEND_K
+
+// The weighted sum with a warp taking NDT sixteens of the head: its weights are loaded once for all of them and its
+// values are one load of 2 NDT bytes a position, so a pass with many groups reads the weights NDT times less often
+// (the cost of attend32_k at long contexts: every warp reads its group's weights from L2). Each sum still adds the
+// tiles in order and which row of the instruction a value sits in does not change its sum, so the bits are
+// attend32_k's (bench/attn_bench.cu). Block (NDT-sixteens chunk of the head x blocks of groups, key head, segment);
+// a lane's rows g and g + 8 of sixteen k are the values c0 + 2 NDT g + 2k and + 1.
+// Query groups a key head from which attend() takes two / four sixteens a warp. bench/attn_bench.cu, a full layer at
+// 65,536 positions: 8 groups 1.25 ms (attend32_k) / 0.98 (one sixteen, i8x2) / 0.55 (two) / 1.40 (four); 16 groups
+// 2.48 / 1.90 / 0.85 / 1.40; 32 groups 4.31 / 3.28 / 1.68 / 1.56 (6,144 positions: 0.41 / 0.31 / 0.16 / 0.135).
+static const int ATTEND_NDT2_FROM = 2, ATTEND_NDT4_FROM = 32;
+template <int NDT>
+struct Wide;
+template <>
+struct Wide<2> {
+    using T = uint32_t;
+};
+template <>
+struct Wide<4> {
+    using T = uint64_t;
+};
+
+template <int S, int NDT>
+__device__ __forceinline__ void attend_wide_steps(float c[NDT][4], int& r, int stride, const int32_t* mine, int j0, int ring, const uint8_t* vals,
+                                                  size_t row, const uint16_t* pq, bool has) {
+    using W = typename Wide<NDT>::T;
+    for (; r + 16 * S <= stride; r += 16 * S) {
+        int32_t where[S];
+        W x[S][4];
+        uint32_t b0[S], b1[S];
+#pragma unroll
+        for (int u = 0; u < S; ++u) {
+            const int j = j0 + (r >> 4) + u;
+            where[u] = mine[j < ring ? j : j - ring];
+            b0[u] = has ? *(const uint32_t*)(pq + r + 16 * u) : 0, b1[u] = has ? *(const uint32_t*)(pq + r + 16 * u + 8) : 0;
+        }
+#pragma unroll
+        for (int u = 0; u < S; ++u) {
+            const uint8_t* va = vals + size_t(where[u]) * 16 * row;
+            x[u][0] = *(const W*)va, x[u][1] = *(const W*)(va + row), x[u][2] = *(const W*)(va + 8 * row), x[u][3] = *(const W*)(va + 9 * row);
+        }
+#pragma unroll
+        for (int u = 0; u < S; ++u)
+#pragma unroll
+            for (int k = 0; k < NDT; ++k) {
+                const uint32_t y0 = uint32_t(x[u][0] >> (16 * k)) & 0xffff, y1 = uint32_t(x[u][1] >> (16 * k)) & 0xffff;
+                const uint32_t y2 = uint32_t(x[u][2] >> (16 * k)) & 0xffff, y3 = uint32_t(x[u][3] >> (16 * k)) & 0xffff;
+                mma(c[k], i8x2(__byte_perm(y0, y1, 0x40)), i8x2(__byte_perm(y0, y1, 0x51)), i8x2(__byte_perm(y2, y3, 0x40)),
+                    i8x2(__byte_perm(y2, y3, 0x51)), b0[u], b1[u]);
+            }
+    }
+}
+
+template <int AHEAD, int NDT>
+__global__ void attend_wide_k(const uint16_t* probs, const int8_t* values, float* out, const int32_t* tiles, Att a, int heads, int kvh, int hd,
+                              int ring) {
+    const int seg = blockIdx.z, rep = heads / kvh, nq = rep * a.cnt[seg], stride = a.stride[seg], base = a.base[seg];
+    const int chunks = hd / (16 * NDT), dc = blockIdx.x % chunks, group = (blockIdx.x / chunks) * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int kh = blockIdx.y, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    if (group * 8 >= nq) return;
+    const int query = group * 8 + g;
+    const bool has = query < nq;
+    const size_t c0 = size_t(16 * NDT) * dc, col = size_t(kh) * hd + c0 + 2 * NDT * g, row = size_t(kvh) * hd;
+    const int32_t* mine = tiles + size_t(a.seq[seg]) * ring;
+    const uint8_t* vals = (const uint8_t*)values + 2 * t * row + col;
+    const uint16_t* pq = probs + a.off[seg] + (size_t(kh) * nq + (has ? query : 0)) * stride + 2 * t;
+    const int j0 = (base >> 4) % ring;
+    float c[NDT][4];
+#pragma unroll
+    for (int k = 0; k < NDT; ++k) c[k][0] = c[k][1] = c[k][2] = c[k][3] = 0;
+    int r = 0;
+    attend_wide_steps<AHEAD, NDT>(c, r, stride, mine, j0, ring, vals, row, pq, has);
+    if (AHEAD > 8) attend_wide_steps<8, NDT>(c, r, stride, mine, j0, ring, vals, row, pq, has);
+    if (AHEAD > 2) attend_wide_steps<2, NDT>(c, r, stride, mine, j0, ring, vals, row, pq, has);
+    attend_wide_steps<1, NDT>(c, r, stride, mine, j0, ring, vals, row, pq, has);
+#pragma unroll
+    for (int k = 0; k < NDT; ++k)
+        for (int i = 0; i < 4; ++i) {
+            const int q = group * 8 + 2 * t + (i & 1), d = int(c0) + 2 * NDT * g + 2 * k + (i >= 2 ? 1 : 0);
+            if (q < nq) out[(size_t(a.row0[seg] + q / rep) * heads + kh * rep + q % rep) * hd + d] = c[k][i] * (1.0f / BOOST);
+        }
+}
 
 // The soft cap on the logits: tanh(v / cap) * cap.
 __global__ void softcap_k(float* logits, size_t n, float cap) {
@@ -926,7 +1102,27 @@ static int tiles_of(const Att& a) { return a.tile0[a.n - 1] + a.stride[a.n - 1] 
 static const int GROUPS_A_BLOCK = 8;
 
 // The two attention kernels with a warp for each of `groups` groups of eight queries.
+// Query groups from which the scores make each key tile once for a block's groups (scores_once_k; SCLMD_ONCE_FROM
+// sets it for measurements, a large number: never). The bits are the same either way.
+static int once_from() {
+    static const int from = getenv("SCLMD_ONCE_FROM") ? atoi(getenv("SCLMD_ONCE_FROM")) : ONCE_FROM;
+    return from;
+}
+
 static void scores(int tiles, int groups, const uint16_t* qhat, const Layer& l, float* out, const Att& a, int heads) {
+    const int hd = l.head_dim;
+    if (groups >= once_from() && (hd == 256 || hd == 512) && (l.keys || (hd == 512 && l.turned % 32 == 0 && l.turned <= 128))) {
+        int blocks = 0;
+        for (int i = 0; i < a.n; ++i) blocks += (a.stride[i] / 16 + ONCE_TILES - 1) / ONCE_TILES;
+        const dim3 grid(blocks, l.kv_heads, (groups + 7) / 8);
+        if (!l.keys)
+            scores_once_k<512, true><<<grid, 256>>>(qhat, l.values, l.vscale, out, l.tiles, a, heads, l.kv_heads, l.ring, l.trig, l.k_norm, l.turned);
+        else if (hd == 512)
+            scores_once_k<512, false><<<grid, 256>>>(qhat, l.keys, l.kscale, out, l.tiles, a, heads, l.kv_heads, l.ring, nullptr, nullptr, 0);
+        else
+            scores_once_k<256, false><<<grid, 256>>>(qhat, l.keys, l.kscale, out, l.tiles, a, heads, l.kv_heads, l.ring, nullptr, nullptr, 0);
+        return;
+    }
     const int per = groups > GROUPS_A_BLOCK ? GROUPS_A_BLOCK : groups;
     const dim3 grid(tiles, l.kv_heads, (groups + per - 1) / per);
     if (l.keys)
@@ -938,7 +1134,18 @@ static void scores(int tiles, int groups, const uint16_t* qhat, const Layer& l, 
 
 static void attend(int groups, const uint16_t* probs, const int8_t* values, float* out, const int32_t* table, const Att& a, int heads, int kvh,
                    int hd, int ring) {
-    const int per = groups > GROUPS_A_BLOCK ? GROUPS_A_BLOCK : groups;
+    const int per = groups > GROUPS_A_BLOCK ? GROUPS_A_BLOCK : groups, blocks = (groups + per - 1) / per;
+    // sixteens a warp (SCLMD_ATTEND_NDT sets it for measurements: 1, 2 or 4); the bits are the same
+    static const int force = getenv("SCLMD_ATTEND_NDT") ? atoi(getenv("SCLMD_ATTEND_NDT")) : 0;
+    const int ndt = force ? force : groups >= ATTEND_NDT4_FROM ? 4 : groups >= ATTEND_NDT2_FROM ? 2 : 1;
+    if (ndt == 4 && hd % 64 == 0) {
+        attend_wide_k<8, 4><<<dim3(hd / 64 * blocks, kvh, a.n), 32 * per>>>(probs, values, out, table, a, heads, kvh, hd, ring);
+        return;
+    }
+    if (ndt == 2 && hd % 32 == 0) {
+        attend_wide_k<16, 2><<<dim3(hd / 32 * blocks, kvh, a.n), 32 * per>>>(probs, values, out, table, a, heads, kvh, hd, ring);
+        return;
+    }
     attend32_k<<<dim3(hd / 16 * ((groups + per - 1) / per), kvh, a.n), 32 * per>>>(probs, values, out, table, a, heads, kvh, hd, ring);
 }
 

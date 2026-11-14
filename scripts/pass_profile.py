@@ -3,11 +3,13 @@
 import argparse
 import ctypes as C
 import json
+import os
 import time
 
 import torch
+from transformers import AutoTokenizer
 
-from sclmd import ckpt
+from sclmd import DATA, ckpt
 from sclmd import engine as E
 from sclmd import model as M
 from sclmd.stream import cap_vram
@@ -30,6 +32,7 @@ def main():
     ap.add_argument("--capacity", type=int, default=8192)
     ap.add_argument("--reserve", type=float, default=0.75, help="GiB of the free VRAM left to other programs")
     E.add_int8_option(ap)
+    ap.add_argument("--keyless", action="store_true", help="the full-attention layers keep their values only (Engine: keyless)")
     args = ap.parse_args()
     E.use_int8_option(args)
     cap_vram(margin=int(args.reserve * 2**30))
@@ -40,12 +43,16 @@ def main():
         plan, head = {int(k): v for k, v in p["layers"].items()}, p.get("head") or args.head
     else:
         plan, head = {i: {m: args.rate for m in M.LINEARS} for i in range(cfg.n_layers)}, args.head
-    eng = E.Engine.load(args.name, plan, head, args.capacity, rows=args.rows)
-    filler = load_set("eval_v1")[0].reshape(-1).tolist()
+    eng = E.Engine.load(args.name, plan, head, args.capacity, rows=args.rows, keyless=args.keyless)
+    if os.path.exists(os.path.join(DATA, "eval_v1", "tokens.npz")):
+        filler = load_set("eval_v1")[0].reshape(-1).tolist()
+    else:  # a checkout without the evaluation sets: the document of scripts/speed_check.py
+        with open(os.path.join(DATA, "speed_check", "doc.txt"), encoding="utf-8") as f:
+            filler = AutoTokenizer.from_pretrained(ckpt("orig")).encode(f.read(), add_special_tokens=False)
     assert eng.lib.sclmd_profile(None) == len(KINDS)
     for at in [int(a) for a in args.at.split(",")]:
         while eng.length < at:
-            eng.feed((filler * (1 + at // len(filler)))[eng.length : min(at, eng.length + 64)], keep="last")
+            eng.feed((filler * (1 + at // len(filler)))[eng.length : min(at, eng.length + 4096)], keep="last")
         for tokens in [int(t) for t in args.tokens.split(",")]:
             def passes(n):
                 for _ in range(n):
