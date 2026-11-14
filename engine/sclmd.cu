@@ -129,10 +129,20 @@ __device__ __forceinline__ void fill_table(uint16_t* table) {
 }
 
 // Two neighbouring int8 values (read as one 16-bit word) as two fp16 in one register.
-__device__ __forceinline__ uint32_t two(const uint16_t* table, const int8_t* p) {
-    const uint16_t w = *(const uint16_t*)p;
+__device__ __forceinline__ uint32_t two(const uint16_t* table, uint16_t w) {
     return uint32_t(table[w & 255]) | uint32_t(table[w >> 8]) << 16;
 }
+
+__device__ __forceinline__ uint32_t two(const uint16_t* table, const int8_t* p) { return two(table, *(const uint16_t*)p); }
+
+// The attention kernels ask for the loads of several steps of their loops before the first is used. A warp waits at
+// the first value that has not come from memory, so a step's loads at a time is a wait a step; with the loads of many
+// steps on their way together the wait is shared (attend_k at 12,288 positions, a pass of 7 rows: 5.4 ms a pass one
+// tile at a time, 3.8 ms by eights, 2.8 ms by sixteens). The loaded values are held in registers, and a block's
+// threads share its registers (65,536): by 32 steps a block may have 256 threads, by 16 steps 512, and beyond that
+// by 2 (a pass of more than 16 rows). The sums are the same bits whichever: the steps are added in the same order.
+// The wide forms carry no bound on a block's threads: with one, the compiler kept them to 64 registers and put the
+// rest on the stack, which was as slow as a step at a time.
 
 // The sum of v over the block's threads (a multiple of 32, at most 1024), returned to every thread.
 __device__ float block_sum(float v) {
@@ -161,6 +171,34 @@ __device__ __forceinline__ float gelu_tanh(float v) {
     return 0.5f * v * (1.0f + tanhf(0.7978845608028654f * (v + 0.044715f * v * v * v)));
 }
 
+// What prep_k reads of one element of a matrix's input: the stream, the output owed to it, the norm's weight there,
+// and the value's own weight or factor.
+struct In {
+    float a, y, p, x;
+};
+
+// use(load(j)) for j = first, first + step, ... below n, in that order, with the loads of STEPS elements asked for
+// before the first is used.
+template <int STEPS, class Load, class Use>
+__device__ __forceinline__ void strided_by(int& j, int n, int step, Load load, Use use) {
+    for (; j + (STEPS - 1) * step < n; j += STEPS * step) {
+        decltype(load(0)) e[STEPS];
+#pragma unroll
+        for (int u = 0; u < STEPS; ++u) e[u] = load(j + u * step);
+#pragma unroll
+        for (int u = 0; u < STEPS; ++u) use(e[u]);
+    }
+}
+
+// MOST at a time (what a thread can hold: a block of 1,024 threads has 64 registers a thread), then by fours and ones.
+template <int MOST, class Load, class Use>
+__device__ __forceinline__ void strided(int first, int n, int step, Load load, Use use) {
+    int j = first;
+    strided_by<MOST>(j, n, step, load, use);
+    if (MOST > 4) strided_by<4>(j, n, step, load, use);
+    strided_by<1>(j, n, step, load, use);
+}
+
 // The input of a matrix with n columns, in one kernel: block (run of blockDim values, token), where blockDim is the
 // rotation's block, or without a rotation (signs null) a power of two that divides n. Three steps:
 //  1. the residual step still owed, if any: with y, h = (a + RMS norm of y times post) * scalar, and the block
@@ -175,35 +213,40 @@ __device__ __forceinline__ float gelu_tanh(float v) {
 // kernel's work, n / blockDim times over, so one block a token makes them first (phase 1, into sums[2 * token] and
 // fps[token]) and the blocks read them (phase 2). The three phases are this one kernel: the same instructions make
 // the sums and the values in each, so a row's result has the same bits whichever way its pass went.
-__global__ void prep_k(const float* a, const float* b, const float* w, const float* y, const float* post, float scalar, float* h_out,
+__global__ void __launch_bounds__(1024) prep_k(const float* a, const float* b, const float* w, const float* y, const float* post, float scalar, float* h_out,
                        float* v_out, const float* signs, float* fps, uint64_t* xf, int n, float eps, int mode, int phase, float* sums) {
     __shared__ float buf[1024];
     const int bd = blockDim.x, token = blockIdx.y, i = threadIdx.x, col = blockIdx.x * bd + i;
     const size_t at = size_t(token) * n;
     float ry = 0, r = 1.0f, fp = 1.0f;
-#define STREAM(j) (y ? (a[at + (j)] + y[at + (j)] * ry * post[j]) * scalar : a[at + (j)])
-#define VALUE(j, hv) (mode == 0 ? (hv) * r * w[j] : mode == 1 ? (hv) : gelu_tanh(hv) * b[at + (j)])
+#define STREAM_OF(av, yv, pv) (y ? ((av) + (yv) * ry * (pv)) * scalar : (av))
+#define VALUE_OF(hv, wv, bv) (mode == 0 ? (hv) * r * (wv) : mode == 1 ? (hv) : gelu_tanh(hv) * (bv))
+#define STREAM(j) STREAM_OF(a[at + (j)], y[at + (j)], post[j])
+#define VALUE(j, hv) VALUE_OF(hv, w[j], b[at + (j)])
     if (phase == 2) {
         ry = sums[2 * token], r = sums[2 * token + 1], fp = fps[token];
     } else {
+        // a thread's elements are a block apart: each a load that waits for memory, so they are asked for several at
+        // a time (strided) and added in the same order as one by one
         if (y) {
             float ss = 0;
-            for (int j = i; j < n; j += bd) ss += y[at + j] * y[at + j];
+            strided<8>(i, n, bd, [&](int j) { return y[at + j]; }, [&](float e) { ss += e * e; });
             ry = powf(block_sum(ss) / n + eps, -0.5f);
         }
+        const auto stream = [&](int j) { return In{a[at + j], y ? y[at + j] : 0.0f, y ? post[j] : 0.0f, mode == 0 ? w[j] : mode == 2 ? b[at + j] : 0.0f}; };
         if (mode == 0) {
             float ss = 0;
-            for (int j = i; j < n; j += bd) {
-                const float hv = STREAM(j);
+            strided<4>(i, n, bd, stream, [&](const In& e) {
+                const float hv = STREAM_OF(e.a, e.y, e.p);
                 ss += hv * hv;
-            }
+            });
             r = powf(block_sum(ss) / n + eps, -0.5f);
         }
         float len = 0;
-        for (int j = i; j < n; j += bd) {
-            const float hv = STREAM(j), v = VALUE(j, hv);
+        strided<4>(i, n, bd, stream, [&](const In& e) {
+            const float hv = STREAM_OF(e.a, e.y, e.p), v = VALUE_OF(hv, e.x, e.x);
             len += v * v;
-        }
+        });
         len = sqrtf(block_sum(len));
         fp = len > 16384.0f ? exp2f(ceilf(log2f(len / 16384.0f))) : 1.0f;
         if (col == 0) fps[token] = fp;
@@ -215,6 +258,8 @@ __global__ void prep_k(const float* a, const float* b, const float* w, const flo
     const float hv = STREAM(col), v = VALUE(col, hv);
 #undef STREAM
 #undef VALUE
+#undef STREAM_OF
+#undef VALUE_OF
     if (y) h_out[at + col] = hv;
     if (v_out) v_out[at + col] = v;
     buf[i] = signs ? v * signs[col] : v;
@@ -356,8 +401,29 @@ __global__ void heads_k(const float* yq, const float* yk, const float* yv, const
 
 // Scores = query . key: block (position tile of a segment, key head). The keys are int8: the sums are of the int8
 // values (as fp16), and a position's sum is multiplied by its key's scale.
-__global__ void scores_k(const uint16_t* qhat, const int8_t* keys, const float* kscale, float* scores, const int32_t* tiles, Att a, int heads,
-                         int kvh, int hd, int ring) {
+// STEPS steps of a query group's sum over a head's values, from value j on, while as many are left: the loads of all
+// of them, then the products in order.
+template <int STEPS>
+__device__ __forceinline__ void scores_steps(float c[4], int& j, int hd, const uint16_t* table, const int8_t* ka, const int8_t* kb,
+                                             const uint16_t* qa, bool has) {
+    for (; j + 16 * STEPS <= hd; j += 16 * STEPS) {
+        uint16_t w[STEPS][4];
+        uint32_t b0[STEPS], b1[STEPS];
+#pragma unroll
+        for (int u = 0; u < STEPS; ++u) {
+            const int at = j + 16 * u;
+            w[u][0] = *(const uint16_t*)(ka + at), w[u][1] = *(const uint16_t*)(kb + at);
+            w[u][2] = *(const uint16_t*)(ka + at + 8), w[u][3] = *(const uint16_t*)(kb + at + 8);
+            b0[u] = has ? *(const uint32_t*)(qa + at) : 0, b1[u] = has ? *(const uint32_t*)(qa + at + 8) : 0;
+        }
+#pragma unroll
+        for (int u = 0; u < STEPS; ++u) mma(c, two(table, w[u][0]), two(table, w[u][1]), two(table, w[u][2]), two(table, w[u][3]), b0[u], b1[u]);
+    }
+}
+
+template <int AHEAD>
+__device__ __forceinline__ void scores_body(const uint16_t* qhat, const int8_t* keys, const float* kscale, float* scores, const int32_t* tiles,
+                                            const Att& a, int heads, int kvh, int hd, int ring) {
     __shared__ uint16_t table[256];
     fill_table(table);
     int seg = 0;
@@ -375,10 +441,11 @@ __global__ void scores_k(const uint16_t* qhat, const int8_t* keys, const float* 
     const bool has = query < nq;
     const uint16_t* qa = qhat + (size_t(a.row0[seg] + (has ? query / rep : 0)) * heads + kh * rep + (has ? query % rep : 0)) * hd + 2 * t;
     float c[4] = {0, 0, 0, 0};
-    for (int j = 0; j < hd; j += 16) {
-        const uint32_t b0 = has ? *(const uint32_t*)(qa + j) : 0, b1 = has ? *(const uint32_t*)(qa + j + 8) : 0;
-        mma(c, two(table, ka + j), two(table, kb + j), two(table, ka + j + 8), two(table, kb + j + 8), b0, b1);
-    }
+    int j = 0;
+    scores_steps<AHEAD>(c, j, hd, table, ka, kb, qa, has);
+    if (AHEAD > 8) scores_steps<8>(c, j, hd, table, ka, kb, qa, has);
+    if (AHEAD > 2) scores_steps<2>(c, j, hd, table, ka, kb, qa, has);
+    scores_steps<1>(c, j, hd, table, ka, kb, qa, has);
     float* out = scores + a.off[seg];
     const float sa = kscale[(slot + g) * kvh + kh], sb = kscale[(slot + g + 8) * kvh + kh];
     for (int i = 0; i < 4; ++i) {  // c[i]: position of the tile g (+ 8), query group * 8 + 2t (+ 1)
@@ -386,6 +453,16 @@ __global__ void scores_k(const uint16_t* qhat, const int8_t* keys, const float* 
         if (q < nq) out[(size_t(kh) * nq + q) * stride + r] = c[i] * (i >= 2 ? sb : sa);
     }
 }
+
+#define SCORES_K(NAME, AHEAD, BOUND)                                                                                                    \
+    __global__ void BOUND NAME(const uint16_t* qhat, const int8_t* keys, const float* kscale, float* scores, const int32_t* tiles, Att a, \
+                               int heads, int kvh, int hd, int ring) {                                                                  \
+        scores_body<AHEAD>(qhat, keys, kscale, scores, tiles, a, heads, kvh, hd, ring);                                                 \
+    }
+SCORES_K(scores32_k, 32, )
+SCORES_K(scores16_k, 16, )
+SCORES_K(scores2_k, 2, __launch_bounds__(1024))
+#undef SCORES_K
 
 // The softmax of a query's scores over the positions it may read, as fp16 in the same layout: block (query of the
 // pass, key head). A row at position pos reads positions up to its own, and with a window the last `window` of them.
@@ -422,8 +499,54 @@ __global__ void softmax_k(const float* scores, uint16_t* probs, const float* vsc
 
 // The weighted sum of the values: block (sixteen of the head's values, key head, segment); a warp walks the position
 // tiles. -> out[row][head][head_dim]. The values are int8 (as fp16 through the table); their scales are in the weights.
-__global__ void attend_k(const uint16_t* probs, const int8_t* values, float* out, const int32_t* tiles, Att a, int heads, int kvh, int hd,
-                         int ring) {
+// A warp's time is its own chain of steps (the tiles are added in order): a block that took several sixteens, so that
+// its warps shared what they read, was no faster (measured).
+// What attend_k's steps are told: where the sequence's tiles are, and a lane's place in a tile's values and weights.
+struct Walk {
+    const int32_t* mine;    // the sequence's table of tiles
+    const uint8_t* values;
+    const uint16_t* pq;     // the lane's weights of the first tile
+    size_t tile_values, in_tile, row;
+    int j0, ring;
+    bool has;
+};
+
+// TILES position tiles of a query group's weighted sum, from position r on, while as many are left: the loads of all
+// of them (first where the tiles are, then their values and weights), then the products in order.
+template <int TILES>
+__device__ __forceinline__ void attend_tiles(float c[4], int& r, int stride, const uint16_t* table, const Walk& k) {
+#define PAIR(x, y) (uint32_t(table[x]) | uint32_t(table[y]) << 16)
+#define LOW(w) ((w) & 255)
+#define HIGH(w) ((w) >> 8)
+    for (; r + 16 * TILES <= stride; r += 16 * TILES) {
+        int32_t where[TILES];
+        uint16_t x[TILES][4];
+        uint32_t b0[TILES], b1[TILES];
+#pragma unroll
+        for (int u = 0; u < TILES; ++u) {
+            const int j = k.j0 + (r >> 4) + u;
+            where[u] = k.mine[j < k.ring ? j : j - k.ring];
+            b0[u] = k.has ? *(const uint32_t*)(k.pq + r + 16 * u) : 0, b1[u] = k.has ? *(const uint32_t*)(k.pq + r + 16 * u + 8) : 0;
+        }
+#pragma unroll
+        for (int u = 0; u < TILES; ++u) {
+            const uint8_t* va = k.values + size_t(where[u]) * k.tile_values + k.in_tile;  // position 2t of the tile
+            x[u][0] = *(const uint16_t*)va, x[u][1] = *(const uint16_t*)(va + k.row);
+            x[u][2] = *(const uint16_t*)(va + 8 * k.row), x[u][3] = *(const uint16_t*)(va + 9 * k.row);
+        }
+#pragma unroll
+        for (int u = 0; u < TILES; ++u)
+            mma(c, PAIR(LOW(x[u][0]), LOW(x[u][1])), PAIR(HIGH(x[u][0]), HIGH(x[u][1])), PAIR(LOW(x[u][2]), LOW(x[u][3])),
+                PAIR(HIGH(x[u][2]), HIGH(x[u][3])), b0[u], b1[u]);
+    }
+#undef PAIR
+#undef LOW
+#undef HIGH
+}
+
+template <int AHEAD>
+__device__ __forceinline__ void attend_body(const uint16_t* probs, const int8_t* values, float* out, const int32_t* tiles, const Att& a,
+                                            int heads, int kvh, int hd, int ring) {
     __shared__ uint16_t table[256];
     fill_table(table);
     const int seg = blockIdx.z, rep = heads / kvh, nq = rep * a.cnt[seg], stride = a.stride[seg], base = a.base[seg];
@@ -432,29 +555,34 @@ __global__ void attend_k(const uint16_t* probs, const int8_t* values, float* out
     // the right operand: rows are the tile's positions, column g is query group * 8 + g
     const int query = group * 8 + g;
     const bool has = query < nq;
-    const uint16_t* pq = probs + a.off[seg] + (size_t(kh) * nq + (has ? query : 0)) * stride + 2 * t;
-    // the left operand: rows are values 16 dt + g and + 8 of the head, columns the tile's positions 2t, 2t + 1, 2t + 8, 2t + 9
-    const size_t col = size_t(kh) * hd + 16 * dt + g, row = size_t(kvh) * hd;
+    // the left operand: columns are the tile's positions 2t, 2t + 1, 2t + 8, 2t + 9; its rows g and g + 8 are the
+    // values 16 dt + 2g and 16 dt + 2g + 1 of the head: neighbours in memory, so a position is one 16-bit load (which
+    // row of the instruction a value sits in does not change its sum)
+    const size_t col = size_t(kh) * hd + 16 * dt + 2 * g, row = size_t(kvh) * hd;
+    // the sequence's table; a pass reads at most ring + 1 tiles, so the table's index goes round at most once
+    const Walk k{tiles + size_t(a.seq[seg]) * ring, (const uint8_t*)values, probs + a.off[seg] + (size_t(kh) * nq + (has ? query : 0)) * stride + 2 * t,
+                 16 * row, 2 * t * row + col, row, (base >> 4) % ring, ring, has};
     float c[4] = {0, 0, 0, 0};
-    // the sequence's table; a pass reads at most ring + 1 tiles, so the table's index goes round at most once (each
-    // iteration works its own out: one that follows from the last would keep the loads from overlapping)
-    const int32_t* mine = tiles + size_t(a.seq[seg]) * ring;
-    const int j0 = (base >> 4) % ring;
-    const size_t tile_values = 16 * row, in_tile = 2 * t * row + col;
-    for (int r = 0; r < stride; r += 16) {
-        const int j = j0 + (r >> 4);
-        const int8_t* va = values + size_t(mine[j < ring ? j : j - ring]) * tile_values + in_tile;  // position 2t of the tile
-        const int8_t *vb = va + row, *vc = va + 8 * row, *vd = va + 9 * row;
-        const uint32_t b0 = has ? *(const uint32_t*)(pq + r) : 0, b1 = has ? *(const uint32_t*)(pq + r + 8) : 0;
-#define PAIR(x, y, i) (uint32_t(table[uint8_t(x[i])]) | uint32_t(table[uint8_t(y[i])]) << 16)
-        mma(c, PAIR(va, vb, 0), PAIR(va, vb, 8), PAIR(vc, vd, 0), PAIR(vc, vd, 8), b0, b1);
-#undef PAIR
-    }
-    for (int i = 0; i < 4; ++i) {  // c[i]: value 16 dt + g (+ 8), query group * 8 + 2t (+ 1)
-        const int q = group * 8 + 2 * t + (i & 1), d = 16 * dt + g + (i >= 2 ? 8 : 0);
+    int r = 0;
+    attend_tiles<AHEAD>(c, r, stride, table, k);
+    if (AHEAD > 8) attend_tiles<8>(c, r, stride, table, k);
+    if (AHEAD > 2) attend_tiles<2>(c, r, stride, table, k);
+    attend_tiles<1>(c, r, stride, table, k);
+    for (int i = 0; i < 4; ++i) {  // c[i]: value 16 dt + 2g (+ 1), query group * 8 + 2t (+ 1)
+        const int q = group * 8 + 2 * t + (i & 1), d = 16 * dt + 2 * g + (i >= 2 ? 1 : 0);
         if (q < nq) out[(size_t(a.row0[seg] + q / rep) * heads + kh * rep + q % rep) * hd + d] = c[i] * (1.0f / BOOST);
     }
 }
+
+#define ATTEND_K(NAME, AHEAD, BOUND)                                                                                                    \
+    __global__ void BOUND NAME(const uint16_t* probs, const int8_t* values, float* out, const int32_t* tiles, Att a, int heads, int kvh, \
+                               int hd, int ring) {                                                                                      \
+        attend_body<AHEAD>(probs, values, out, tiles, a, heads, kvh, hd, ring);                                                         \
+    }
+ATTEND_K(attend32_k, 32, )
+ATTEND_K(attend16_k, 16, )
+ATTEND_K(attend2_k, 2, __launch_bounds__(1024))
+#undef ATTEND_K
 
 // The soft cap on the logits: tanh(v / cap) * cap.
 __global__ void softcap_k(float* logits, size_t n, float cap) {
@@ -532,6 +660,30 @@ static Att att_for(const Segs& g, bool full, int heads, int back) {
 
 static int tiles_of(const Att& a) { return a.tile0[a.n - 1] + a.stride[a.n - 1] / 16; }
 
+// The two attention kernels with a warp for each of `groups` groups of eight queries, in the form the block's threads
+// allow (see scores_k).
+static void scores(int tiles, int kvh, int groups, const uint16_t* qhat, const int8_t* keys, const float* kscale, float* out, const int32_t* table,
+                   const Att& a, int heads, int hd, int ring) {
+    const dim3 grid(tiles, kvh);
+    if (32 * groups <= 256)
+        scores32_k<<<grid, 32 * groups>>>(qhat, keys, kscale, out, table, a, heads, kvh, hd, ring);
+    else if (32 * groups <= 512)
+        scores16_k<<<grid, 32 * groups>>>(qhat, keys, kscale, out, table, a, heads, kvh, hd, ring);
+    else
+        scores2_k<<<grid, 32 * groups>>>(qhat, keys, kscale, out, table, a, heads, kvh, hd, ring);
+}
+
+static void attend(int groups, const uint16_t* probs, const int8_t* values, float* out, const int32_t* table, const Att& a, int heads, int kvh,
+                   int hd, int ring) {
+    const dim3 grid(hd / 16, kvh, a.n);
+    if (32 * groups <= 256)
+        attend32_k<<<grid, 32 * groups>>>(probs, values, out, table, a, heads, kvh, hd, ring);
+    else if (32 * groups <= 512)
+        attend16_k<<<grid, 32 * groups>>>(probs, values, out, table, a, heads, kvh, hd, ring);
+    else
+        attend2_k<<<grid, 32 * groups>>>(probs, values, out, table, a, heads, kvh, hd, ring);
+}
+
 // Where a pass's time goes (sclmd_profile): with a table set, the pass waits for the GPU after every launch and adds
 // the time to the launch's kind. The waits make the pass slower as a whole; the shares are what is looked at.
 enum { P_INPUT, P_QKV, P_HEADS, P_SCORES, P_SOFTMAX, P_ATTEND, P_O, P_GATE_UP, P_DOWN, P_HEAD, P_KINDS };
@@ -586,11 +738,11 @@ API int sclmd_pass(const Model* mp, int tokens, const Segs* segs) {
         heads_k<<<dim3(m.heads + 2 * kvh, tokens), hd>>>(yq, yk, l.v.rows ? yv : nullptr, l.q_norm, l.k_norm, l.inv_freq, m.qhat, l.keys,
                                                        l.values, l.kscale, l.vscale, l.tiles, a, m.heads, kvh, l.ring, m.eps);
         tick(P_HEADS);
-        scores_k<<<dim3(tiles_of(a), kvh), 32 * groups>>>(m.qhat, l.keys, l.kscale, m.scores, l.tiles, a, m.heads, kvh, hd, l.ring);
+        scores(tiles_of(a), kvh, groups, m.qhat, l.keys, l.kscale, m.scores, l.tiles, a, m.heads, hd, l.ring);
         tick(P_SCORES);
         softmax_k<<<dim3(rep * tokens, kvh), 256>>>(m.scores, m.probs, l.vscale, l.tiles, a, m.heads, kvh, l.full ? 0 : m.window, l.ring);
         tick(P_SOFTMAX);
-        attend_k<<<dim3(hd / 16, kvh, a.n), 32 * groups>>>(m.probs, l.values, m.attn, l.tiles, a, m.heads, kvh, hd, l.ring);
+        attend(groups, m.probs, l.values, m.attn, l.tiles, a, m.heads, kvh, hd, l.ring);
         tick(P_ATTEND);
         prep(m, m.attn, nullptr, nullptr, nqo, l.rot_o, 1, tokens);
         tick(P_INPUT);
@@ -691,9 +843,9 @@ API int sclmd_draft(const Drafter* dp, const Layer* sliding, const Layer* full, 
         heads_k<<<dim3(d.heads, rows), hd>>>(d.y, nullptr, nullptr, l.q_norm, nullptr, l.inv_freq, d.qhat, nullptr, nullptr, nullptr, nullptr,
                                              nullptr, att_for(at, true, d.heads, 0), d.heads, kvh, 1, d.eps);
         const Att a = att_for(read, l.full, d.heads, window);
-        scores_k<<<dim3(tiles_of(a), kvh), 32 * groups>>>(d.qhat, src.keys, src.kscale, d.scores, src.tiles, a, d.heads, kvh, hd, src.ring);
+        scores(tiles_of(a), kvh, groups, d.qhat, src.keys, src.kscale, d.scores, src.tiles, a, d.heads, hd, src.ring);
         softmax_k<<<dim3(rep * rows, kvh), 256>>>(d.scores, d.probs, src.vscale, src.tiles, a, d.heads, kvh, l.full ? 0 : window + 1, src.ring);
-        attend_k<<<dim3(hd / 16, kvh, a.n), 32 * groups>>>(d.probs, src.values, d.attn, src.tiles, a, d.heads, kvh, hd, src.ring);
+        attend(groups, d.probs, src.values, d.attn, src.tiles, a, d.heads, kvh, hd, src.ring);
         prep(d, rows, d.attn, nullptr, nullptr, d.heads * hd, l.rot_o, 1);
         gemm(d.xf, d.fps, rows, l.o, d.y);
         owed = Owed{d.y, l.post_attn_ln, 1.0f};

@@ -17,4 +17,5 @@ data/*
 *.npy
 .claude/worktrees/
 !data/plans/
+!data/speed_check/
 !data/plans/*.json

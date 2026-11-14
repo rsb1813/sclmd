@@ -8,7 +8,8 @@ import torch
 from . import codes as CD
 from . import model as M
 
-DLL = os.path.join(os.path.dirname(__file__), "..", "engine", "build", "sclmd.dll")
+# SCLMD_DLL: another build of the engine (to compare builds: scripts/bits_check.py)
+DLL = os.environ.get("SCLMD_DLL") or os.path.join(os.path.dirname(__file__), "..", "engine", "build", "sclmd.dll")
 MAX_TOKENS = 32  # the most rows the kernels take in a pass; an engine is made for 8, 16 or 32 (Engine.rows)
 TILE = 16   # positions of keys and values a sequence is given at a time
 SPARE = 16  # positions a sliding layer keeps past its window at least: a pass writes its rows while its first row still reads a window back

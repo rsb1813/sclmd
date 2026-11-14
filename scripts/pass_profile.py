@@ -27,8 +27,10 @@ def main():
     ap.add_argument("--tokens", default="1,7")
     ap.add_argument("--passes", type=int, default=20)
     ap.add_argument("--rows", type=int, default=8, help="the rows the engine is made for (8, 16 or 32)")
+    ap.add_argument("--capacity", type=int, default=8192)
+    ap.add_argument("--reserve", type=float, default=0.75, help="GiB of the free VRAM left to other programs")
     args = ap.parse_args()
-    cap_vram()
+    cap_vram(margin=int(args.reserve * 2**30))
     cfg = M.Config.load(ckpt("orig"))
     if args.plan:
         with open(args.plan, encoding="utf-8") as f:
@@ -36,12 +38,12 @@ def main():
         plan, head = {int(k): v for k, v in p["layers"].items()}, p.get("head") or args.head
     else:
         plan, head = {i: {m: args.rate for m in M.LINEARS} for i in range(cfg.n_layers)}, args.head
-    eng = E.Engine.load(args.name, plan, head, 8192, rows=args.rows)
+    eng = E.Engine.load(args.name, plan, head, args.capacity, rows=args.rows)
     filler = load_set("eval_v1")[0].reshape(-1).tolist()
     assert eng.lib.sclmd_profile(None) == len(KINDS)
     for at in [int(a) for a in args.at.split(",")]:
         while eng.length < at:
-            eng.feed(filler[eng.length : min(at, eng.length + 64)], keep="last")
+            eng.feed((filler * (1 + at // len(filler)))[eng.length : min(at, eng.length + 64)], keep="last")
         for tokens in [int(t) for t in args.tokens.split(",")]:
             def passes(n):
                 for _ in range(n):

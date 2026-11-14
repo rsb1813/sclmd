@@ -18,8 +18,13 @@ from sclmd import model as M
 from sclmd import plan as P
 from sclmd.generate import Picker, extend
 from sclmd.stream import VRAM_MARGIN, cap_vram
+from sclmd.text import Pieces
 
-DEPTH = 6  # the drafter's generation_config.json: num_assistant_tokens
+# Tokens the drafter guesses ahead. The drafter's generation_config.json says 6 (num_assistant_tokens); with 7 a pass
+# has 8 rows, which costs what 7 rows cost (rows are in groups of eight), and more guesses are kept than the extra
+# guess costs: 160 -> 165 tok/s over scripts/speed_check.py's replies. With 8 the pass has 9 rows and costs 3 ms more
+# (140 tok/s then). The text does not depend on it.
+DEPTH = 7
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SHARES = "own_v1"  # the measurements the plan is fitted from: on text the model wrote itself (on unseen text of that kind a plan
 # fitted from them is KL 0.055 where one of the same size fitted from other people's text is 0.066)
@@ -118,31 +123,23 @@ class Session:
         self.ctx = list(full)
         t1 = time.perf_counter()
 
-        kind, part, sent, said, looped = "answer", [], "", [], [False]
-        answer = []
+        said, looped, answer = [], [False], []
+        # the text of a few tokens at a time: decoding the reply so far at every token was 15% of a long thinking pass
+        pieces = Pieces(tok, self.stop, self.open, self.close)
 
         def emit(token: int) -> None:
-            nonlocal kind, part, sent
             said.append(token)
             if looping(said):
                 looped[0] = True
             if token in self.stop:
                 return
+            piece = pieces.add(token)
             if token == self.open or token == self.close:
-                kind, part, sent = ("think" if token == self.open else "answer"), [], ""
-                on_text(kind, "")
-                return
-            part.append(token)
-            if kind == "answer":
+                on_text(pieces.kind, "")
+            elif pieces.kind == "answer":
                 answer.append(token)
-            text = tok.decode(part, skip_special_tokens=False)
-            if kind == "think" and "thought\n".startswith(text):  # the channel's name comes first
-                return
-            if kind == "think" and text.startswith("thought\n"):
-                text = text[len("thought\n"):]
-            if not text.endswith("\ufffd"):  # else a character is still missing bytes
-                on_text(kind, text[len(sent):])
-                sent = text
+            if piece:
+                on_text(*piece)
 
         pick = Picker(opts["temperature"], opts["top_k"], opts["top_p"], seed=random.getrandbits(30))
         guess = self.drafter.guess if self.drafter is not None and self.use_drafter else None

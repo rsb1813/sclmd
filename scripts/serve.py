@@ -26,6 +26,7 @@ from sclmd import model as M
 from sclmd import plan as P
 from sclmd.batch import Batcher, Job
 from sclmd.generate import Picker
+from sclmd.text import Pieces
 from sclmd.stream import VRAM_MARGIN, cap_vram
 
 DEPTH = 6  # the drafter's generation_config.json: num_assistant_tokens
@@ -299,37 +300,6 @@ class Server:
                 "started_over_for_memory": self.batch.restarts, "passes": self.batch.passes, "passes_by_width": dict(self.batch.widths), "rows_per_pass": round(self.batch.rows / max(self.batch.passes, 1), 2),
                 "guesses_kept": round(self.batch.kept_rows / max(self.batch.guess_rows, 1), 2),
                 "tokens_per_second_while_busy": round(self.totals["completion_tokens"] / max(self.busy_s, 1e-9), 1)}
-
-
-class Pieces:
-    """A reply's tokens as pieces of text, thinking and answer apart: add(token) -> (kind, text) or None."""
-
-    def __init__(self, tok, stop: tuple, opening: int, closing: int):
-        self.tok, self.stop, self.opening, self.closing = tok, stop, opening, closing
-        self.kind, self.ids, self.done, self.shown, self.name = "answer", [], 0, 0, False
-
-    def add(self, token: int):
-        if token in self.stop:
-            return None
-        if token == self.opening or token == self.closing:
-            self.kind, self.ids, self.done, self.shown, self.name = ("think" if token == self.opening else "answer"), [], 0, 0, token == self.opening
-            return None
-        self.ids.append(token)
-        # the text of the tokens from `done` on, less what of it was shown: a few tokens are decoded, not the reply
-        before = self.tok.decode(self.ids[self.done : self.shown], skip_special_tokens=False)
-        text = self.tok.decode(self.ids[self.done :], skip_special_tokens=False)
-        if text.endswith("\ufffd") or len(text) <= len(before):  # a character is still missing bytes
-            return None
-        piece = text[len(before):]
-        self.done, self.shown = self.shown, len(self.ids)
-        if self.name:  # the thinking channel's name comes first: "thought\n"
-            whole = self.tok.decode(self.ids, skip_special_tokens=False)
-            if "thought\n".startswith(whole):
-                return None
-            self.name = False
-            if whole.startswith("thought\n"):
-                piece = whole[len("thought\n"):]
-        return (self.kind, piece) if piece else None
 
 
 class App:

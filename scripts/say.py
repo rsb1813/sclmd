@@ -14,7 +14,7 @@ from sclmd import model as M
 from sclmd.generate import Picker, generate
 from sclmd.stream import cap_vram
 
-DEPTH = 6  # the drafter's generation_config.json: num_assistant_tokens
+DEPTH = 7  # as the chat (scripts/chat.py)
 END_OF_TURN = 106
 
 
