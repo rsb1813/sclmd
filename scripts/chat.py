@@ -289,7 +289,9 @@ def main() -> None:
                     "faster than 16 and takes 62 MB more VRAM (86 MB at a context of 16,384), which the plan cannot spend on 4-bit matrices")
     ap.add_argument("--reserve", type=float, default=VRAM_MARGIN / 2**30, help="GiB of the VRAM that is free now to leave to other "
                     "programs. Less means more matrices at 4 bits; if other programs then take more, Windows pages VRAM out and everything slows down")
+    E.add_int8_option(ap)
     cli = ap.parse_args()
+    E.use_int8_option(cli)
     reserve = int(cli.reserve * 2**30)
     console = Console()
     console.print("[grey62]모델을 올리는 중입니다 (약 15초)…[/]")

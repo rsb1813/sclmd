@@ -99,7 +99,9 @@ def main():
     ap.add_argument("--against", default="", help="compare the tokens with those stored under this name")
     ap.add_argument("--profile", action="store_true", help="wait for the GPU after each stage and show the shares by position")
     ap.add_argument("--chat", action="store_true", help="generate through the chat's Session (its emit and loop check counted)")
+    E.add_int8_option(ap)
     args = ap.parse_args()
+    E.use_int8_option(args)
     from scripts import chat as CH
 
     cap_vram(margin=int(args.reserve * 2**30))

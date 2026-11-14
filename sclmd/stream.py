@@ -26,13 +26,14 @@ class Stream:
         self.ckpt, self.cfg, self.device, self.batch = ckpt, ckpt.cfg, device, batch
 
     @torch.no_grad()
-    def run(self, ids: torch.Tensor, n_layers: int | None = None, weights=None, tap=None, log=None, dtype=None) -> dict:
+    def run(self, ids: torch.Tensor, n_layers: int | None = None, weights=None, tap=None, log=None, dtype=None, linear=None) -> dict:
         """ids [sequences, n], every sequence from position 0.
         weights(i, w) -> w: replaces a layer's weights (quantized variants).
         tap(i, name, tensor, rows): the input of each group of matrices of layer i, for the sequences `rows`.
         Returns "hidden" (the last layer's output, before the final norm) and "shared" (the keys and values the drafter
         attends to: layer type -> (keys, values)).
-        dtype: compute in this type instead of the checkpoint's (float32: the arithmetic without bf16's rounding)."""
+        dtype: compute in this type instead of the checkpoint's (float32: the arithmetic without bf16's rounding).
+        linear(i, x, weight): the matrix products of layer i (default F.linear), e.g. to simulate rounded inputs."""
         cfg, dev = self.cfg, self.device
         n_layers = cfg.n_layers if n_layers is None else n_layers
         ids = ids.to(dev)
@@ -55,7 +56,8 @@ class Stream:
                 rows = slice(a, min(a + self.batch, s))
                 shared = {}
                 h[rows] = M.layer_forward(cfg, i, w, h[rows], positions, shared=shared,
-                                          tap=(lambda name, x, i=i, rows=rows: tap(i, name, x, rows)) if tap else None)
+                                          tap=(lambda name, x, i=i, rows=rows: tap(i, name, x, rows)) if tap else None,
+                                          linear=(lambda x, wt, i=i: linear(i, x, wt)) if linear else F.linear)
                 for t, (k, v, _) in shared.items():
                     shared_all.setdefault(t, []).append((k.cpu(), v.cpu()))
             del w
@@ -74,7 +76,8 @@ def logits_chunks(cfg: M.Config, hidden: torch.Tensor, norm: torch.Tensor, embed
 
 @torch.no_grad()
 def compare(cfg: M.Config, ref_hidden: torch.Tensor, hidden: torch.Tensor, norm: torch.Tensor, embed: torch.Tensor, ids: torch.Tensor,
-            target: torch.Tensor, test_norm: torch.Tensor | None = None, test_embed: torch.Tensor | None = None) -> dict:
+            target: torch.Tensor, test_norm: torch.Tensor | None = None, test_embed: torch.Tensor | None = None,
+            per_token: list | None = None) -> dict:
     """A path's next-token distributions against the reference's, per sequence, from the two last-layer outputs
     [sequences, n, hidden size]: KL(reference || path), agreement of the first choice, and both perplexities on `ids`.
     Only positions whose next token is a target (target [sequences, n], bool) count: elsewhere the model was never
@@ -93,7 +96,10 @@ def compare(cfg: M.Config, ref_hidden: torch.Tensor, hidden: torch.Tensor, norm:
                 continue
             pr, pt = F.log_softmax(lr[:m][u], dim=-1), F.log_softmax(lt[:m][u], dim=-1)
             tg = nxt[a : a + m][u]
-            kl[q] += (pr.exp() * (pr - pt)).sum(-1).double().sum().cpu()
+            each = (pr.exp() * (pr - pt)).sum(-1).double()
+            kl[q] += each.sum().cpu()
+            if per_token is not None:  # every target position's KL, in order (for quantiles)
+                per_token.append(each.cpu())
             top1[q] += (pr.argmax(-1) == pt.argmax(-1)).double().sum().cpu()
             nll_ref[q] -= pr.gather(1, tg[:, None]).double().sum().cpu()
             nll[q] -= pt.gather(1, tg[:, None]).double().sum().cpu()

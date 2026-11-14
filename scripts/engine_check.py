@@ -51,12 +51,15 @@ def main():
     ap.add_argument("--capacity", type=int, default=8192)
     ap.add_argument("--seqs", type=int, default=1, help="sequences of each category to score (0: only time it)")
     ap.add_argument("--same", help="tag of an eval_codes --keep run with this plan, to compare with")
+    E.add_int8_option(ap)
     args = ap.parse_args()
+    int8 = E.use_int8_option(args)
     cap_vram()
     ck = Checkpoint(ckpt("orig"))
     cfg = ck.cfg
     plan, head, tag = plan_of(args, cfg)
     tag += "_keyless" if args.keyless else ""
+    tag += f"_int8_{int8:g}" if int8 else ""
     t = time.time()
     eng = E.Engine.load(args.name, plan, head, args.capacity, keyless=args.keyless)
     torch.cuda.synchronize()
@@ -124,9 +127,15 @@ def main():
                 embed = ck.embed(DEV)
                 ref_embed, ref_norm = (embed.float(), norm) if ref_name == "orig_fp32" else (embed, ck.norm(DEV))
                 del embed
-            result = compare(cfg, ref, hidden, ref_norm, ref_embed, ids[rows], target[rows], test_norm=norm, test_embed=test_embed)
+            each = []
+            result = compare(cfg, ref, hidden, ref_norm, ref_embed, ids[rows], target[rows], test_norm=norm, test_embed=test_embed, per_token=each)
             report["against"][ref_name] = by_category(result, sub_cat, names)
             a = report["against"][ref_name]
+            each = torch.cat(each).float()
+            a["all"] |= {f"kl_{q}": float(v) for q, v in zip(("p50", "p90", "p99", "p999"), torch.quantile(each, torch.tensor([0.5, 0.9, 0.99, 0.999])))}
+            a["all"]["kl_max"] = float(each.max())
+            print(f"[engine] against {ref_name}: per-token KL p90 {a['all']['kl_p90']:.4f} p99 {a['all']['kl_p99']:.4f} p99.9 {a['all']['kl_p999']:.4f} "
+                  f"max {a['all']['kl_max']:.3f}", flush=True)
             print(f"[engine] against {ref_name}: KL {a['all']['kl']:.4f}, top1 {a['all']['top1']:.4f}, ppl {a['all']['ppl']:.3f} (reference {a['all']['ppl_ref']:.3f}) | "
                   + " ".join(f"{c} {v['kl']:.4f}" for c, v in a.items() if c != "all"), flush=True)
             del ref, ref_embed

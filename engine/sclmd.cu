@@ -42,11 +42,16 @@ struct Att {
 
 // A matrix as pair codes. codes: the stored order (bench/mma_gemm.cu); lut[code]: the pair as two fp16 in one word;
 // scale[row]. bits: 6 or 8 a pair. rows is a multiple of 16, cols of 64.
+// For the integer products (Model.int8, an option): lut8[code] is the pair rounded to int8 (the codebook divided by
+// book_scale, its largest entry / 127), the two bytes held twice in the word (b0 b1 b0 b1).
 struct Mat {
     const uint32_t* codes;
     const uint32_t* lut;
     const float* scale;
     int rows, cols, bits, pad;
+    const uint32_t* lut8;
+    float book_scale;
+    int pad2;
 };
 
 // The rotation of an input of `cols` values: signs[cols] (+1 / -1), then a Hadamard transform over blocks of `block`.
@@ -99,6 +104,11 @@ struct Model {
     float* attn;     // [rows][heads * widest head] attention's output
     float* hn;       // [rows][hidden] the last output after the final norm (what the drafter is handed)
     float* logits;   // [rows][vocab]
+    // An option, off when 0 (brief B1, lossy): the layers' matrices multiply int8 inputs by int8 codebooks on the
+    // integer tensor-core instruction (gemm8_k). A matrix's input is rounded per token with the clip at int8 times
+    // its rms. The head stays fp16 (and the drafter, which has its own prep).
+    float int8;
+    int pad_int8;
 };
 
 __device__ __forceinline__ void mma(float c[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
@@ -106,6 +116,17 @@ __device__ __forceinline__ void mma(float c[4], uint32_t a0, uint32_t a1, uint32
                  : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
 }
+
+// s8 x s8 with int32 sums, 32 columns an instruction (two tiles); the sums are exact (bench/mma_s8.cu has the
+// fragment layout and the measurements)
+__device__ __forceinline__ void mma8(int c[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// two int8 pairs (each held twice in its word, lut8) as one register: the low pair from p, the high from q
+__device__ __forceinline__ uint32_t join8(uint32_t p, uint32_t q) { return __byte_perm(p, q, 0x5410); }
 
 // The segment a row belongs to (the segments are in row order).
 __device__ __forceinline__ int seg_of_row(const Att& a, int row) {
@@ -218,8 +239,13 @@ __device__ __forceinline__ void strided(int first, int n, int step, Load load, U
 // kernel's work, n / blockDim times over, so one block a token makes them first (phase 1, into sums[2 * token] and
 // fps[token]) and the blocks read them (phase 2). The three phases are this one kernel: the same instructions make
 // the sums and the values in each, so a row's result has the same bits whichever way its pass went.
+// sigma > 0 (Model.int8): the values go out as int8 instead, one 32-bit word of four a lane and tile (the same
+// columns as the fp16 word), xf read as uint32 with a lane's words of four tiles side by side (gemm8_k reads them as
+// one uint4), and fps[token] is what they were divided by:
+// sigma times the rms of the input / 127 (the rotation keeps the length), values past it clipped.
 __global__ void __launch_bounds__(1024) prep_k(const float* a, const float* b, const float* w, const float* y, const float* post, float scalar, float* h_out,
-                       float* v_out, const float* signs, float* fps, uint64_t* xf, int n, float eps, int mode, int phase, float* sums) {
+                       float* v_out, const float* signs, float* fps, uint64_t* xf, int n, float eps, int mode, int phase, float* sums,
+                       float sigma) {
     __shared__ float buf[1024];
     const int bd = blockDim.x, token = blockIdx.y, i = threadIdx.x, col = blockIdx.x * bd + i;
     const size_t at = size_t(token) * n;
@@ -253,7 +279,10 @@ __global__ void __launch_bounds__(1024) prep_k(const float* a, const float* b, c
             len += v * v;
         });
         len = sqrtf(block_sum(len));
-        fp = len > 16384.0f ? exp2f(ceilf(log2f(len / 16384.0f))) : 1.0f;
+        if (sigma > 0)
+            fp = len > 0 ? sigma * len * rsqrtf(float(n)) / 127.0f : 1.0f;
+        else
+            fp = len > 16384.0f ? exp2f(ceilf(log2f(len / 16384.0f))) : 1.0f;
         if (col == 0) fps[token] = fp;
         if (phase == 1) {
             if (i == 0) sums[2 * token] = ry, sums[2 * token + 1] = r;
@@ -277,6 +306,17 @@ __global__ void __launch_bounds__(1024) prep_k(const float* a, const float* b, c
             __syncthreads();
         }
     const float k = (signs ? rsqrtf(float(bd)) : 1.0f) / fp;
+    if (sigma > 0) {
+        if ((i & 9) == 0) {
+            const int t = (i & 15) >> 1;
+            const auto q = [&](float v) { return uint32_t(uint8_t(int8_t(fminf(fmaxf(rintf(v * k), -127.0f), 127.0f)))); };
+            const uint32_t word = q(buf[i]) | q(buf[i + 1]) << 8 | q(buf[i + 8]) << 16 | q(buf[i + 9]) << 24;
+            // tile j's word of lane L at (group * tiles + j - j % 4) * 32 + 4 L + j % 4: a lane's four tiles are one uint4
+            const int j = col >> 4;
+            reinterpret_cast<uint32_t*>(xf)[(size_t(token >> 3) * (n >> 4) + (j & ~3)) * 32 + 4 * (4 * (token & 7) + t) + (j & 3)] = word;
+        }
+        return;
+    }
     if ((i & 9) == 0) {  // i % 16 in {0, 2, 4, 6}: the first column of a lane's word
         const int t = (i & 15) >> 1;
         const uint64_t word = uint64_t(__half_as_ushort(__float2half(buf[i] * k))) | uint64_t(__half_as_ushort(__float2half(buf[i + 1] * k))) << 16 |
@@ -370,6 +410,94 @@ __global__ void gemm_k(Mat m0, Mat m1, Mat m2, float* y0, float* y1, float* y2, 
                 for (int w = 0; w < segs; ++w) sum += part[local][w][lane][i];
                 const int row = strip * 16 + (lane >> 2) + (i >= 2 ? 8 : 0), token = 8 * g + 2 * (lane & 3) + (i & 1);
                 if (token < tokens) y[size_t(token) * m.rows + row] = m.scale[row] * fps[token] * sum;
+            }
+        __syncthreads();
+    }
+}
+
+// gemm_k on the integer instruction (Model.int8): the same codes, strips, tiles and launch, the input int8 (xf read as
+// uint32, a word a lane and tile: prep_k with sigma), the codebook int8 (lut8), two tiles an instruction. Instruction
+// columns 0..15 are tile j (k = 4t + i: column {2t, 2t+1, 2t+8, 2t+9}[i]), 16..31 tile j + 1; so, from the word w of
+// tile j (pairs (g, 2t), (g+8, 2t), (g, 2t+8), (g+8, 2t+8) a byte each), A's registers are
+// pair(w & 255) | pair(w >> 16 & 255) << 16 (row g) and pair(w >> 8 & 255) | pair(w >> 24) << 16 (row g + 8), and the
+// same of tile j + 1's word. The int32 sums are exact: a row's result has the same bits at any width and order.
+// y = scale[row] * book_scale * fps[token] * sum.
+template <int G>
+__global__ void gemm8_k(Mat m0, Mat m1, Mat m2, float* y0, float* y1, float* y2, const uint32_t* xf, const float* fps, int segs, int tokens,
+                        int strips) {
+    __shared__ uint32_t luts[GEMM_STRIPS][256];
+    __shared__ int part[GEMM_STRIPS][8][32][4];
+    const int local = (threadIdx.x >> 5) / segs, warp = (threadIdx.x >> 5) % segs, lane = threadIdx.x & 31;
+    int strip = blockIdx.x * strips + local;
+    Mat m = m0;
+    float* y = y0;
+    if (strip >= m0.rows / 16) {
+        strip -= m0.rows / 16, m = m1, y = y1;
+        if (strip >= m1.rows / 16) strip -= m1.rows / 16, m = m2, y = y2;
+    }
+    const bool idle = strip >= m.rows / 16;
+    uint32_t* slut = luts[local];
+    if (!idle)
+        for (int i = threadIdx.x - local * segs * 32; i < (1 << m.bits); i += segs * 32) slut[i] = m.lut8[i];
+    __syncthreads();
+    const int tiles = m.cols / 16, per = idle ? 0 : tiles / segs, first = warp * per;
+    int c[G][4];
+    for (int g = 0; g < G; ++g) c[g][0] = c[g][1] = c[g][2] = c[g][3] = 0;
+    // a lane's input words of four tiles are one 16-byte load (prep_k's int8 layout)
+    const uint4* xw = reinterpret_cast<const uint4*>(xf) + size_t(first / 4) * 32 + lane;
+    const size_t group = size_t(tiles) * 8;
+    if (m.bits == 8) {
+        const uint32_t* cw = m.codes + (size_t(strip) * tiles + first) * 32 + lane;
+        for (int j = 0; j < per; j += 4) {
+            uint32_t w[4], b[G][4];
+            for (int i = 0; i < 4; ++i) w[i] = cw[size_t(j + i) * 32];
+#pragma unroll
+            for (int g = 0; g < G; ++g) {
+                const uint4 x = xw[g * group + size_t(j / 4) * 32];
+                b[g][0] = x.x, b[g][1] = x.y, b[g][2] = x.z, b[g][3] = x.w;
+            }
+#pragma unroll
+            for (int i = 0; i < 4; i += 2) {
+                const uint32_t u = w[i], v = w[i + 1];
+                const uint32_t a0 = join8(slut[u & 255], slut[u >> 16 & 255]), a1 = join8(slut[u >> 8 & 255], slut[u >> 24]);
+                const uint32_t a2 = join8(slut[v & 255], slut[v >> 16 & 255]), a3 = join8(slut[v >> 8 & 255], slut[v >> 24]);
+                for (int g = 0; g < G; ++g) mma8(c[g], a0, a1, a2, a3, b[g][i], b[g][i + 1]);
+            }
+        }
+    } else {  // 6 bits a pair (see gemm_k)
+        const uint32_t* cw = m.codes + (size_t(strip) * (tiles / 4) + first / 4) * 96 + lane;
+        for (int j = 0; j < per; j += 4) {
+            const uint32_t* q = cw + size_t(j / 4) * 96;
+            const uint32_t q0 = q[0], q1 = q[32], q2 = q[64];
+            uint32_t b[G][4];
+#pragma unroll
+            for (int g = 0; g < G; ++g) {
+                const uint4 x = xw[g * group + size_t(j / 4) * 32];
+                b[g][0] = x.x, b[g][1] = x.y, b[g][2] = x.z, b[g][3] = x.w;
+            }
+            const uint64_t lo = uint64_t(q0) | uint64_t(q1) << 32, hi = q2;
+            const uint32_t k10 = uint32_t(lo >> 60 | hi << 4) & 63;
+            const uint32_t a[16] = {slut[lo & 63],       slut[lo >> 6 & 63],  slut[lo >> 12 & 63], slut[lo >> 18 & 63],
+                                    slut[lo >> 24 & 63], slut[lo >> 30 & 63], slut[lo >> 36 & 63], slut[lo >> 42 & 63],
+                                    slut[lo >> 48 & 63], slut[lo >> 54 & 63], slut[k10],           slut[hi >> 2 & 63],
+                                    slut[hi >> 8 & 63],  slut[hi >> 14 & 63], slut[hi >> 20 & 63], slut[hi >> 26 & 63]};
+            const uint32_t r0 = join8(a[0], a[2]), r1 = join8(a[1], a[3]), r2 = join8(a[4], a[6]), r3 = join8(a[5], a[7]);
+            const uint32_t s0 = join8(a[8], a[10]), s1 = join8(a[9], a[11]), s2 = join8(a[12], a[14]), s3 = join8(a[13], a[15]);
+            for (int g = 0; g < G; ++g) {
+                mma8(c[g], r0, r1, r2, r3, b[g][0], b[g][1]);
+                mma8(c[g], s0, s1, s2, s3, b[g][2], b[g][3]);
+            }
+        }
+    }
+    for (int g = 0; g < G; ++g) {
+        for (int i = 0; i < 4; ++i) part[local][warp][lane][i] = c[g][i];
+        __syncthreads();
+        if (warp == 0 && !idle)
+            for (int i = 0; i < 4; ++i) {
+                int sum = 0;
+                for (int w = 0; w < segs; ++w) sum += part[local][w][lane][i];
+                const int row = strip * 16 + (lane >> 2) + (i >= 2 ? 8 : 0), token = 8 * g + 2 * (lane & 3) + (i & 1);
+                if (token < tokens) y[size_t(token) * m.rows + row] = m.scale[row] * m.book_scale * fps[token] * float(sum);
             }
         __syncthreads();
     }
@@ -713,6 +841,29 @@ static void gemm(const uint64_t* xf, const float* fps, int tokens, const Mat& a,
         gemm_k<4><<<blocks, 32 * segs * strips>>>(a, b, c, ya, yb, yc, xf, fps, segs, tokens, strips);
 }
 
+// gemm on the integer instruction (xf as prep_k wrote it with sigma), with the same launch
+static void gemm8(const uint64_t* xf64, const float* fps, int tokens, const Mat& a, float* ya, const Mat& b = Mat{}, float* yb = nullptr,
+                  const Mat& c = Mat{}, float* yc = nullptr) {
+    const uint32_t* xf = reinterpret_cast<const uint32_t*>(xf64);
+    const int segs = segs_for(a.cols), all = (a.rows + b.rows + c.rows) / 16;
+    const int strips = GEMM_STRIPS * segs * 32 <= 1024 ? GEMM_STRIPS : 1024 / (segs * 32), blocks = (all + strips - 1) / strips;
+    if (tokens <= 8)
+        gemm8_k<1><<<blocks, 32 * segs * strips>>>(a, b, c, ya, yb, yc, xf, fps, segs, tokens, strips);
+    else if (tokens <= 16)
+        gemm8_k<2><<<blocks, 32 * segs * strips>>>(a, b, c, ya, yb, yc, xf, fps, segs, tokens, strips);
+    else
+        gemm8_k<4><<<blocks, 32 * segs * strips>>>(a, b, c, ya, yb, yc, xf, fps, segs, tokens, strips);
+}
+
+// the layers' matrices: on the integer instruction when the model's option is on
+static void gemm_of(const Model& m, int tokens, const Mat& a, float* ya, const Mat& b = Mat{}, float* yb = nullptr, const Mat& c = Mat{},
+                    float* yc = nullptr) {
+    if (m.int8 > 0)
+        gemm8(m.xf, m.fps, tokens, a, ya, b, yb, c, yc);
+    else
+        gemm(m.xf, m.fps, tokens, a, ya, b, yb, c, yc);
+}
+
 // What prep_k is told of the residual step still owed: the matrix output it adds, the norm's weight and the layer's scalar.
 struct Owed {
     const float *y = nullptr, *post = nullptr;
@@ -728,20 +879,26 @@ static int two_phase_from() {
 
 // prep_k for `rows` rows; the sums of the two-phase way go after the rows' scales in fps (which holds 3 * MAX_TOKENS).
 static void launch_prep(int rows, const float* a, const float* b, const float* w, int n, const Rot& rot, int mode, const Owed& owed,
-                        float* h_out, float* v_out, float* fps, uint64_t* xf, float eps) {
+                        float* h_out, float* v_out, float* fps, uint64_t* xf, float eps, float sigma = 0.0f) {
     const dim3 grid(n / rot.block, rows);
     float* sums = fps + MAX_TOKENS;
     if (rows >= two_phase_from() && grid.x > 1) {
-        prep_k<<<dim3(1, rows), rot.block>>>(a, b, w, owed.y, owed.post, owed.scalar, h_out, v_out, rot.signs, fps, xf, n, eps, mode, 1, sums);
-        prep_k<<<grid, rot.block>>>(a, b, w, owed.y, owed.post, owed.scalar, h_out, v_out, rot.signs, fps, xf, n, eps, mode, 2, sums);
+        prep_k<<<dim3(1, rows), rot.block>>>(a, b, w, owed.y, owed.post, owed.scalar, h_out, v_out, rot.signs, fps, xf, n, eps, mode, 1, sums, sigma);
+        prep_k<<<grid, rot.block>>>(a, b, w, owed.y, owed.post, owed.scalar, h_out, v_out, rot.signs, fps, xf, n, eps, mode, 2, sums, sigma);
     } else {
-        prep_k<<<grid, rot.block>>>(a, b, w, owed.y, owed.post, owed.scalar, h_out, v_out, rot.signs, fps, xf, n, eps, mode, 0, sums);
+        prep_k<<<grid, rot.block>>>(a, b, w, owed.y, owed.post, owed.scalar, h_out, v_out, rot.signs, fps, xf, n, eps, mode, 0, sums, sigma);
     }
 }
 
+// A layer matrix's input: int8 when the model's option is on (the head's input goes through prep_head, fp16)
 static void prep(const Model& m, const float* a, const float* b, const float* w, int n, const Rot& rot, int mode, int tokens,
                  const Owed& owed = Owed{}, float* h_out = nullptr, float* v_out = nullptr) {
-    launch_prep(tokens, a, b, w, n, rot, mode, owed, h_out, v_out, m.fps, m.xf, m.eps);
+    launch_prep(tokens, a, b, w, n, rot, mode, owed, h_out, v_out, m.fps, m.xf, m.eps, m.int8);
+}
+
+static void prep_head(const Model& m, const float* a, const float* b, const float* w, int n, const Rot& rot, int mode, int tokens,
+                      const Owed& owed = Owed{}, float* h_out = nullptr, float* v_out = nullptr) {
+    launch_prep(tokens, a, b, w, n, rot, mode, owed, h_out, v_out, m.fps, m.xf, m.eps, 0.0f);
 }
 
 // What a layer's attention kernels are told of a pass's segments. A row reads the positions up to its own (the
@@ -810,7 +967,7 @@ API int sclmd_profile(double* times) {
 // One matrix times a given input (tests): x[tokens][cols] -> y[tokens][rows], with the model's work memory.
 API int sclmd_linear(const Model* m, const Mat* mat, const Rot* rot, const float* x, float* y, int tokens) {
     prep(*m, x, nullptr, nullptr, mat->cols, *rot, 1, tokens);
-    gemm(m->xf, m->fps, tokens, *mat, y);
+    gemm_of(*m, tokens, *mat, y);
     return int(cudaGetLastError());
 }
 
@@ -841,7 +998,7 @@ static int pass(const Model* mp, int tokens, const Segs* segs, int logits_from) 
         if (owed.y) std::swap(h, spare);
         tick(P_INPUT);
         float *yq = m.y, *yk = m.y + size_t(tokens) * nqo, *yv = yk + size_t(tokens) * nkv;
-        gemm(m.xf, m.fps, tokens, l.q, yq, l.k, yk, l.v, yv);  // a full-attention layer's v has no rows
+        gemm_of(m, tokens, l.q, yq, l.k, yk, l.v, yv);  // a full-attention layer's v has no rows
         tick(P_QKV);
         const Att a = att_for(*segs, l.full, m.heads, m.window - 1);
         const int rep = m.heads / kvh, groups = (rep * a.most + 7) / 8;
@@ -857,23 +1014,23 @@ static int pass(const Model* mp, int tokens, const Segs* segs, int logits_from) 
         tick(P_ATTEND);
         prep(m, m.attn, nullptr, nullptr, nqo, l.rot_o, 1, tokens);
         tick(P_INPUT);
-        gemm(m.xf, m.fps, tokens, l.o, m.y);
+        gemm_of(m, tokens, l.o, m.y);
         tick(P_O);
         owed = Owed{m.y, l.post_attn_ln, 1.0f};
         // feed-forward
         prep(m, h, nullptr, l.pre_ff_ln, n, l.rot_mlp, 0, tokens, owed, spare);
         std::swap(h, spare);
         tick(P_INPUT);
-        gemm(m.xf, m.fps, tokens, l.gate, m.y, l.up, m.y2);
+        gemm_of(m, tokens, l.gate, m.y, l.up, m.y2);
         tick(P_GATE_UP);
         prep(m, m.y, m.y2, nullptr, m.mlp, l.rot_down, 2, tokens);
         tick(P_INPUT);
-        gemm(m.xf, m.fps, tokens, l.down, m.y);
+        gemm_of(m, tokens, l.down, m.y);
         tick(P_DOWN);
         owed = Owed{m.y, l.post_ff_ln, l.scalar};
     }
     // the last residual step, the final norm (kept in m.hn) and the head. Two steps a layer: the stream ends in m.h
-    prep(m, h, nullptr, m.norm, n, m.rot_head, 0, tokens, owed, spare, m.hn);
+    prep_head(m, h, nullptr, m.norm, n, m.rot_head, 0, tokens, owed, spare, m.hn);
     const int first = logits_from < 0 ? 0 : logits_from / 8 * 8;  // the first row of the group of eight the logits start in
     if (first < tokens) {
         float* logits = m.logits + size_t(first) * m.vocab;

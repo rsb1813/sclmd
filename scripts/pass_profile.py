@@ -29,7 +29,9 @@ def main():
     ap.add_argument("--rows", type=int, default=8, help="the rows the engine is made for (8, 16 or 32)")
     ap.add_argument("--capacity", type=int, default=8192)
     ap.add_argument("--reserve", type=float, default=0.75, help="GiB of the free VRAM left to other programs")
+    E.add_int8_option(ap)
     args = ap.parse_args()
+    E.use_int8_option(args)
     cap_vram(margin=int(args.reserve * 2**30))
     cfg = M.Config.load(ckpt("orig"))
     if args.plan:

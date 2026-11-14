@@ -208,7 +208,11 @@ def main():
     ap.add_argument("--set", dest="items_set", default="v1", help="the item set: v1 (items.jsonl) or v2 (items_v2.jsonl: larger exact kinds)")
     ap.add_argument("--rows", type=int, default=8, help="rows of the engine's pass (Engine.load's rows; 8 as the chat)")
     ap.add_argument("--budget", type=float, default=0, help="stop answering after this many seconds (0: no limit); run again to go on")
+    ap.add_argument("--int8", type=float, nargs="?", const=5.0, default=0.0, metavar="SIGMA",
+                    help="integer products (sclmd/engine.py add_int8_option; lossy option, off by default)")
     args = ap.parse_args()
+    if args.int8:
+        os.environ["SCLMD_INT8"] = repr(float(args.int8))
     items_path, path, summary_path = files(args.items_set, args.tag)
     with open(items_path, encoding="utf-8") as f:
         items = [json.loads(line) for line in f]

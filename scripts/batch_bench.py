@@ -60,7 +60,9 @@ def main():
     ap.add_argument("--no-drafter", action="store_true")
     ap.add_argument("--rows", type=int, default=32, help="the most rows of a pass (8, 16 or 32)")
     ap.add_argument("--out", default=os.path.join(DATA, "batch_bench.json"))
+    E.add_int8_option(ap)
     args = ap.parse_args()
+    E.use_int8_option(args)
     counts = [int(c) for c in args.counts.split(",")]
     cap_vram()
     tok = AutoTokenizer.from_pretrained(ckpt("orig"))

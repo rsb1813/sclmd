@@ -61,7 +61,7 @@ def fixed_bytes(cfg: M.Config, head_bits: int, capacity: int, pool: dict | None 
 
 class Mat(C.Structure):
     _fields_ = [("codes", C.c_void_p), ("lut", C.c_void_p), ("scale", C.c_void_p), ("rows", C.c_int), ("cols", C.c_int),
-                ("bits", C.c_int), ("pad", C.c_int)]
+                ("bits", C.c_int), ("pad", C.c_int), ("lut8", C.c_void_p), ("book_scale", C.c_float), ("pad2", C.c_int)]
 
 
 class Rot(C.Structure):
@@ -84,7 +84,32 @@ class Segs(C.Structure):
 class Model(C.Structure):
     _fields_ = ([("layers", C.c_void_p)] + [(n, C.c_int) for n in ("n_layers", "hidden", "mlp", "heads", "window", "vocab")] +
                 [("eps", C.c_float), ("softcap", C.c_float), ("head", Mat), ("rot_head", Rot), ("norm", C.c_void_p)] +
-                [(p, C.c_void_p) for p in ("h", "h2", "fps", "xf", "y", "y2", "qhat", "scores", "probs", "attn", "hn", "logits")])
+                [(p, C.c_void_p) for p in ("h", "h2", "fps", "xf", "y", "y2", "qhat", "scores", "probs", "attn", "hn", "logits")] +
+                [("int8", C.c_float), ("pad_int8", C.c_int)])
+
+
+# The integer products (brief B1, lossy, off by default): the layers' matrices take int8 inputs, clipped at INT8_SIGMA
+# times their rms, and int8 codebooks, on the s8 tensor-core instruction. SCLMD_INT8=<sigma> turns it on for every
+# Engine made without int8= (the scripts' --int8 sets it); 0 or unset: off.
+INT8_SIGMA = 5.0
+
+
+def int8_default() -> float:
+    v = os.environ.get("SCLMD_INT8")
+    return float(v) if v else 0.0
+
+
+def add_int8_option(ap):
+    """--int8 [SIGMA] on a script's arguments; use_int8_option(args) after parsing turns it on for the Engines it makes."""
+    ap.add_argument("--int8", type=float, nargs="?", const=INT8_SIGMA, default=0.0, metavar="SIGMA",
+                    help=f"integer products (lossy option, off by default): int8 inputs clipped at SIGMA times their rms (default {INT8_SIGMA:g}) "
+                         "and int8 codebooks on the s8 tensor-core instruction")
+
+
+def use_int8_option(args) -> float:
+    if args.int8:
+        os.environ["SCLMD_INT8"] = repr(float(args.int8))
+    return int8_default()
 
 
 _lib = None
@@ -161,6 +186,16 @@ def lut(book: torch.Tensor) -> torch.Tensor:
     return (h[:, 0] | h[:, 1] << 16).to(torch.int32)
 
 
+def lut8(book: torch.Tensor) -> tuple[torch.Tensor, float]:
+    """The codebook rounded to int8 for the integer products: (one word a pair: the two int8 twice, b0 b1 b0 b1 (int32),
+    the scale they are multiplied by: the largest entry / 127)."""
+    b = book.float()
+    s = float(b.abs().max()) / 127.0 or 1.0
+    q = torch.clamp(torch.round(b / s), -127, 127).to(torch.int64) & 0xFF
+    two = q[:, 0] | q[:, 1] << 8
+    return (two | two << 16).to(torch.int32), s
+
+
 class Engine:
     """The main model on the GPU kernels. The same four things generation asks of RefTarget (sclmd/generate.py).
 
@@ -178,8 +213,10 @@ class Engine:
     embed: the input embedding table [vocab, hidden] (any device and type; rows are fetched as needed)"""
 
     def __init__(self, cfg: M.Config, layers: list, head: tuple, norm: torch.Tensor, embed: torch.Tensor, capacity: int = 8192,
-                 device: str = "cuda", sequences: int = 1, pool: dict | None = None, rows: int = 8, keyless: bool = False):
+                 device: str = "cuda", sequences: int = 1, pool: dict | None = None, rows: int = 8, keyless: bool = False,
+                 int8: float | None = None):
         assert capacity % TILE == 0, "the capacity is a multiple of 16"
+        self.int8 = int8_default() if int8 is None else float(int8)  # 0: off; else the clip in rms of the inputs (INT8_SIGMA)
         assert rows in (8, 16, 32), "a pass has 8, 16 or 32 rows"
         self.cfg, self.device, self.capacity, self.sequences, self.rows = cfg, device, capacity, sequences, rows
         self.lengths = [0] * sequences  # positions each sequence holds
@@ -276,6 +313,7 @@ class Engine:
         m.layers = C.cast(self.c_layers, C.c_void_p)
         m.n_layers, m.hidden, m.mlp, m.heads, m.window, m.vocab = cfg.n_layers, cfg.hidden, cfg.mlp, cfg.heads, cfg.window, cfg.vocab
         m.eps, m.softcap = cfg.eps, cfg.softcap or 0.0
+        m.int8 = self.int8
         m.head, m.rot_head, m.norm = self._mat(*head), self._rot(cfg.hidden), f32(norm).data_ptr()
         for name, t in self.work.items():
             setattr(m, name, t.data_ptr())
@@ -283,7 +321,7 @@ class Engine:
 
     @classmethod
     def load(cls, name: str, plan: dict, head: int, capacity: int = 8192, device: str = "cuda", sequences: int = 1,
-             pool: dict | None = None, rows: int = 8, keyless: bool = False) -> "Engine":
+             pool: dict | None = None, rows: int = 8, keyless: bool = False, int8: float | None = None) -> "Engine":
         """The original model with the stored codes `name`: plan is layer -> {matrix: bits a pair}, head the output
         head's bits. The layers come off the disk one at a time; the embedding table stays in RAM."""
         from . import ckpt
@@ -298,7 +336,7 @@ class Engine:
                 yield ck.layer(i, "cpu", skip=M.LINEARS) | {"mats": CD.stored(name, i, {m: plan[i][m] for m in has})}
 
         eng = cls(cfg, layers(), CD.stored(name, "head", {"head": head})["head"], ck.norm("cpu"), ck.embed("cpu"), capacity, device,
-                  sequences, pool, rows, keyless)
+                  sequences, pool, rows, keyless, int8)
         torch.cuda.empty_cache()  # packing left about 1 GiB reserved and unused: whatever loads next needs it
         return eng
 
@@ -315,7 +353,11 @@ class Engine:
         packed = pack(codes, bits, out=out) if out is not None else self._own(pack(codes, bits, device=dev))
         table = self._own(lut(book.to(dev)))
         scale = self._own(scales.to(device=dev, dtype=torch.float32).contiguous())
-        return Mat(packed.data_ptr(), table.data_ptr(), scale.data_ptr(), codes.shape[0], codes.shape[1] * 2, bits, 0)
+        mat = Mat(packed.data_ptr(), table.data_ptr(), scale.data_ptr(), codes.shape[0], codes.shape[1] * 2, bits, 0)
+        if self.int8:
+            t8, s8 = lut8(book.to(dev))
+            mat.lut8, mat.book_scale = self._own(t8).data_ptr(), s8
+        return mat
 
     def _rot(self, cols: int) -> Rot:
         if cols not in self.rots:
@@ -513,6 +555,44 @@ class Engine:
             state["bytes"] += sum(d.numel() * d.element_size() for d in data)
         self.release(seq)
         return state
+
+    def save(self, seq: int, pin: bool = True) -> dict:
+        """A copy in RAM of what a sequence holds, in park()'s form, the sequence left as it is (a prefix many texts
+        begin with: unpark() puts it on any free sequence, as often as wanted). Nothing may have been written past its
+        length (save right when the prefix is in; a sliding layer's ring then holds what the next positions read). pin: page-locked RAM (copies to the GPU at full speed)."""
+        assert self.highs[seq] == self.lengths[seq], "positions past its length were written: crop and trim first, or save earlier"
+        state = {"length": self.lengths[seq], "high": self.highs[seq], "kinds": {}, "bytes": 0}
+        for t in self.ring:
+            js = [j for j, tile in enumerate(self.tiles[t][seq]) if tile >= 0]
+            data = [torch.empty(k.shape[0], len(js), TILE, *k.shape[2:], dtype=k.dtype, pin_memory=pin) for k in self.kv_all[t]]
+            self._copy_tiles(t, [self.tiles[t][seq][j] for j in js], data, out=True)
+            state["kinds"][t] = {"js": js, "data": data}
+            state["bytes"] += sum(d.numel() * d.element_size() for d in data)
+        return state
+
+    def fork(self, src: int, dst: int):
+        """The free sequence `dst` gets a copy of what sequence `src` holds, GPU to GPU (src: a prefix kept on its own
+        sequence; nothing written past its length). KVFull, and nothing changed, when the pool is short."""
+        assert self.lengths[dst] == 0 and all(x < 0 for t in self.ring for x in self.tiles[t][dst]), "the sequence is in use"
+        assert self.highs[src] == self.lengths[src], "positions past its length were written"
+        js = {t: [j for j, tile in enumerate(self.tiles[t][src]) if tile >= 0] for t in self.ring}
+        for t in self.ring:
+            if len(js[t]) > len(self.free[t]):
+                raise KVFull(f"no room for a copy of {len(js[t])} tiles of {t} keys and values")
+        for t in self.ring:
+            if not js[t]:
+                continue
+            own = [self.free[t].pop() for _ in js[t]]
+            frm = [self.tiles[t][src][j] for j in js[t]]
+            for j, tile in zip(js[t], own):
+                self.tiles[t][dst][j] = tile
+            self.tables[t][dst, torch.tensor(js[t], device=self.device)] = torch.tensor(own, dtype=torch.int32, device=self.device)
+            a, b = torch.tensor(frm, device=self.device), torch.tensor(own, device=self.device)
+            for x in self.kv_all[t]:
+                v = self._tiles_view(x, t)
+                for lay in range(v.shape[0]):  # a layer at a time: the temporary is one layer's tiles
+                    v[lay].index_copy_(0, b, v[lay].index_select(0, a))
+        self.lengths[dst], self.highs[dst] = self.lengths[src], self.highs[src]
 
     def unpark(self, seq: int, state: dict):
         """Puts a parked sequence on the free sequence `seq`. KVFull, and nothing changed, when the pool is short."""

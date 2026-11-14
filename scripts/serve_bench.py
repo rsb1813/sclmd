@@ -57,6 +57,8 @@ def chat(url: str, messages: list, max_tokens: int, think: bool, seed: int, out:
         data = json.loads(line[6:])
         if data.get("usage"):
             out["usage"] = data["usage"]
+        if data.get("timings"):
+            out["timings"] = data["timings"]
         for choice in data.get("choices", []):
             delta = choice.get("delta", {})
             piece = delta.get("content") or delta.get("reasoning_content")

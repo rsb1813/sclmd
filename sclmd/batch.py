@@ -45,6 +45,9 @@ class Job:
         self.cancel = False  # set from outside: the text ends at the next pass
         self.snapped = False
         self.read = self.passes = self.rows = 0  # prompt tokens read here, passes it had rows in, rows it was given
+        # a position at which the reading stops for a moment: when the sequence holds exactly that many positions,
+        # at_pause(job) is called between passes (scripts/serve.py keeps the shared prefix there), then it reads on
+        self.pause, self.at_pause = None, None
 
     def _settle(self, token: int):
         self.pending = token
@@ -101,6 +104,9 @@ class Batcher:
             rows[j] = 1
             free -= 1
         room = {j: eng.capacity - eng.lengths[j.seq] for j in live}
+        for j in live:  # a prompt read up to its pause first
+            if j.pause is not None and eng.lengths[j.seq] < j.pause:
+                room[j] = min(room[j], j.pause - eng.lengths[j.seq])
 
         def read(readers: list, most: int) -> int:
             """Up to `most` rows shared among the readers; how many were given."""
@@ -231,6 +237,10 @@ class Batcher:
             at = eng.lengths[j.seq]  # after the pass: the position after the rows
             if j.pending is None:  # a prompt: when its last token is in, the reply's first token is chosen
                 j.todo, j.read = j.todo[n:], j.read + n
+                if j.pause is not None and at >= j.pause:
+                    if at == j.pause and j.todo and j.at_pause is not None:
+                        j.at_pause(j)
+                    j.pause = None
                 if not j.todo and j.only_read:
                     j.done = "read"
                 elif not j.todo and j.resume is not None:  # started over, and back where it was

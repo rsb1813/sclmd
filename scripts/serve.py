@@ -42,8 +42,9 @@ class Refused(Exception):
 class Request:
     """A chat completion under way: what the HTTP thread and the engine's thread know of it."""
 
-    def __init__(self, full: list, start: int, max_new: int, pick: Picker, think: bool, messages: list | None = None):
+    def __init__(self, full: list, start: int, max_new: int, pick: Picker, think: bool, messages: list | None = None, cut: int = 0):
         self.full, self.start, self.max_new, self.pick, self.think, self.messages = full, start, max_new, pick, think, messages
+        self.cut = cut  # the length of its shared part (the system turn, or the messages the client marked): kept for others (Prefixes)
         self.events = queue.Queue()  # ("token", id), then ("done", {...}) or ("error", status, message)
         self.cancelled = False
         self.job = None
@@ -73,14 +74,54 @@ class Parked:
         self.tokens, self.state, self.used = tokens, state, used
 
 
+class Prefixes:
+    """Shared prompt prefixes (system turns, instructions, few-shot examples many requests begin with): the engine's
+    state of each one in page-locked RAM (Engine.save), put on a request's sequence (Engine.unpark) so that it reads
+    only what comes after. Up to `ram` bytes; the one used longest ago goes first. The same tokens as reading it all:
+    the engine computes a row the same whatever pass it is in."""
+
+    def __init__(self, ram: int, least: int = 16):
+        self.ram, self.least = ram, least
+        self.held = {}  # tuple of tokens -> [state, last used]
+        self.too_big = set()  # prefixes larger than the whole budget: never saved
+        self.hits = self.stored = 0
+        self.waits = 0  # times a request that begins with one waited for keys and values to put it on
+
+    def find(self, full: list, longer_than: int):
+        """The longest prefix held that `full` begins with and is longer than `longer_than` (and shorter than full) -> (tokens, state) or None."""
+        best = None
+        for key, entry in self.held.items():
+            if longer_than < len(key) < len(full) and (best is None or len(key) > len(best)) and tuple(full[: len(key)]) == key:
+                best = key
+        if best is None:
+            return None
+        self.held[best][1] = time.time()
+        return best, self.held[best][0]
+
+    def wants(self, tokens: list) -> bool:
+        return self.ram > 0 and len(tokens) >= self.least and tuple(tokens) not in self.held and tuple(tokens) not in self.too_big
+
+    def put(self, tokens: list, state: dict) -> None:
+        if state["bytes"] > self.ram:
+            return
+        self.held[tuple(tokens)] = [state, time.time()]
+        self.stored += 1
+        while self.bytes() > self.ram:
+            del self.held[min(self.held, key=lambda k: self.held[k][1])]
+
+    def bytes(self) -> int:
+        return sum(e[0]["bytes"] for e in self.held.values())
+
+
 class Server:
     """The engine's side: requests come in through `inbox`, each becomes a job on a sequence, and run() makes passes
     while there is anything to do. Conversations whose reply is over stay on their sequences (kept); when sequences or
     keys and values run short, the one used longest ago moves to RAM (parked, up to `ram` bytes), and comes back
     when its next turn arrives."""
 
-    def __init__(self, tok, eng: E.Engine, drafter, stop: tuple, ram: int = 0):
+    def __init__(self, tok, eng: E.Engine, drafter, stop: tuple, ram: int = 0, prefix_ram: int = 0):
         self.tok, self.eng, self.stop, self.ram = tok, eng, stop, ram
+        self.prefixes = Prefixes(prefix_ram)
         self.parked = []
         self.batch = Batcher(eng, drafter, DEPTH)
         self.batch.make_room = self._make_room
@@ -151,11 +192,16 @@ class Server:
                     best, most = k, n
         back = max((p for p in self.parked if most < len(p.tokens) < len(req.full) and req.full[: len(p.tokens)] == p.tokens),
                    key=lambda p: len(p.tokens), default=None)
+        shared = self.prefixes.find(req.full, len(back.tokens) if back is not None else most) if self.prefixes.held else None
+        if shared is not None:  # a prefix kept for everyone: a copy of it goes onto a sequence (the copy in RAM stays)
+            back = Parked(list(shared[0]), shared[1], time.time())
         reused = 0
         if back is not None:  # the conversation is in RAM: back onto a sequence, making room as needed
-            self.parked.remove(back)
+            if shared is None:
+                self.parked.remove(back)
             if not self.unused and not self._make_room():
-                self.parked.append(back)
+                if shared is None:
+                    self.parked.append(back)
                 return False
             seq = self.unused.pop()
             while True:
@@ -164,8 +210,13 @@ class Server:
                     reused = len(back.tokens)
                     break
                 except E.KVFull:
-                    if not self._make_room():  # the texts under way hold too much for it now: it starts anew
-                        break
+                    if self._make_room():
+                        continue
+                    if shared is not None and self.active:  # a kept prefix stays kept: the request waits for the texts under way
+                        self.unused.append(seq)
+                        self.prefixes.waits += 1
+                        return False
+                    break  # the texts under way hold too much for it now: it starts anew
         elif best is not None:
             seq = best.seq
             if best.job is not None:
@@ -186,9 +237,23 @@ class Server:
         req.reused = reused
         req.job = Job(seq, req.full[reused:], req.max_new, req.pick, self.stop, emit=lambda t, q=req.events: q.put(("token", t)),
                       start=req.start, base=req.full[:reused])
+        if shared is not None and reused:
+            self.prefixes.hits += 1
+        if reused < req.cut < len(req.full) and self.prefixes.wants(req.full[: req.cut]):  # its shared part is kept when read
+            req.job.pause, req.job.at_pause = req.cut, lambda job, cut=req.cut: self._keep_prefix(job, cut)
         self.batch.add(req.job)
         self.active.append(req)
         return True
+
+    def _keep_prefix(self, job: Job, cut: int) -> None:
+        """The job's sequence holds exactly its shared prefix: a copy of it goes to RAM for the requests that begin with it."""
+        tokens, eng = job.base[:cut], self.eng
+        if self.prefixes.wants(tokens) and eng.highs[job.seq] == cut:
+            size = sum(E.tile_bytes(eng.cfg, t, eng.lean) * sum(x >= 0 for x in eng.tiles[t][job.seq]) for t in eng.ring)
+            if size > self.prefixes.ram:
+                self.prefixes.too_big.add(tuple(tokens))
+                return
+            self.prefixes.put(tokens, eng.save(job.seq))
 
     def _finish(self, req: Request) -> None:
         eng, job = self.eng, req.job
@@ -295,6 +360,8 @@ class Server:
         return {"requests": {"under_way": len(self.active), "waiting": len(self.waiting) + self.inbox.qsize(), **self.totals},
                 "conversations_kept": len(self.kept), "conversations_in_ram": len(self.parked),
                 "ram_gib": round(sum(p.state["bytes"] for p in self.parked) / 2**30, 2), "sequences": eng.sequences,
+                "prefixes": {"held": len(self.prefixes.held), "gib": round(self.prefixes.bytes() / 2**30, 3), "stored": self.prefixes.stored,
+                             "hits": self.prefixes.hits, "waits": self.prefixes.waits},
                 "keys_and_values": {"gib": round(sum(tile[t] * eng.pool[t] for t in tile) / 2**30, 2),
                                     "free_gib": round(sum(tile[t] * free[t] for t in tile) / 2**30, 2)},
                 "started_over_for_memory": self.batch.restarts, "passes": self.batch.passes, "passes_by_width": dict(self.batch.widths), "rows_per_pass": round(self.batch.rows / max(self.batch.passes, 1), 2),
@@ -361,10 +428,25 @@ class App:
             think = t.get("type") == "enabled" if isinstance(t, dict) else bool(t)
         elif body.get("reasoning_effort") is not None:
             think = body["reasoning_effort"] not in ("none", "minimal")
+        # the shared part kept for other requests (--prefix-gib): the messages the client marks (sclmd_prefix_messages:
+        # how many of the first), else the leading system messages. Read only when the store is on; a mark that is not a
+        # number counts as no mark.
+        shared = 0
+        if self.server.prefixes.ram > 0:
+            system = next((i for i, m in enumerate(messages) if m["role"] != "system"), len(messages))
+            try:
+                shared = int(body["sclmd_prefix_messages"]) if body.get("sclmd_prefix_messages") is not None else system
+            except (TypeError, ValueError):
+                shared = system
+            shared = max(0, min(shared, len(messages) - 1))
         with self.lock:
-            ids = lambda prompt: self.tok.apply_chat_template(messages, tokenize=True, add_generation_prompt=prompt, enable_thinking=think)  # noqa: E731
+            ids = lambda prompt, ms=messages: self.tok.apply_chat_template(ms, tokenize=True, add_generation_prompt=prompt, enable_thinking=think)  # noqa: E731
             before, full = ids(False), ids(True)
-        before, full = (list(x["input_ids"] if hasattr(x, "keys") else x) for x in (before, full))
+            part = ids(False, messages[:shared]) if shared else []
+        before, full, part = (list(x["input_ids"] if hasattr(x, "keys") else x) for x in (before, full, part))
+        cut = 0  # on token ids: where the template writes the part otherwise than in the whole, the part ends before that
+        while cut < min(len(part), len(full)) and part[cut] == full[cut]:
+            cut += 1
         start = len(before) + len(self.turn)
         if full[: len(before)] != before or full[len(before) : start] != self.turn:
             raise Refused(500, "the chat template did not write the turn as expected")
@@ -381,7 +463,7 @@ class App:
         top_k = int(body.get("top_k", 64) or 64)
         seed = body.get("seed")
         pick = Picker(temperature, max(1, min(top_k, 1024)), top_p, seed=int(seed) & 0x3FFFFFFF if seed is not None else uuid.uuid4().int & 0x3FFFFFFF)
-        return Request(full, start, max_new, pick, think, messages)
+        return Request(full, start, max_new, pick, think, messages, cut)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -570,6 +652,9 @@ def main() -> None:
     ap.add_argument("--sequences", type=int, default=32, help="conversations held at once, those kept for their next turn included")
     ap.add_argument("--ram-gib", type=float, default=24.0, help="RAM for conversations that wait for their next turn after the GPU "
                     "has run short (0: they are forgotten instead and read again from the start)")
+    ap.add_argument("--prefix-gib", type=float, default=0.0, help="page-locked RAM for shared prompt prefixes (system turns, "
+                    "instructions, few-shot examples): read once, then copied onto each request that begins with one (0: off). "
+                    "A prefix takes 0.42 MB a token up to 1,024 tokens; the same reply tokens as reading it")
     ap.add_argument("--typical", type=int, default=2048, help="tokens of a typical conversation: how the keys and values are split "
                     "between the two kinds of layer")
     ap.add_argument("--max-tokens", type=int, default=4096, help="the most tokens of a reply when the request does not say (thinking included)")
@@ -581,7 +666,9 @@ def main() -> None:
     ap.add_argument("--keyless", action="store_true", help="long conversations: the ten full-attention layers keep their values only and "
                     "the keys are made of them when read: 21 KB a token past 1,024 tokens for 41 (a conversation of 40,960 tokens 1.2 GiB "
                     "for 2.0); other bits than without it, of the same precision")
+    E.add_int8_option(ap)
     cli = ap.parse_args()
+    E.use_int8_option(cli)  # the whole engine: every request's rows on the integer products, so a reply's bits do not depend on its neighbours
     import sys
 
     import transformers
@@ -613,7 +700,7 @@ def main() -> None:
         eng = E.Engine.load(cli.name, plan, cli.head, context, sequences=cli.sequences, pool=pool, rows=cli.rows, keyless=cli.keyless)
         drafter = None if cli.no_drafter else E.EngineDrafter.load(eng, ckpt("drafter"), cli.name, depth=DEPTH)
     stop = (tok.eos_token_id, tok.convert_tokens_to_ids("<turn|>"), tok.convert_tokens_to_ids("<|tool_response>"))
-    server = Server(tok, eng, drafter, stop, ram=int(cli.ram_gib * 2**30))
+    server = Server(tok, eng, drafter, stop, ram=int(cli.ram_gib * 2**30), prefix_ram=int(cli.prefix_gib * 2**30))
     bits = round(P.bits_per_weight(cfg, plan), 2)
     one = E.tile_bytes(cfg, M.SLIDING) * E.ring_tiles(cfg, M.SLIDING, context, cli.rows) + E.tile_bytes(cfg, M.FULL, cli.keyless) * typical // E.TILE
     facts = {"bits_per_weight": bits, "kl_estimate": None if estimate is None else round(estimate, 3),

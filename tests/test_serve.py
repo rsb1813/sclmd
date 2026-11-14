@@ -246,3 +246,67 @@ def test_requests_are_told_when_the_engines_thread_fails(small_e):  # noqa: F811
             break
         tokens.append(event[1])
     assert event[0] == "done" and tokens == fresh(small_e, ids_of(12, 171), 8, hot())
+
+
+def test_a_shared_prefix_is_read_once_and_gives_the_same_replies(small_e, drafter_e):  # noqa: F811
+    for size in (20, 50):  # 50: longer than the sliding layers' ring (32 positions)
+        eng = small_e.engine(sequences=4)
+        server = Server(None, eng, engine_drafter(eng, drafter_e), STOP, prefix_ram=1 << 30)
+        system = ids_of(size, 180 + size)
+        fulls = [system + ids_of(5 + i, 190 + i) + [5, 6] for i in range(6)]
+        reqs = [Request(f, len(f) - 1, 12, hot(i), False, cut=size) for i, f in enumerate(fulls[:3])]
+        for r in reqs:  # three at once: none is held yet, the first to have read it keeps it
+            server.submit(r)
+        got = finish(server, *reqs)
+        assert server.prefixes.stored == 1 and list(server.prefixes.held) == [tuple(system)]
+        later = []
+        for i, f in enumerate(fulls[3:], 3):  # one after the other: each one reads only its own part
+            req = Request(f, len(f) - 1, 12, hot(i), False, cut=size)
+            server.submit(req)
+            later += finish(server, req)
+            assert req.reused == size
+        for (tokens, result), f, i in zip(got + later, fulls, range(6)):
+            assert tokens == fresh(small_e, f, 12, hot(i)), (size, i)
+        assert server.prefixes.hits == 3
+
+
+def test_prefixes_give_way_to_newer_ones_and_off_means_none(small_e):  # noqa: F811
+    eng = small_e.engine(sequences=2)
+    one = E.tile_bytes(small_e.cfg, M.SLIDING) + E.tile_bytes(small_e.cfg, M.FULL)
+    server = Server(None, eng, None, STOP, prefix_ram=3 * one)  # room for one prefix of 20 tokens (2 tiles of each kind)
+    for i in range(3):
+        system = ids_of(20, 200 + i)
+        f = system + ids_of(6, 210 + i) + [5, 6]
+        (tokens, _), = finish(server, ask_cut(server, f, 20))
+        assert tokens == fresh(small_e, f, 8, hot())
+        assert list(server.prefixes.held) == [tuple(system)]
+    tight = Server(None, small_e.engine(sequences=2), None, STOP, prefix_ram=one)  # smaller than any prefix: none is saved
+    f = ids_of(20, 225) + ids_of(6, 226) + [5, 6]
+    (tokens, _), = finish(tight, ask_cut(tight, f, 20))
+    assert tokens == fresh(small_e, f, 8, hot()) and not tight.prefixes.held and tight.prefixes.too_big == {tuple(f[:20])}
+    off = Server(None, small_e.engine(sequences=2), None, STOP)
+    f = ids_of(20, 220) + ids_of(6, 221) + [5, 6]
+    for _ in range(2):
+        (tokens, r), = finish(off, ask_cut(off, f[:20] + ids_of(6, 222 + _) + [5, 6], 20))
+        assert r["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
+    assert not off.prefixes.held
+
+
+def ask_cut(server: Server, full: list, cut: int) -> Request:
+    req = Request(full, len(full) - 1, 8, hot(), False, cut=cut)
+    server.submit(req)
+    return req
+
+
+def test_requests_that_begin_with_a_kept_prefix_wait_for_room_instead_of_reading_it(small_e):  # noqa: F811
+    eng = small_e.engine(sequences=4, pool={M.SLIDING: 5, M.FULL: 8})  # keys and values for about two such texts at once
+    server = Server(None, eng, None, STOP, prefix_ram=1 << 30)
+    system = ids_of(20, 230)
+    first = system + ids_of(6, 231) + [5, 6]
+    finish(server, ask_cut(server, first, 20))
+    assert server.prefixes.stored == 1
+    fulls = [system + ids_of(5 + i, 240 + i) + [5, 6] for i in range(4)]
+    reqs = [ask_cut(server, f, 20) for f in fulls]  # four at once: two have to wait
+    for (tokens, result), f in zip(finish(server, *reqs), fulls):
+        assert tokens == fresh(small_e, f, 8, hot()) and result["usage"]["prompt_tokens_details"]["cached_tokens"] == 20
+    assert server.prefixes.hits == 4 and server.prefixes.waits > 0
