@@ -3,7 +3,8 @@
 # Stands alone (no project imports):
 #   python -I scripts/task_eval_prepare.py --flores <folder with eng_Latn.devtest and kor_Hang.devtest> --out data/task_eval
 #   python -I scripts/task_eval_prepare.py --set v2 --gsm8k <data/bench/items/gsm8k.jsonl>   (items_v2.jsonl; see v2 below)
-#   python -I scripts/task_eval_prepare.py --set cjk --flores <folder with kor_Hang, jpn_Jpan, zho_Hans .devtest>   (items_cjk.jsonl)
+#   python -I scripts/task_eval_prepare.py --set cjk --flores <folder with kor_Hang, jpn_Jpan, zho_Hans .devtest>   (items_cjk.jsonl:
+#   Japanese and Chinese into Korean)
 # FLORES-200's devtest (CC BY-SA 4.0, github.com/facebookresearch/flores) gives sentences with human translations;
 # the records and lists are made here from a fixed seed; the word problems are GSM8K's as the benchmarks prepared them.
 # Kinds: tr_en_ko, tr_ko_en (150 each), extract (60 records -> JSON), lists (40: sort, keep the even ones),
@@ -143,12 +144,11 @@ def v2_items(gsm8k: str) -> list:
     return items
 
 
-# ---- cjk: translation between Korean and Japanese / Chinese (scripts/task_eval.py --set cjk), the owner's other language
-# pairs. FLORES-200 devtest sentences that v1 does not use (v1 takes 330 of the 1,012), 100 a kind, a fixed seed:
-# tr_ja_ko, tr_ko_ja, tr_zh_ko, tr_ko_zh (Chinese in simplified characters), scored by chrF like v1's translations.
+# ---- cjk: Japanese and Chinese (simplified) into Korean (scripts/task_eval.py --set cjk). The owner's translation work
+# goes one way, into Korean (from English, Japanese, Chinese), so only that direction is asked. FLORES-200 devtest
+# sentences that v1 does not use (v1 takes 330 of the 1,012), 150 a kind like v1, a fixed seed: tr_ja_ko, tr_zh_ko,
+# scored by chrF against the human Korean translation like v1's.
 TO_KO = "다음 문장을 한국어로 번역해 줘. 번역문만 써.\n\n{src}"
-KO_JA = "다음 문장을 일본어로 번역해 줘. 번역문만 써.\n\n{src}"
-KO_ZH = "다음 문장을 중국어(간체)로 번역해 줘. 번역문만 써.\n\n{src}"
 
 
 def cjk_items(flores: str) -> list:
@@ -160,12 +160,11 @@ def cjk_items(flores: str) -> list:
     assert len(ko) == len(ja) == len(zh) == 1012
     used = set(random.Random(7).sample(range(1012), 330))  # v1's sentences (the same draw as v1 below)
     free = [i for i in range(1012) if i not in used]
-    order = random.Random(11).sample(free, 400)
+    order = random.Random(11).sample(free, 300)
     items = []
-    for kind, idx, src, gold, ask in (("tr_ja_ko", order[0:100], ja, ko, TO_KO), ("tr_ko_ja", order[100:200], ko, ja, KO_JA),
-                                      ("tr_zh_ko", order[200:300], zh, ko, TO_KO), ("tr_ko_zh", order[300:400], ko, zh, KO_ZH)):
+    for kind, idx, src in (("tr_ja_ko", order[:150], ja), ("tr_zh_ko", order[150:], zh)):
         for i in idx:
-            items.append({"id": f"cjk/{kind}/{i}", "kind": kind, "prompt": ask.format(src=src[i]), "gold": gold[i]})
+            items.append({"id": f"cjk/{kind}/{i}", "kind": kind, "prompt": TO_KO.format(src=src[i]), "gold": ko[i]})
     return items
 
 
