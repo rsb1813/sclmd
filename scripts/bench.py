@@ -35,10 +35,10 @@ def seed_of(task: str, item: str, run: int) -> int:
 
 
 class Replier:
-    def __init__(self, name: str, plan_path: str, capacity: int, drafter: bool = True):
+    def __init__(self, name: str, plan_path: str, capacity: int, drafter: bool = True, rows: int = 8):
         self.tok = tok = AutoTokenizer.from_pretrained(ckpt("orig"))
         plan, head = P.read(plan_path)
-        self.eng = E.Engine.load(name, plan, head or 8, capacity)
+        self.eng = E.Engine.load(name, plan, head or 8, capacity, rows=rows)
         self.drafter = E.EngineDrafter.load(self.eng, ckpt("drafter"), name, depth=DEPTH) if drafter else None
         self.stop = (tok.eos_token_id, tok.convert_tokens_to_ids("<turn|>"), tok.convert_tokens_to_ids("<|tool_response>"))
         self.open, self.close = tok.convert_tokens_to_ids("<|channel>"), tok.convert_tokens_to_ids("<channel|>")
@@ -55,6 +55,8 @@ class Replier:
         t = time.perf_counter()
         eng.crop(0)
         logits, hidden = eng.feed(prompt, keep="last")
+        torch.cuda.synchronize()
+        read = time.perf_counter() - t  # the prompt's reading (one wait a reply, outside the token loop)
         said, looped, stats = [], [False], {}
 
         def emit(token: int) -> None:
@@ -79,7 +81,8 @@ class Replier:
         return {"id": item["id"], "answer": tok.decode(kinds["answer"], skip_special_tokens=True),
                 "think": tok.decode(kinds["think"], skip_special_tokens=True), "prompt_tokens": len(prompt), "tokens": len(said),
                 "think_tokens": len(kinds["think"]), "ended": ended, "looped": looped[0], "loop_guard": LOOP[1], "open_think": kind == "think",
-                "seconds": round(seconds, 2), "per_pass": round(stats["tokens"] / max(stats["passes"], 1), 2)}
+                "seconds": round(seconds, 2), "per_pass": round(stats["tokens"] / max(stats["passes"], 1), 2),
+                "prompt_s": round(read, 3), "passes": stats["passes"]}
 
 
 def main():

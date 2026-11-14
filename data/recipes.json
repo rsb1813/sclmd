@@ -1,0 +1,40 @@
+{
+ "about": "scripts/recipe_table.py's recipes. task / task_v2 / load are the tags of stored runs (data/task_eval, data/task_load_bench); baseline is the run with the same weights. kl and chat_tok_s are measured numbers carried by hand, with their source in note. A field left out is not measured yet.",
+ "today": "chat",
+ "today_v2": "chat",
+ "recipes": [
+  {
+   "name": "TODAY (default)",
+   "options": "chat plan fit_own_v1_11.9 (3.48 bits), exact acceptance, 8-row chat pass",
+   "task": "chat",
+   "baseline": "chat",
+   "task_v2": "chat",
+   "load": "load_today",
+   "kl": "0.0386, first choice 96.5% (eval_codes, data/own_v2_codes_v1_fit_own_v1_11.9.json)",
+   "chat_tok_s": "163.6 (speed_check --chat)",
+   "note": "the bit gates hold here: bits_check --against base, speed_check ALL THE SAME TOKENS, serve_bench --check. The server's default (load_today) is already 3.0 bits a weight and 32 rows: the same load columns as SAFE"
+  },
+  {
+   "name": "SAFE",
+   "options": "all matrices at 3 bits (data/plans/c6.json) + greedy; configuration only",
+   "task": "c6",
+   "baseline": "c6",
+   "task_v2": "c6",
+   "note": "task_eval 2026-11-14: 38.6 / 61.9 / 100% / 98.3%, 126 tok/s; against today ko->en -0.96 chrF [-1.54, -0.44]: a measurable loss that FAILS the bar (lower bound > -1.0) against today; v2: lost 2 sorting items (lists/84, lists/88), gsm8k 1 lost 1 won",
+   "load": "load_today",
+   "kl": "0.1135, first choice 93.9% (eval_codes, data/own_v2_codes_v1_c6_head8.json)"
+  },
+  {
+   "name": "BALANCED",
+   "options": "SAFE + B1 --int8 + B2 wide rows + B3 --margin D (the D task_eval accepts)",
+   "baseline": "c6",
+   "note": "waits for B1, B2, B3"
+  },
+  {
+   "name": "AGGRESSIVE",
+   "options": "BALANCED + B7 2.5 bits a weight",
+   "baseline": "c6",
+   "note": "waits for B7 (an overnight re-quantizing job)"
+  }
+ ]
+}
