@@ -74,7 +74,7 @@ def main():
                 token = int(logits.argmax())
                 sums.append(["guess", at, step, token] + bits(logits) + bits(hidden))
     for kind, group in eng.kv_all.items():
-        for name, t in zip(("keys", "values", "key scales", "value scales"), group):
+        for name, t in zip(("keys", "values", "key scales", "value scales") if len(group) == 4 else ("values", "value scales"), group):
             sums.append([f"{kind} {name}"] + bits(t))
     digest = hashlib.sha1(json.dumps(sums).encode()).hexdigest()[:16]
     print(f"[bits] {len(sums)} outputs up to position {at}: {digest}", flush=True)

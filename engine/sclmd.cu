@@ -66,14 +66,17 @@ struct Layer {
     // its scale, the largest of them 127. A sequence is given tiles from the pool as it grows: tiles[sequence * ring
     // + j] is the pool tile that holds its positions 16j .. 16j + 15, j taken modulo `ring` (the table is shared by
     // the layers of a kind).
+    // keys == null: the layer keeps its values only (its value is its key's projection), and the scores make its
+    // keys of them (scores_made32_k) with `trig` and `turned`.
     int8_t *keys, *values;
     const int32_t* tiles;
     float *kscale, *vscale;
+    const uint16_t* trig;  // [capacity][turned][2] cos and sin (fp16) of position * inv_freq[pair]
     float scalar;
     int full;      // 1: attends to every earlier position; 0: to the last `window`
     int head_dim, kv_heads;
     int ring;      // sliding: (window + spare) / 16, so positions go round; full: capacity / 16
-    int pad;
+    int turned;    // the rotated pairs, in whole 16s: the first `turned` values of each half of a head are turned
 };
 
 struct Model {
@@ -380,14 +383,18 @@ __global__ void gemm_k(Mat m0, Mat m1, Mat m2, float* y0, float* y1, float* y2, 
 // The rotary position turns pair (d, d + head_dim / 2) by pos * inv_freq[d]. The token's position and sequence are
 // its segment's (a.pos0: the position of the segment's first row). A key or value is kept as int8: the vector divided
 // by its scale (its largest size over 127) and rounded.
+// fold (a layer that keeps no keys: its k_norm, or the k_norm of the layer the drafter reads): the key is the value
+// times k_norm, turned; where scores read the value itself as the key (the 16s of a head past the first `nturn` values
+// of each half, which are not turned) k_norm is put on the query instead.
 __global__ void heads_k(const float* yq, const float* yk, const float* yv, const float* q_norm, const float* k_norm, const float* inv_freq,
                         uint16_t* qhat, int8_t* keys, int8_t* values, float* kscale, float* vscale, const int32_t* tiles, Att a, int heads,
-                        int kvh, int ring, float eps) {
+                        int kvh, int ring, float eps, const float* fold, int nturn) {
     const int hd = blockDim.x, v = blockIdx.x, token = blockIdx.y, d = threadIdx.x, half = hd / 2;
     const int kind = v < heads ? 0 : v < heads + kvh ? 1 : 2, head = kind == 0 ? v : kind == 1 ? v - heads : v - heads - kvh;
     const float* src = kind == 0 ? yq + (size_t(token) * heads + head) * hd
                                  : (kind == 1 || !yv ? yk : yv) + (size_t(token) * kvh + head) * hd;
     __shared__ float buf[1024];
+    if (kind == 1 && !keys) return;  // the layer keeps no keys
     const float val = src[d];
     const float r = powf(block_sum(val * val) / hd + eps, -0.5f);
     const int seg = seg_of_row(a, token), pos = a.pos0[seg] + token - a.row0[seg];
@@ -404,7 +411,8 @@ __global__ void heads_k(const float* yq, const float* yk, const float* yv, const
     const float turned = d < half ? -buf[d + half] : buf[d - half];
     const float out = buf[d] * cosf(ang) + turned * sinf(ang);
     if (kind == 0) {
-        qhat[(size_t(token) * heads + head) * hd + d] = __half_as_ushort(__float2half(out));
+        const float q = fold && (d & ~15) % half >= nturn ? out * fold[d] : out;
+        qhat[(size_t(token) * heads + head) * hd + d] = __half_as_ushort(__float2half(q));
         return;
     }
     const float most = block_max(fabsf(out)), scale = most > 0 ? most / 127.0f : 1.0f;
@@ -423,12 +431,12 @@ __global__ void heads_k(const float* yq, const float* yk, const float* yv, const
 
 // Scores = query . key: block (position tile of a segment, key head). The keys are int8: the sums are of the int8
 // values (as fp16), and a position's sum is multiplied by its key's scale.
-// STEPS steps of a query group's sum over a head's values, from value j on, while as many are left: the loads of all
-// of them, then the products in order.
+// STEPS steps of a query group's sum over a head's values, from value j on up to value `to`, while as many are left:
+// the loads of all of them, then the products in order.
 template <int STEPS>
-__device__ __forceinline__ void scores_steps(float c[4], int& j, int hd, const uint16_t* table, const int8_t* ka, const int8_t* kb,
+__device__ __forceinline__ void scores_steps(float c[4], int& j, int to, const uint16_t* table, const int8_t* ka, const int8_t* kb,
                                              const uint16_t* qa, bool has) {
-    for (; j + 16 * STEPS <= hd; j += 16 * STEPS) {
+    for (; j + 16 * STEPS <= to; j += 16 * STEPS) {
         uint16_t w[STEPS][4];
         uint32_t b0[STEPS], b1[STEPS];
 #pragma unroll
@@ -443,10 +451,71 @@ __device__ __forceinline__ void scores_steps(float c[4], int& j, int hd, const u
     }
 }
 
+// The steps from value j up to `to` with the loads of up to AHEAD steps on their way together.
 template <int AHEAD>
+__device__ __forceinline__ void scores_plain(float c[4], int& j, int to, const uint16_t* table, const int8_t* ka, const int8_t* kb,
+                                             const uint16_t* qa, bool has) {
+    scores_steps<AHEAD>(c, j, to, table, ka, kb, qa, has);
+    if (AHEAD > 8) scores_steps<8>(c, j, to, table, ka, kb, qa, has);
+    if (AHEAD > 2) scores_steps<2>(c, j, to, table, ka, kb, qa, has);
+    scores_steps<1>(c, j, to, table, ka, kb, qa, has);
+}
+
+// A layer that keeps its values only (Layer::keys is null): a key is the value times k_norm, turned by its position
+// (heads_k: out = x * cos + (the value half a head away, negated in the first half) * sin). Two of a turned key's
+// values as the instruction takes them, made of the two int8 values (own), their partners half a head away (part),
+// k_norm of each (ko, kp) and the cos and sin of the position for the two pairs (tr: cos, sin, cos, sin as fp16).
+// sign: -1 in the first half of the head, +1 in the second.
+__device__ __forceinline__ uint32_t made(uint16_t own, uint16_t part, uint64_t tr, const float* ko, const float* kp, float sign) {
+    const float c0 = __half2float(__ushort_as_half(uint16_t(tr))), s0 = __half2float(__ushort_as_half(uint16_t(tr >> 16)));
+    const float c1 = __half2float(__ushort_as_half(uint16_t(tr >> 32))), s1 = __half2float(__ushort_as_half(uint16_t(tr >> 48)));
+    const float e0 = float(int8_t(own & 255)) * ko[0] * c0 + sign * (float(int8_t(part & 255)) * kp[0] * s0);
+    const float e1 = float(int8_t(own >> 8)) * ko[1] * c1 + sign * (float(int8_t(part >> 8)) * kp[1] * s1);
+    return uint32_t(__half_as_ushort(__float2half(e0))) | uint32_t(__half_as_ushort(__float2half(e1))) << 16;
+}
+
+// STEPS steps over turned values, from value j on up to `to` (all in the half of the head that starts at `first`):
+// va, vb: the values of the lane's two positions at the lane's columns (2t on); ta, tb: the positions' cos and sin,
+// two pairs a word; kn: k_norm of the turned values (the first half's, then the second's).
+template <int STEPS>
+__device__ __forceinline__ void scores_made(float c[4], int& j, int to, int first, int half, int turned, const int8_t* va, const int8_t* vb,
+                                            const uint64_t* ta, const uint64_t* tb, const float* kn, int t, const uint16_t* qa, bool has) {
+    const int other = first ? -half : half;
+    const float sign = first ? 1.0f : -1.0f;
+    const float *ko = kn + (first ? turned : 0) + 2 * t, *kp = kn + (first ? 0 : turned) + 2 * t;
+    for (; j + 16 * STEPS <= to; j += 16 * STEPS) {
+        uint16_t w[STEPS][4], x[STEPS][4];
+        uint64_t tr[STEPS][4];
+        uint32_t b0[STEPS], b1[STEPS];
+#pragma unroll
+        for (int u = 0; u < STEPS; ++u) {
+            const int at = j + 16 * u, i = ((at - first) >> 1) + t;
+            w[u][0] = *(const uint16_t*)(va + at), w[u][1] = *(const uint16_t*)(vb + at);
+            w[u][2] = *(const uint16_t*)(va + at + 8), w[u][3] = *(const uint16_t*)(vb + at + 8);
+            x[u][0] = *(const uint16_t*)(va + at + other), x[u][1] = *(const uint16_t*)(vb + at + other);
+            x[u][2] = *(const uint16_t*)(va + at + other + 8), x[u][3] = *(const uint16_t*)(vb + at + other + 8);
+            tr[u][0] = ta[i], tr[u][1] = tb[i], tr[u][2] = ta[i + 4], tr[u][3] = tb[i + 4];
+            b0[u] = has ? *(const uint32_t*)(qa + at) : 0, b1[u] = has ? *(const uint32_t*)(qa + at + 8) : 0;
+        }
+#pragma unroll
+        for (int u = 0; u < STEPS; ++u) {
+            const int p = j + 16 * u - first;
+            mma(c, made(w[u][0], x[u][0], tr[u][0], ko + p, kp + p, sign), made(w[u][1], x[u][1], tr[u][1], ko + p, kp + p, sign),
+                made(w[u][2], x[u][2], tr[u][2], ko + p + 8, kp + p + 8, sign), made(w[u][3], x[u][3], tr[u][3], ko + p + 8, kp + p + 8, sign),
+                b0[u], b1[u]);
+        }
+    }
+}
+
+// MADE: the layer keeps no keys: `keys` and `kscale` are its values and their scales, and the keys are made of them.
+template <int AHEAD, bool MADE>
 __device__ __forceinline__ void scores_body(const uint16_t* qhat, const int8_t* keys, const float* kscale, float* scores, const int32_t* tiles,
-                                            const Att& a, int heads, int kvh, int hd, int ring) {
+                                            const Att& a, int heads, int kvh, int hd, int ring, const uint16_t* trig = nullptr,
+                                            const float* k_norm = nullptr, int turned = 0) {
     __shared__ uint16_t table[256];
+    __shared__ float kn[MADE ? 256 : 1];
+    if (MADE)
+        for (int i = threadIdx.x; i < 2 * turned; i += blockDim.x) kn[i] = k_norm[i < turned ? i : hd / 2 + i - turned];
     fill_table(table);
     int seg = 0;
     for (int i = 1; i < a.n; ++i)
@@ -466,10 +535,18 @@ __device__ __forceinline__ void scores_body(const uint16_t* qhat, const int8_t* 
     const uint16_t* qa = qhat + (size_t(a.row0[seg] + (has ? query / rep : 0)) * heads + kh * rep + (has ? query % rep : 0)) * hd + 2 * t;
     float c[4] = {0, 0, 0, 0};
     int j = 0;
-    scores_steps<AHEAD>(c, j, hd, table, ka, kb, qa, has);
-    if (AHEAD > 8) scores_steps<8>(c, j, hd, table, ka, kb, qa, has);
-    if (AHEAD > 2) scores_steps<2>(c, j, hd, table, ka, kb, qa, has);
-    scores_steps<1>(c, j, hd, table, ka, kb, qa, has);
+    if (MADE) {
+        const int half = hd / 2, pos = a.base[seg] + 16 * tile + g;
+        const uint64_t* ta = (const uint64_t*)(trig + size_t(pos) * turned * 2);
+        const uint64_t* tb = (const uint64_t*)(trig + size_t(pos + 8) * turned * 2);
+        for (int first = 0; first < hd; first += half) {
+            scores_made<4>(c, j, first + turned, first, half, turned, ka, kb, ta, tb, kn, t, qa, has);
+            scores_made<1>(c, j, first + turned, first, half, turned, ka, kb, ta, tb, kn, t, qa, has);
+            scores_plain<AHEAD>(c, j, first + half, table, ka, kb, qa, has);
+        }
+    } else {
+        scores_plain<AHEAD>(c, j, hd, table, ka, kb, qa, has);
+    }
     float* out = scores + a.off[seg];
     const float sa = kscale[(slot + g) * kvh + kh], sb = kscale[(slot + g + 8) * kvh + kh];
     for (int i = 0; i < 4; ++i) {  // c[i]: position of the tile g (+ 8), query group * 8 + 2t (+ 1)
@@ -478,13 +555,15 @@ __device__ __forceinline__ void scores_body(const uint16_t* qhat, const int8_t* 
     }
 }
 
-#define SCORES_K(NAME, AHEAD, BOUND)                                                                                                    \
-    __global__ void BOUND NAME(const uint16_t* qhat, const int8_t* keys, const float* kscale, float* scores, const int32_t* tiles, Att a, \
-                               int heads, int kvh, int hd, int ring) {                                                                  \
-        scores_body<AHEAD>(qhat, keys, kscale, scores, tiles, a, heads, kvh, hd, ring);                                                 \
-    }
-SCORES_K(scores32_k, 32, )
-#undef SCORES_K
+__global__ void scores32_k(const uint16_t* qhat, const int8_t* keys, const float* kscale, float* scores, const int32_t* tiles, Att a, int heads,
+                           int kvh, int hd, int ring) {
+    scores_body<32, false>(qhat, keys, kscale, scores, tiles, a, heads, kvh, hd, ring);
+}
+
+__global__ void scores_made32_k(const uint16_t* qhat, const int8_t* values, const float* vscale, float* scores, const int32_t* tiles, Att a,
+                                int heads, int kvh, int hd, int ring, const uint16_t* trig, const float* k_norm, int turned) {
+    scores_body<32, true>(qhat, values, vscale, scores, tiles, a, heads, kvh, hd, ring, trig, k_norm, turned);
+}
 
 // The softmax of a query's scores over the positions it may read, as fp16 in the same layout: block (query of the
 // pass, key head). A row at position pos reads positions up to its own, and with a window the last `window` of them.
@@ -690,10 +769,14 @@ static int tiles_of(const Att& a) { return a.tile0[a.n - 1] + a.stride[a.n - 1] 
 static const int GROUPS_A_BLOCK = 8;
 
 // The two attention kernels with a warp for each of `groups` groups of eight queries.
-static void scores(int tiles, int kvh, int groups, const uint16_t* qhat, const int8_t* keys, const float* kscale, float* out, const int32_t* table,
-                   const Att& a, int heads, int hd, int ring) {
+static void scores(int tiles, int groups, const uint16_t* qhat, const Layer& l, float* out, const Att& a, int heads) {
     const int per = groups > GROUPS_A_BLOCK ? GROUPS_A_BLOCK : groups;
-    scores32_k<<<dim3(tiles, kvh, (groups + per - 1) / per), 32 * per>>>(qhat, keys, kscale, out, table, a, heads, kvh, hd, ring);
+    const dim3 grid(tiles, l.kv_heads, (groups + per - 1) / per);
+    if (l.keys)
+        scores32_k<<<grid, 32 * per>>>(qhat, l.keys, l.kscale, out, l.tiles, a, heads, l.kv_heads, l.head_dim, l.ring);
+    else
+        scores_made32_k<<<grid, 32 * per>>>(qhat, l.values, l.vscale, out, l.tiles, a, heads, l.kv_heads, l.head_dim, l.ring, l.trig, l.k_norm,
+                                            l.turned);
 }
 
 static void attend(int groups, const uint16_t* probs, const int8_t* values, float* out, const int32_t* table, const Att& a, int heads, int kvh,
@@ -763,9 +846,10 @@ static int pass(const Model* mp, int tokens, const Segs* segs, int logits_from) 
         const Att a = att_for(*segs, l.full, m.heads, m.window - 1);
         const int rep = m.heads / kvh, groups = (rep * a.most + 7) / 8;
         heads_k<<<dim3(m.heads + 2 * kvh, tokens), hd>>>(yq, yk, l.v.rows ? yv : nullptr, l.q_norm, l.k_norm, l.inv_freq, m.qhat, l.keys,
-                                                       l.values, l.kscale, l.vscale, l.tiles, a, m.heads, kvh, l.ring, m.eps);
+                                                       l.values, l.kscale, l.vscale, l.tiles, a, m.heads, kvh, l.ring, m.eps,
+                                                       l.keys ? nullptr : l.k_norm, l.turned);
         tick(P_HEADS);
-        scores(tiles_of(a), kvh, groups, m.qhat, l.keys, l.kscale, m.scores, l.tiles, a, m.heads, hd, l.ring);
+        scores(tiles_of(a), groups, m.qhat, l, m.scores, a, m.heads);
         tick(P_SCORES);
         softmax_k<<<dim3(rep * tokens, kvh), 256>>>(m.scores, m.probs, l.vscale, l.tiles, a, m.heads, kvh, l.full ? 0 : m.window, l.ring);
         tick(P_SOFTMAX);
@@ -872,9 +956,10 @@ API int sclmd_draft(const Drafter* dp, const Layer* sliding, const Layer* full, 
         if (owed.y) std::swap(h, spare);
         gemm(d.xf, d.fps, rows, l.q, d.y);
         heads_k<<<dim3(d.heads, rows), hd>>>(d.y, nullptr, nullptr, l.q_norm, nullptr, l.inv_freq, d.qhat, nullptr, nullptr, nullptr, nullptr,
-                                             nullptr, att_for(at, true, d.heads, 0), d.heads, kvh, 1, d.eps);
+                                             nullptr, att_for(at, true, d.heads, 0), d.heads, kvh, 1, d.eps, src.keys ? nullptr : src.k_norm,
+                                             src.turned);
         const Att a = att_for(read, l.full, d.heads, window);
-        scores(tiles_of(a), kvh, groups, d.qhat, src.keys, src.kscale, d.scores, src.tiles, a, d.heads, hd, src.ring);
+        scores(tiles_of(a), groups, d.qhat, src, d.scores, a, d.heads);
         softmax_k<<<dim3(rep * rows, kvh), 256>>>(d.scores, d.probs, src.vscale, src.tiles, a, d.heads, kvh, l.full ? 0 : window + 1, src.ring);
         attend(groups, d.probs, src.values, d.attn, src.tiles, a, d.heads, kvh, hd, src.ring);
         prep(d, rows, d.attn, nullptr, nullptr, d.heads * hd, l.rot_o, 1);

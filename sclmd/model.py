@@ -155,7 +155,8 @@ def attend(cfg: Config, layer_type: str, q: torch.Tensor, k: torch.Tensor, v: to
 
 
 def layer_forward(cfg: Config, i: int, w: dict, h: torch.Tensor, positions: torch.Tensor, cache: Cache | None = None,
-                  shared: dict | None = None, tap=None, linear=F.linear, see: tuple | None = None, rounded=None, kept=None) -> torch.Tensor:
+                  shared: dict | None = None, tap=None, linear=F.linear, see: tuple | None = None, rounded=None, kept=None,
+                  made: bool = False) -> torch.Tensor:
     """One decoder layer over h [batch, n, hidden] at `positions` [n].
     see: (positions, window) the mask uses instead of the queries' own (the drafter: it sits one position past the
          last key it may read).
@@ -165,6 +166,8 @@ def layer_forward(cfg: Config, i: int, w: dict, h: torch.Tensor, positions: torc
     tap(name, tensor): called with the input of each group of matrices ("attn_in", "o_in", "mlp_in", "down_in").
     linear(x, weight): the matrix product; quantized paths pass their own.
     kept(tensor): applied to the new keys and values instead of `rounded` (the engine keeps them as int8 with a scale).
+    made: as an engine with keyless=True: of a layer whose value is its key's projection only the value is kept, and
+        the key is made of the kept value.
     rounded(tensor): applied to what attention multiplies: the queries, keys, values and weights (the engine keeps
         them as fp16; a test of it passes that rounding)."""
     t = cfg.layer_types[i]
@@ -183,10 +186,16 @@ def layer_forward(cfg: Config, i: int, w: dict, h: torch.Tensor, positions: torc
     else:
         k = linear(x, w["k"]).view(b, n, kvh, hd)
         v = linear(x, w["v"]).view(b, n, kvh, hd) if "v" in w else k
-        k = rotate(rms_norm(k, w["k_norm"], cfg.eps), cos, sin).transpose(1, 2)
-        v = rms_norm(v, None, cfg.eps).transpose(1, 2)
-        if kept is not None or rounded is not None:
-            k, v = (kept or rounded)(k), (kept or rounded)(v)
+        if kept is not None and made and "v" not in w:
+            # a keyless engine keeps such a layer's value only, and makes the key of what it kept: the value times k_norm, turned
+            v = kept(rms_norm(v, None, cfg.eps))
+            k = rotate((v.float() * w["k_norm"].float()).type_as(v), cos, sin).transpose(1, 2)
+            v = v.transpose(1, 2)
+        else:
+            k = rotate(rms_norm(k, w["k_norm"], cfg.eps), cos, sin).transpose(1, 2)
+            v = rms_norm(v, None, cfg.eps).transpose(1, 2)
+            if kept is not None or rounded is not None:
+                k, v = (kept or rounded)(k), (kept or rounded)(v)
         kv_pos = positions
         if cache is not None:
             k, v = cache.extend(i, k, v)

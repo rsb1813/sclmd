@@ -2,6 +2,7 @@
 # The reference gets the same stored matrices and the engine's roundings (a matrix's input, attention's queries and
 # weights are fp16; the kept keys and values are int8 with a scale a vector), so what is left between the two is the
 # order of float32 sums.
+import copy
 import os
 
 import pytest
@@ -68,8 +69,8 @@ BOOST = 4096.0  # the engine's attention weights are kept times this (engine/scl
 class Reference:
     """The reference decoder over stored matrices. The same four things generation asks of the engine."""
 
-    def __init__(self, cfg, layers, head, norm, embed):
-        self.cfg, self.layers, self.head, self.norm, self.table = cfg, layers, head, norm, embed
+    def __init__(self, cfg, layers, head, norm, embed, made=False):
+        self.cfg, self.layers, self.head, self.norm, self.table, self.made = cfg, layers, head, norm, embed, made
         self.cache, self.shared = M.Cache(), {}
 
     def embed(self, ids):
@@ -80,7 +81,7 @@ class Reference:
         pos = torch.arange(start, start + len(ids), device=DEV)
         h = self.embed(ids)[None]
         for i, w in enumerate(self.layers):
-            h = M.layer_forward(cfg, i, w, h, pos, self.cache, self.shared, linear=lambda x, m: m(x), rounded=fp16, kept=int8)
+            h = M.layer_forward(cfg, i, w, h, pos, self.cache, self.shared, linear=lambda x, m: m(x), rounded=fp16, kept=int8, made=self.made)
         self.cache.length = start + len(ids)
         hn = M.rms_norm(h[0], self.norm, cfg.eps)
         logits = self.head(hn)
@@ -106,17 +107,26 @@ class Small:
             self.eng_layers.append(rest | {"mats": {name: m.stored() for name, m in mats.items()}})
         self.embed, self.norm = state["model.embed_tokens.weight"], state["model.norm.weight"]
         self.head = Stored(self.embed, 6)
+        self.keyless = False  # engines whose full-attention layers keep their values only (and the reference as they do)
 
     def engine(self, capacity: int = 96, **more) -> E.Engine:
-        return E.Engine(self.cfg, self.eng_layers, self.head.stored(), self.norm, self.embed, capacity=capacity, **more)
+        return E.Engine(self.cfg, self.eng_layers, self.head.stored(), self.norm, self.embed, capacity=capacity, keyless=self.keyless, **more)
 
     def reference(self) -> Reference:
-        return Reference(self.cfg, self.ref_layers, self.head, self.norm, self.embed)
+        return Reference(self.cfg, self.ref_layers, self.head, self.norm, self.embed, self.keyless)
 
 
-@pytest.fixture(scope="module")
-def small_e():
-    return Small()
+_SMALL = []
+
+
+# every test of the engine runs twice: with keys kept in every layer, and keyless
+@pytest.fixture(scope="module", params=[False, True], ids=["keys", "keyless"])
+def small_e(request):
+    if not _SMALL:
+        _SMALL.append(Small())
+    one = copy.copy(_SMALL[0])
+    one.keyless = request.param
+    return one
 
 
 def ids_of(n: int, seed: int) -> list:
@@ -170,8 +180,9 @@ def test_attention_kernels_against_pytorch_on_the_engines_own_buffers(small_e):
     for i in (1, 2):  # a sliding layer and a full-attention one
         t = base.layer_types[i]
         cfg = M.Config(**{**vars(base), "n_layers": 1, "layer_types": [t]})
-        eng = E.Engine(cfg, [small_e.eng_layers[i]], small_e.head.stored(), small_e.norm, small_e.embed, capacity=96)
-        hd, kvh, heads, slots = cfg.head_dim[t], cfg.kv_heads[t], cfg.heads, eng.kv[0][0].shape[0]
+        eng = E.Engine(cfg, [small_e.eng_layers[i]], small_e.head.stored(), small_e.norm, small_e.embed, capacity=96, keyless=small_e.keyless)
+        hd, kvh, heads, slots = cfg.head_dim[t], cfg.kv_heads[t], cfg.heads, eng.kv[0][1].shape[0]
+        fold = eng.folded(0)  # a layer that keeps no keys has k_norm on its queries where the key is the value itself
         rep, pos = heads // kvh, 0
         for n in (1, 1, 8, 3, 8, 8, 8, 5):
             eng.h[:n] = (torch.randn(n, base.hidden, generator=g) * 3).to(DEV)
@@ -180,6 +191,8 @@ def test_attention_kernels_against_pytorch_on_the_engines_own_buffers(small_e):
             first_tile = lo & ~15
             stride, nq = ((pos + n - 1 >> 4) + 1) * 16 - first_tile, rep * n
             q = eng.work["qhat"].view(-1)[: n * heads * hd].view(n, heads, hd).double()
+            if fold is not None:
+                q = q / fold.double()
             scores = eng.work["scores"][: kvh * nq * stride].view(kvh, nq, stride)
             probs = eng.work["probs"][: kvh * nq * stride].view(kvh, nq, stride)
             attn = eng.work["attn"].view(-1)[: n * heads * hd].view(n, heads, hd).double()
@@ -206,7 +219,7 @@ def test_each_layer_alone_matches_the_reference_on_the_same_inputs(small_e):
     for i in range(base.n_layers):
         t = base.layer_types[i]
         cfg = M.Config(**{**vars(base), "n_layers": 1, "layer_types": [t]})
-        eng = E.Engine(cfg, [small_e.eng_layers[i]], small_e.head.stored(), small_e.norm, small_e.embed, capacity=96)
+        eng = E.Engine(cfg, [small_e.eng_layers[i]], small_e.head.stored(), small_e.norm, small_e.embed, capacity=96, keyless=small_e.keyless)
         cache, taps, pos, width = M.Cache(), {}, 0, cfg.heads * cfg.head_dim[t]
         for n in (1, 1, 8, 3, 8, 8, 8, 5):  # 42 positions: past a sliding layer's ring of 32
             h = (torch.randn(n, base.hidden, generator=g) * 3).to(DEV)
@@ -214,9 +227,9 @@ def test_each_layer_alone_matches_the_reference_on_the_same_inputs(small_e):
             eng.advance([(0, n)])
             positions = torch.arange(pos, pos + n, device=DEV)
             want = M.layer_forward(cfg, 0, small_e.ref_layers[i], h[None], positions, cache, linear=lambda x, m: m(x), rounded=fp16,
-                                   kept=int8, tap=lambda name, x: taps.__setitem__(name, x[0]))[0]
+                                   kept=int8, made=small_e.keyless, tap=lambda name, x: taps.__setitem__(name, x[0]))[0]
             where = (i, pos, n)
-            slot = positions % eng.kv[0][0].shape[0]
+            slot = positions % eng.kv[0][1].shape[0]
             keys, values = eng.kv_float(0)
             assert close(keys[slot].transpose(0, 1), cache.k[0][0, :, pos : pos + n], KEPT), where
             assert close(values[slot].transpose(0, 1), cache.v[0][0, :, pos : pos + n], KEPT), where

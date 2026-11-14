@@ -4,7 +4,7 @@ Gemma 4 31B (dense) on a single RTX 5080 16 GB: as close to the original as the 
 Every weight sits in VRAM as 3- or 4-bit pair codes and is multiplied straight from the codes on the tensor cores; a small drafter guesses seven tokens ahead and the main model verifies them in one pass, which leaves the text unchanged.
 
 - `chat.bat`: the terminal chat (`/?` lists its commands). It picks how many matrices get 4 bits from the VRAM that is free when it starts.
-- `serve.bat`: an OpenAI-compatible server for several users at once (`http://127.0.0.1:8001/v1`; `-h` lists its options): every pass of the model carries tokens of all requests under way, 137 tok/s for one reply and 546 together for eight, and a prompt is read at about 900 tokens a second (3 bits a weight; `--kv-gib 0.68` gives the chat's 3.48 bits and room for fewer conversations).
+- `serve.bat`: an OpenAI-compatible server for several users at once (`http://127.0.0.1:8001/v1`; `-h` lists its options): every pass of the model carries tokens of all requests under way, 137 tok/s for one reply and 546 together for eight, and a prompt is read at about 900 tokens a second; `--keyless` halves what a long conversation's token takes (21 KB), for one conversation of 81,920 tokens or two of 40,960 (`--context`) (3 bits a weight; `--kv-gib 0.68` gives the chat's 3.48 bits and room for fewer conversations).
 - `design.md`: the model, the budget, and what was measured (Korean)
 - `checklist.md`: what is done and what is being done now (Korean)
 

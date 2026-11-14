@@ -26,21 +26,36 @@ def ring_tiles(cfg: M.Config, kind: str, capacity: int, rows: int = 8) -> int:
     return capacity // TILE if kind == M.FULL else -(-(cfg.window + max(SPARE, rows)) // TILE)
 
 
-def tile_bytes(cfg: M.Config, kind: str) -> int:
+def keyless_kind(kind: str, keyless: bool) -> bool:
+    """Whether the layers of a kind keep their values only in an engine made with keyless=True. A full-attention
+    layer's value is its key's projection (normalized; the key is that times k_norm, turned by the position), so the
+    scores can make the key of the kept value where they read it (engine/sclmd.cu: scores_made32_k), and a position
+    costs half the memory: 21 KB a token for 41. The key is then made of the value as it was rounded to int8, not
+    rounded by itself: other bits than an engine with keys."""
+    return keyless and kind == M.FULL
+
+
+def turned(cfg: M.Config, kind: str) -> int:
+    """The rotated pairs of a kind's heads in whole 16s: the first that many values of each half of a head are turned."""
+    return -(-cfg.rope[kind][1] // 16) * 16
+
+
+def tile_bytes(cfg: M.Config, kind: str, keyless: bool = False) -> int:
     """VRAM of one tile of a kind: 16 positions of keys and values (int8, and a float32 scale a head) in every layer
-    of the kind."""
-    return cfg.layer_types.count(kind) * TILE * cfg.kv_heads[kind] * (cfg.head_dim[kind] + 4) * 2
+    of the kind; of the values only where the layers keep no keys (keyless)."""
+    return cfg.layer_types.count(kind) * TILE * cfg.kv_heads[kind] * (cfg.head_dim[kind] + 4) * (1 if keyless_kind(kind, keyless) else 2)
 
 
-def fixed_bytes(cfg: M.Config, head_bits: int, capacity: int, pool: dict | None = None, rows: int = 8) -> int:
+def fixed_bytes(cfg: M.Config, head_bits: int, capacity: int, pool: dict | None = None, rows: int = 8, keyless: bool = False) -> int:
     """VRAM an Engine takes besides the layers' codes: the head's codes, the keys and values, the work memory.
     pool: tiles of keys and values by kind of layer (default: what one sequence of `capacity` positions can hold);
     rows: the rows of its passes."""
     head = cfg.vocab * cfg.hidden * head_bits // 16
     kinds = dict.fromkeys(cfg.layer_types)
-    kv = sum(tile_bytes(cfg, t) * (ring_tiles(cfg, t, capacity, rows) if pool is None else pool[t]) for t in kinds)
+    kv = sum(tile_bytes(cfg, t, keyless) * (ring_tiles(cfg, t, capacity, rows) if pool is None else pool[t]) for t in kinds)
     # the logits of the main model and the drafter, attention's scores and weights, and the rest
     work = 2 * rows * cfg.vocab * 4 + cfg.heads * rows * (max(capacity, cfg.window + rows) + 32) * 6 + (32 << 20)
+    work += sum(capacity * turned(cfg, t) * 4 for t in kinds if keyless_kind(t, keyless))  # cos and sin of every position
     return head + kv + work
 
 
@@ -57,8 +72,8 @@ class Layer(C.Structure):
     _fields_ = ([(m, Mat) for m in ("q", "k", "v", "o", "gate", "up", "down")] +
                 [(r, Rot) for r in ("rot_in", "rot_o", "rot_mlp", "rot_down")] +
                 [(p, C.c_void_p) for p in ("in_ln", "post_attn_ln", "pre_ff_ln", "post_ff_ln", "q_norm", "k_norm", "inv_freq", "keys", "values",
-                                           "tiles", "kscale", "vscale")] +
-                [("scalar", C.c_float), ("full", C.c_int), ("head_dim", C.c_int), ("kv_heads", C.c_int), ("ring", C.c_int), ("pad", C.c_int)])
+                                           "tiles", "kscale", "vscale", "trig")] +
+                [("scalar", C.c_float), ("full", C.c_int), ("head_dim", C.c_int), ("kv_heads", C.c_int), ("ring", C.c_int), ("turned", C.c_int)])
 
 
 class Segs(C.Structure):
@@ -149,6 +164,8 @@ def lut(book: torch.Tensor) -> torch.Tensor:
 class Engine:
     """The main model on the GPU kernels. The same four things generation asks of RefTarget (sclmd/generate.py).
 
+    keyless: the full-attention layers keep their values only (keyless_kind: half the memory a position, other bits).
+
     It holds `sequences` sequences (conversations) side by side; a pass may carry tokens of several (run). A
     sequence's keys and values sit in tiles of 16 positions handed out from a pool as it grows (KVFull when the pool
     is empty); `pool` is the tiles by kind of layer, by default what `sequences` sequences of `capacity` positions
@@ -161,7 +178,7 @@ class Engine:
     embed: the input embedding table [vocab, hidden] (any device and type; rows are fetched as needed)"""
 
     def __init__(self, cfg: M.Config, layers: list, head: tuple, norm: torch.Tensor, embed: torch.Tensor, capacity: int = 8192,
-                 device: str = "cuda", sequences: int = 1, pool: dict | None = None, rows: int = 8):
+                 device: str = "cuda", sequences: int = 1, pool: dict | None = None, rows: int = 8, keyless: bool = False):
         assert capacity % TILE == 0, "the capacity is a multiple of 16"
         assert rows in (8, 16, 32), "a pass has 8, 16 or 32 rows"
         self.cfg, self.device, self.capacity, self.sequences, self.rows = cfg, device, capacity, sequences, rows
@@ -185,11 +202,31 @@ class Engine:
         self.tables = {t: self._own(torch.zeros(sequences, self.ring[t], dtype=torch.int32, device=device)) for t in kinds}
         # Few, large allocations: PyTorch rounds each up to 2 MiB, and a tensor a matrix and a layer's keys wasted 0.57 GiB.
         # The keys and values of all layers of a kind are one tensor each: [layers of the kind, pool slots, heads, head_dim],
-        # int8, and their scales [layers, pool slots, heads]: (keys, values, keys' scales, values' scales)
-        self.kv_all = {t: tuple(self._own(torch.zeros(cfg.layer_types.count(t), self.pool[t] * TILE, cfg.kv_heads[t], cfg.head_dim[t],
-                                                      dtype=torch.int8, device=device)) for _ in range(2))
-                       + tuple(self._own(torch.zeros(cfg.layer_types.count(t), self.pool[t] * TILE, cfg.kv_heads[t], device=device)) for _ in range(2))
-                       for t in kinds}
+        # int8, and their scales [layers, pool slots, heads]: (keys, values, keys' scales, values' scales); of a kind
+        # that keeps no keys (keyless): (values, values' scales)
+        self.lean = keyless  # the option; self.keyless: by kind of layer
+        self.keyless = {t: keyless_kind(t, keyless) for t in kinds}
+
+        def kept_of(t):
+            n, slots = cfg.layer_types.count(t), self.pool[t] * TILE
+            vectors = lambda: self._own(torch.zeros(n, slots, cfg.kv_heads[t], cfg.head_dim[t], dtype=torch.int8, device=device))  # noqa: E731
+            scales = lambda: self._own(torch.zeros(n, slots, cfg.kv_heads[t], device=device))  # noqa: E731
+            return (vectors(), scales()) if self.keyless[t] else (vectors(), vectors(), scales(), scales())
+
+        self.kv_all = {t: kept_of(t) for t in kinds}
+        # what the scores make a keyless kind's keys with: the rotated pairs in whole 16s, and cos and sin (fp16) of
+        # every position's angle for those pairs [capacity, pairs, 2] (the angle as heads_k and model.rope_tables
+        # compute it: position * inv_freq in float32)
+        self.turn, self.trig, self.k_norm = {}, {}, []
+        for t in kinds:
+            if self.keyless[t]:
+                hd, n = cfg.head_dim[t], turned(cfg, t)
+                assert hd % 32 == 0 and n <= min(hd // 2, 128), "a keyless layer's head is whole 32s, with at most 128 turned pairs"
+                theta, rotated = cfg.rope[t]
+                inv = torch.zeros(n)
+                inv[:rotated] = 1.0 / (theta ** (torch.arange(0, 2 * rotated, 2).float() / hd))
+                ang = torch.arange(capacity).float()[:, None] * inv[None, :]
+                self.turn[t], self.trig[t] = n, self._own(torch.stack((ang.cos(), ang.sin()), -1).half().contiguous().to(device))
         self.kv = []
         for i, (lay, cl) in enumerate(zip(layers, self.c_layers)):
             t = cfg.layer_types[i]
@@ -202,17 +239,24 @@ class Engine:
                 at += words(codes, bits)
             cl.rot_in, cl.rot_o = self._rot(cfg.hidden), self._rot(cfg.heads * hd)
             cl.rot_mlp, cl.rot_down = self._rot(cfg.hidden), self._rot(cfg.mlp)
-            for name in ("in_ln", "post_attn_ln", "pre_ff_ln", "post_ff_ln", "q_norm", "k_norm"):
+            for name in ("in_ln", "post_attn_ln", "pre_ff_ln", "post_ff_ln", "q_norm"):
                 setattr(cl, name, f32(lay[name]).data_ptr())
+            self.k_norm.append(f32(lay["k_norm"]))
+            cl.k_norm = self.k_norm[-1].data_ptr()
             theta, rotated = cfg.rope[t]
             inv = torch.zeros(hd // 2)
             inv[:rotated] = 1.0 / (theta ** (torch.arange(0, 2 * rotated, 2).float() / hd))
             cl.inv_freq = f32(inv).data_ptr()
             nth = cfg.layer_types[:i].count(t)
-            keys, values, kscale, vscale = (x[nth] for x in self.kv_all[t])
-            self.kv.append((keys, values, kscale, vscale))
-            cl.keys, cl.values, cl.tiles = keys.data_ptr(), values.data_ptr(), self.tables[t].data_ptr()
-            cl.kscale, cl.vscale = kscale.data_ptr(), vscale.data_ptr()
+            if self.keyless[t]:
+                assert "v" not in mats, "a keyless layer's value is its key's projection"
+                (values, vscale), keys, kscale = (x[nth] for x in self.kv_all[t]), None, None
+                cl.keys, cl.kscale, cl.trig, cl.turned = None, None, self.trig[t].data_ptr(), self.turn[t]
+            else:
+                keys, values, kscale, vscale = (x[nth] for x in self.kv_all[t])
+                cl.keys, cl.kscale, cl.trig, cl.turned = keys.data_ptr(), kscale.data_ptr(), None, 0
+            self.kv.append((keys, values, kscale, vscale))  # keys and their scales: None of a keyless layer
+            cl.values, cl.vscale, cl.tiles = values.data_ptr(), vscale.data_ptr(), self.tables[t].data_ptr()
             cl.scalar, cl.full, cl.head_dim, cl.kv_heads, cl.ring = float(lay["scalar"]), int(t == M.FULL), hd, kvh, self.ring[t]
             if device != "cpu":
                 torch.cuda.empty_cache()  # packing's temporaries, or the allocator keeps them beside the codes
@@ -239,7 +283,7 @@ class Engine:
 
     @classmethod
     def load(cls, name: str, plan: dict, head: int, capacity: int = 8192, device: str = "cuda", sequences: int = 1,
-             pool: dict | None = None, rows: int = 8) -> "Engine":
+             pool: dict | None = None, rows: int = 8, keyless: bool = False) -> "Engine":
         """The original model with the stored codes `name`: plan is layer -> {matrix: bits a pair}, head the output
         head's bits. The layers come off the disk one at a time; the embedding table stays in RAM."""
         from . import ckpt
@@ -254,7 +298,7 @@ class Engine:
                 yield ck.layer(i, "cpu", skip=M.LINEARS) | {"mats": CD.stored(name, i, {m: plan[i][m] for m in has})}
 
         eng = cls(cfg, layers(), CD.stored(name, "head", {"head": head})["head"], ck.norm("cpu"), ck.embed("cpu"), capacity, device,
-                  sequences, pool, rows)
+                  sequences, pool, rows, keyless)
         torch.cuda.empty_cache()  # packing left about 1 GiB reserved and unused: whatever loads next needs it
         return eng
 
@@ -382,9 +426,40 @@ class Engine:
         return t.view(t.shape[0], self.pool[kind], TILE, *t.shape[2:])
 
     def kv_float(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """A layer's keys and values as numbers: [pool slots, heads, head_dim] (the int8 values times their scales)."""
+        """A layer's keys and values as numbers: [pool slots, heads, head_dim] (the int8 values times their scales).
+        A keyless layer's keys are made as the scores make them, taking a slot's number for its position (which it is
+        while the engine holds one sequence)."""
         k, v, ks, vs = self.kv[layer]
+        if k is None:
+            k, ks = self._made(layer, v, torch.arange(v.shape[0], device=v.device) % self.capacity), vs
         return k.float() * ks[..., None], v.float() * vs[..., None]
+
+    def _made(self, layer: int, v: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """The keys a keyless layer's scores make of its kept values v (int8 [m, heads, head_dim], at `positions`), in
+        the values' units (times the values' scales: the keys). As engine/sclmd.cu: where a value is not turned the
+        key is the value times k_norm (the kernel has k_norm on the query there: folded); the turned ones are
+        value * k_norm * cos -+ partner * k_norm * sin, rounded to fp16."""
+        t = self.cfg.layer_types[layer]
+        half, n, kn = self.cfg.head_dim[t] // 2, self.turn[t], self.k_norm[layer]
+        x = v.float()
+        out = x * kn
+        trig = self.trig[t][positions].float()  # [m, pairs, 2]
+        cos, sin = trig[:, None, :, 0], trig[:, None, :, 1]
+        a, b = x[..., :n] * kn[:n], x[..., half : half + n] * kn[half : half + n]
+        out[..., :n] = (a * cos - b * sin).half().float()
+        out[..., half : half + n] = (b * cos + a * sin).half().float()
+        return out
+
+    def folded(self, layer: int) -> torch.Tensor | None:
+        """What a keyless layer's queries are multiplied by before they are kept [head_dim]: k_norm where the scores
+        read the value itself as the key, 1 at the turned values. None of a layer with keys."""
+        t = self.cfg.layer_types[layer]
+        if not self.keyless[t]:
+            return None
+        half, n = self.cfg.head_dim[t] // 2, self.turn[t]
+        f = self.k_norm[layer].clone()
+        f[:n] = f[half : half + n] = 1.0
+        return f
 
     def snapshot(self, seq: int = 0):
         """Remembers a sequence's present length so that restore() can come back to it however far the text goes on.
@@ -426,7 +501,7 @@ class Engine:
 
     def park(self, seq: int) -> dict:
         """Takes a sequence off the GPU: what it holds comes back as a state in RAM (its keys and values up to its
-        length: 0.42 MB a token for the last 1,040 tokens and 41 KB a token), and its tiles go back to the pool.
+        length: 0.42 MB a token for the last 1,040 tokens and 41 KB a token, 21 KB when keyless), and its tiles go back to the pool.
         unpark() puts it on any free sequence later. A snapshot of it is given up."""
         self.trim(seq)
         state = {"length": self.lengths[seq], "high": self.highs[seq], "kinds": {}, "bytes": 0}
@@ -512,7 +587,8 @@ class Engine:
             first = 0 if t == M.FULL else max(0, length - (self.cfg.window + 1))
             pos = torch.arange(first, length, device=self.device)
             slot = self.slots(t, pos, seq)
-            out[t] = ((k[slot].float() * ks[slot][..., None]).transpose(0, 1)[None], (v[slot].float() * vs[slot][..., None]).transpose(0, 1)[None], pos)
+            key = self._made(self.cfg.last_of(t), v[slot], pos) * vs[slot][..., None] if k is None else k[slot].float() * ks[slot][..., None]
+            out[t] = (key.transpose(0, 1)[None], (v[slot].float() * vs[slot][..., None]).transpose(0, 1)[None], pos)
         return out
 
 

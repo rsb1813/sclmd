@@ -290,7 +290,7 @@ class Server:
 
     def about(self) -> dict:
         eng = self.eng
-        tile = {t: E.tile_bytes(eng.cfg, t) for t in eng.ring}
+        tile = {t: E.tile_bytes(eng.cfg, t, eng.lean) for t in eng.ring}
         free = eng.free_tiles()
         return {"requests": {"under_way": len(self.active), "waiting": len(self.waiting) + self.inbox.qsize(), **self.totals},
                 "conversations_kept": len(self.kept), "conversations_in_ram": len(self.parked),
@@ -548,11 +548,11 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
 
-def pool_for(cfg: M.Config, budget: int, full_per_sliding: float) -> dict:
+def pool_for(cfg: M.Config, budget: int, full_per_sliding: float, keyless: bool = False) -> dict:
     """Tiles of keys and values for `budget` bytes: `full_per_sliding` tiles of the full-attention layers for each of
     the sliding ones (a conversation needs one of each for every 16 tokens up to the sliding window, 1,024, and only
     full-attention ones after that)."""
-    unit = E.tile_bytes(cfg, M.SLIDING) + full_per_sliding * E.tile_bytes(cfg, M.FULL)
+    unit = E.tile_bytes(cfg, M.SLIDING) + full_per_sliding * E.tile_bytes(cfg, M.FULL, keyless)
     n = int(budget // unit)
     return {M.SLIDING: n, M.FULL: int(n * full_per_sliding)}
 
@@ -564,7 +564,7 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=8001)
     ap.add_argument("--name", default="v1", help="the codes' folder under C:\\models\\sclmd-codes")
     ap.add_argument("--kv-gib", type=float, default=0.0, help="VRAM for the conversations' keys and values (0: all that 3 bits a weight "
-                    "leaves, about 2.4 GiB). A conversation takes 0.42 MB a token up to 1,024 tokens and 41 KB a token after; what is "
+                    "leaves, about 2.4 GiB). A conversation takes 0.46 MB a token up to 1,024 tokens and 41 KB a token after (21 KB with --keyless); what is "
                     "not set aside here goes to 4-bit matrices (quality)")
     ap.add_argument("--context", type=int, default=8192, help="tokens one conversation can hold (prompt and reply)")
     ap.add_argument("--sequences", type=int, default=32, help="conversations held at once, those kept for their next turn included")
@@ -578,6 +578,9 @@ def main() -> None:
     ap.add_argument("--no-drafter", action="store_true")
     ap.add_argument("--rows", type=int, default=32, help="the most rows of a pass (8, 16 or 32): tokens of all requests together")
     ap.add_argument("--reserve", type=float, default=VRAM_MARGIN / 2**30, help="GiB of the VRAM that is free now to leave to other programs")
+    ap.add_argument("--keyless", action="store_true", help="long conversations: the ten full-attention layers keep their values only and "
+                    "the keys are made of them when read: 21 KB a token past 1,024 tokens for 41 (a conversation of 40,960 tokens 1.2 GiB "
+                    "for 2.0); other bits than without it, of the same precision")
     cli = ap.parse_args()
     import sys
 
@@ -596,7 +599,7 @@ def main() -> None:
     # the VRAM that is free now, less what is left to other programs, the head, the work memory, the drafter and room
     # to load in: that much is shared between the layers' codes and the conversations' keys and values
     free = torch.cuda.mem_get_info()[0] - reserve
-    rest = E.fixed_bytes(cfg, cli.head, context, pool={M.SLIDING: 0, M.FULL: 0}, rows=cli.rows) + (0 if cli.no_drafter else E.DRAFTER_BYTES)
+    rest = E.fixed_bytes(cfg, cli.head, context, pool={M.SLIDING: 0, M.FULL: 0}, rows=cli.rows, keyless=cli.keyless) + (0 if cli.no_drafter else E.DRAFTER_BYTES)
     both = free - rest - LOAD_ROOM
     least = P.code_bytes(cfg, P.uniform(cfg, 6))
     if both - least < (256 << 20):
@@ -605,14 +608,14 @@ def main() -> None:
     kv = min(int(cli.kv_gib * 2**30), both - least) if cli.kv_gib > 0 else both - least
     plan, estimate = P.fit(cfg, cli.name, both - kv, of=SHARES) if both - kv > least else (P.uniform(cfg, 6), None)
     typical = max(cli.typical, cfg.window)
-    pool = pool_for(cfg, kv, typical / (cfg.window + E.SPARE))
+    pool = pool_for(cfg, kv, typical / (cfg.window + E.SPARE), cli.keyless)
     with torch.no_grad():
-        eng = E.Engine.load(cli.name, plan, cli.head, context, sequences=cli.sequences, pool=pool, rows=cli.rows)
+        eng = E.Engine.load(cli.name, plan, cli.head, context, sequences=cli.sequences, pool=pool, rows=cli.rows, keyless=cli.keyless)
         drafter = None if cli.no_drafter else E.EngineDrafter.load(eng, ckpt("drafter"), cli.name, depth=DEPTH)
     stop = (tok.eos_token_id, tok.convert_tokens_to_ids("<turn|>"), tok.convert_tokens_to_ids("<|tool_response>"))
     server = Server(tok, eng, drafter, stop, ram=int(cli.ram_gib * 2**30))
     bits = round(P.bits_per_weight(cfg, plan), 2)
-    one = E.tile_bytes(cfg, M.SLIDING) * E.ring_tiles(cfg, M.SLIDING, context, cli.rows) + E.tile_bytes(cfg, M.FULL) * typical // E.TILE
+    one = E.tile_bytes(cfg, M.SLIDING) * E.ring_tiles(cfg, M.SLIDING, context, cli.rows) + E.tile_bytes(cfg, M.FULL, cli.keyless) * typical // E.TILE
     facts = {"bits_per_weight": bits, "kl_estimate": None if estimate is None else round(estimate, 3),
              "vram_gib": round(torch.cuda.memory_allocated() / 2**30, 2), "drafter": drafter is not None}
     app = App(server, tok, cli.think, cli.max_tokens, facts)
@@ -623,7 +626,7 @@ def main() -> None:
     print(f"[serve] {MODEL} at http://{cli.host}:{cli.port}/v1 · {bits} bits a weight"
           + (f" (KL about {estimate:.3f} on its own text)" if estimate else " (KL about 0.10 on its own text)")
           + f" · VRAM {facts['vram_gib']} GiB\n[serve] keys and values {kv / 2**30:.2f} GiB: about {kv // one} conversations of {typical} tokens "
-          f"at once, or {kv // (E.tile_bytes(cfg, M.SLIDING) + E.tile_bytes(cfg, M.FULL)) * E.TILE} tokens of shorter ones; "
+          f"at once, or {kv // (E.tile_bytes(cfg, M.SLIDING) + E.tile_bytes(cfg, M.FULL, cli.keyless)) * E.TILE} tokens of shorter ones; "
           f"a conversation holds up to {context} tokens; thinking {'on' if cli.think else 'off'} unless asked", flush=True)
     try:
         httpd.serve_forever()

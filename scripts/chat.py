@@ -281,8 +281,10 @@ def main() -> None:
     ap.add_argument("--plan", default="auto", help="which matrices are 3 bits and which 4: auto (as many at 4 bits as the VRAM "
                     "that is free now holds, the most useful first), c6 (3 bits everywhere), or a plan file")
     ap.add_argument("--head", type=int, default=8)
-    ap.add_argument("--context", type=int, default=8192, help="tokens a conversation can hold (41 KB of VRAM each, taken at the start: what it takes, the plan cannot spend on 4-bit matrices)")
+    ap.add_argument("--context", type=int, default=8192, help="tokens a conversation can hold (41 KB of VRAM each, 21 KB with --keyless, taken at the start: what it takes, the plan cannot spend on 4-bit matrices)")
     ap.add_argument("--no-drafter", action="store_true")
+    ap.add_argument("--keyless", action="store_true", help="for long contexts: the full-attention layers keep their values only (21 KB a token "
+                    "for 41) and the keys are made of them when read; other bits than without it, of the same precision")
     ap.add_argument("--rows", type=int, default=ROWS, choices=(8, 16, 32), help="tokens of a prompt read in one pass: 32 reads a prompt about 45%% "
                     "faster than 16 and takes 62 MB more VRAM (86 MB at a context of 16,384), which the plan cannot spend on 4-bit matrices")
     ap.add_argument("--reserve", type=float, default=VRAM_MARGIN / 2**30, help="GiB of the VRAM that is free now to leave to other "
@@ -302,7 +304,7 @@ def main() -> None:
     if cli.plan == "auto":
         # what is free now, less what PyTorch is kept from (cap_vram), the rest of the engine, and room to load in
         free = torch.cuda.mem_get_info()[0] - reserve
-        rest = E.fixed_bytes(cfg, head, cli.context, rows=cli.rows) + (0 if cli.no_drafter else E.DRAFTER_BYTES)
+        rest = E.fixed_bytes(cfg, head, cli.context, rows=cli.rows, keyless=cli.keyless) + (0 if cli.no_drafter else E.DRAFTER_BYTES)
         budget = free - rest - LOAD_ROOM
         if budget < P.code_bytes(cfg, P.uniform(cfg, 6)):
             console.print(f"[yellow]VRAM이 모자랍니다: 지금 비어 있는 것은 {(free + reserve) / 2**30:.1f}GiB이고, 전부 3bit로도 "
@@ -316,7 +318,7 @@ def main() -> None:
         plan, head = P.read(cli.plan)
         head = head or cli.head
     with torch.no_grad():
-        eng = E.Engine.load(cli.name, plan, head, -(-cli.context // E.TILE) * E.TILE, rows=cli.rows)
+        eng = E.Engine.load(cli.name, plan, head, -(-cli.context // E.TILE) * E.TILE, rows=cli.rows, keyless=cli.keyless)
         drafter = None if cli.no_drafter else E.EngineDrafter.load(eng, ckpt("drafter"), cli.name, depth=DEPTH)
         opts = {"temperature": 1.0, "top_p": 0.95, "top_k": 64, "num_predict": 4096, "verbose": True, "showthink": False}
         session = Session(tok, eng, drafter)

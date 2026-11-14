@@ -43,6 +43,7 @@ def timed(eng: E.Engine, ids: list, tokens: int, passes: int) -> float:
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--name", default="v1")
+    ap.add_argument("--keyless", action="store_true", help="the full-attention layers keep their values only (Engine: keyless)")
     ap.add_argument("--set", default="eval_v1")
     ap.add_argument("--rate", type=int, default=6, help="bits a pair for every matrix of the layers (6 or 8)")
     ap.add_argument("--head", type=int, default=8)
@@ -55,8 +56,9 @@ def main():
     ck = Checkpoint(ckpt("orig"))
     cfg = ck.cfg
     plan, head, tag = plan_of(args, cfg)
+    tag += "_keyless" if args.keyless else ""
     t = time.time()
-    eng = E.Engine.load(args.name, plan, head, args.capacity)
+    eng = E.Engine.load(args.name, plan, head, args.capacity, keyless=args.keyless)
     torch.cuda.synchronize()
     report = {"codes": args.name, "tag": tag, "bits_per_weight": bits_per_weight(cfg, plan), "head_bits_per_weight": head / 2,
               "capacity": args.capacity, "load_seconds": round(time.time() - t, 1), "engine_gib": round(eng.bytes() / 2**30, 2),
