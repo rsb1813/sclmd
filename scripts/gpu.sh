@@ -7,9 +7,10 @@
 #   Order: class first, then the ticket's time. Classes: 1 high (labels verify*, fix*, main*: work that ends something,
 #   or GPU_PRIORITY=high), 2 normal, 3 low (GPU_PRIORITY=low). A ticket that has waited GPU_AGE seconds (default 900)
 #   counts one class higher, so that nobody waits for ever.
-#   A ticket is kept when a call gives up (exit 75 or 76): calling again with the same label within 20 minutes takes the
-#   same place in the line. A ticket whose caller is not waiting right now is passed over (the card does not wait for
-#   it) but keeps its place for when it calls again.
+#   A ticket is kept when a call gives up (exit 75 or 76): calling again with the same label within 20 minutes of giving
+#   up takes the same place in the line (the ticket file's time is when its caller last waited; the name keeps the time
+#   it was taken, by which the line is ordered). A ticket whose caller is not waiting right now is passed over (the
+#   card does not wait for it) but keeps its place for when it calls again.
 #   GPU_WAIT   seconds to wait at most (default 200); then exit 75 (still busy): call again
 #   GPU_LIMIT  seconds the command may run (default 340); it is stopped after that (exit 124)
 # Keep GPU_WAIT + GPU_LIMIT under the 600 s a tool call may take, so that a call is never cut while it holds the lock.
@@ -55,7 +56,10 @@ scan() {
         r=${b%%@*}; x=${b#*@}; t=${x%%@*}; x=${x#*@}; p=${x%%@*}
         case "$r$t$p" in *[!0-9]*) rm -f "$f"; continue ;; esac
         if [ "$p" != "$$" ] && ! kill -0 "$p" 2>/dev/null; then
-            if [ $((now - t)) -gt "$TTL" ]; then rm -f "$f"; fi
+            # its caller is away: given up TTL seconds after it last waited (not after the ticket was taken, which would
+            # throw out exactly the tickets that have waited longest)
+            seen=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+            if [ $((now - seen)) -gt "$TTL" ]; then rm -f "$f"; fi
             alive=0
         else
             alive=1
@@ -135,9 +139,11 @@ for f in "$Q"/*@*@*@"$safe"; do
     [ -e "$f" ] || continue
     b=${f##*/}; x=${b#*@}; ot=${x%%@*}; x=${x#*@}; op=${x%%@*}
     if ! kill -0 "$op" 2>/dev/null; then
+        seen=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+        if [ $((T0 + SECONDS - seen)) -gt "$TTL" ]; then rm -f "$f"; continue; fi
         t=$ot
         mine="$Q/$rank@$t@$$@$safe"
-        mv -f "$f" "$mine" 2>/dev/null || t=
+        if mv -f "$f" "$mine" 2>/dev/null; then touch "$mine"; else t=; fi
         break
     fi
 done
@@ -193,6 +199,7 @@ while :; do
     fi
     waited=$((SECONDS - s0))
     if [ "$waited" -ge "${GPU_WAIT:-200}" ]; then
+        touch "$mine"  # the time it last waited: its place is kept for TTL seconds from now
         scan
         keep="your place in line is kept: $pos of $n (call again with the same label within 20 min)"
         if [ -n "$vram" ] && [ ! -d "$LOCK" ]; then
