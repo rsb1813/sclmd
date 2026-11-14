@@ -16,6 +16,7 @@
 # Keep GPU_WAIT + GPU_LIMIT under the 600 s a tool call may take, so that a call is never cut while it holds the lock.
 # exit 76: another program (a game) holds the card's memory (not started; do not stop other programs; call again).
 # exit 77: the owner has dropped this brief (logs/exp/cancelled lists the labels).
+# exit 78: the owner keeps the card for other briefs (logs/gpu.only lists the labels that may use it): go on without it.
 #   sh gpu.sh status     the job on the card, the waiting line, the hold
 #   sh gpu.sh hold       no new job starts (the running one finishes; the line waits); the same as: type nul > logs\gpu.hold
 #   sh gpu.sh go         starts again (del logs\gpu.hold)
@@ -83,6 +84,7 @@ if [ $# -eq 1 ]; then
         mkdir -p "$Q"
         echo "[gpu] on the card: $(holder)"
         [ -e "$HOLD" ] && echo "[gpu] HOLD: no new job starts ($HOLD; sh gpu.sh go to start again)"
+        [ -s "$ROOT/gpu.only" ] && echo "[gpu] only for: $(grep -v '^\s*#' "$ROOT/gpu.only" | tr '\n' ' ')($ROOT/gpu.only)"
         now=$((T0 + SECONDS))
         lines=
         for f in "$Q"/*@*@*@*; do
@@ -126,6 +128,22 @@ fi
 if grep -qxF "$label" "$ROOT/exp/cancelled" 2>/dev/null; then
     echo "[gpu] CANCELLED BY THE OWNER: the brief '$label' has been dropped. Do not run any more GPU jobs. Stop work now and hand in your result as it is (verdict: unfinished, with what you had measured so far)."
     exit 77
+fi
+# the owner can keep the card for some briefs only: logs/gpu.only lists the labels that may use it (shell patterns, one
+# a line, # starts a comment); everyone else is told to go on without the GPU
+if [ -s "$ROOT/gpu.only" ]; then
+    allowed=0
+    while IFS= read -r pat || [ -n "$pat" ]; do
+        pat=${pat%%#*}
+        pat=${pat%"${pat##*[![:space:]]}"}
+        pat=${pat#"${pat%%[![:space:]]*}"}
+        [ -n "$pat" ] || continue
+        case "$label" in $pat) allowed=1; break ;; esac
+    done < "$ROOT/gpu.only"
+    if [ $allowed -eq 0 ]; then
+        echo "[gpu] RESERVED BY THE OWNER: the card is kept for other briefs ($(grep -v '^\s*#' "$ROOT/gpu.only" | tr '\n' ' ')); '$label' gets no more GPU time. Do not call gpu.sh again. Go on WITHOUT the GPU: code, reading and review, CPU-only checks (the stand-in engine, tokenizer, replays). Then hand in; list every GPU run you could not do under not_run, and as exact commands under long_jobs, so the owner can run them later."
+        exit 78
+    fi
 fi
 
 case "$label" in verify*|fix*|main*) rank=1 ;; *) rank=2 ;; esac
