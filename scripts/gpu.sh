@@ -9,6 +9,11 @@
 LOCK=/h/projects/sclm/sclmd/logs/gpu.lock
 label=$1
 shift
+# a brief the owner has dropped: its engineer is told at the next GPU job (logs/exp/cancelled lists the labels)
+if grep -qxF "$label" /h/projects/sclm/sclmd/logs/exp/cancelled 2>/dev/null; then
+    echo "[gpu] CANCELLED BY THE OWNER: the brief '$label' has been dropped. Do not run any more GPU jobs. Stop work now and hand in your result as it is (verdict: unfinished, with what you had measured so far)."
+    exit 77
+fi
 waited=0
 while ! mkdir "$LOCK" 2>/dev/null; do
     pid=$(cat "$LOCK/pid" 2>/dev/null)
