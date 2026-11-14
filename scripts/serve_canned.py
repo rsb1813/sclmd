@@ -1,21 +1,21 @@
 """The server's HTTP side (scripts/serve.py: Handler and App, with the real tokenizer and chat template) with a canned
 reply in the engine's place: for trying a client against the server's protocol without the GPU or the 15 s of loading.
 
-    python -m scripts.serve_canned 8017
+    python -m scripts.serve_canned 8017            (and the real server's --max-body-mb, --max-connections, ... fields options)
     uv run --no-project --with openai python scripts/openai_client_check.py 8017
 
 A user message "fail" makes the server fail after three tokens, "fail first" before any."""
+import argparse
 import queue
-import sys
 import threading
 import time
-from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
 
 import transformers
 from transformers import AutoTokenizer
 
 from sclmd import ckpt
+from scripts import serve_contract as C
 from scripts.serve import MODEL, App, Handler
 
 
@@ -37,8 +37,15 @@ class Canned:
         while True:
             req = self.inbox.get()
             said = req.messages[-1]["content"]
-            out = ([self.opening] + enc("thought\nThe user greets me. I greet back.") + [self.closing] if req.think else [])
-            out += enc(f"Hello! You said: {said} 안녕하세요.")[: max(req.max_new - len(out) - 1, 1)] + [self.stop[1]]
+            opened, tools = getattr(req, "opened", False), getattr(req, "tools", None)  # (a server before tool calls has neither)
+            out = ([self.opening] + enc("thought\nThe user greets me. I greet back.") + [self.closing] if req.think and not opened else [])
+            out += enc("I go on.") + [self.closing] if opened else []
+            results = sum(m["role"] == "tool" for m in req.messages)
+            if tools and results < 8:  # tools: a call of the first with page: the results so far + 1 (R2's tool_loop_bench)
+                name = tools[0]["function"]["name"]
+                out += enc(f'<|tool_call>call:{name}{{page:{results + 1},note:<|"|>say "hi", {{x}}\n서울<|"|>}}<tool_call|>') + [self.stop[2]]
+            else:
+                out += enc(f"Hello! You said: {said} 안녕하세요.")[: max(req.max_new - len(out) - 1, 1)] + [self.stop[1]]
             if said == "fail first":
                 req.events.put(("error", 500, "the server failed while answering: RuntimeError"))
                 continue
@@ -60,17 +67,21 @@ class Canned:
 
 
 def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("port", type=int)
+    C.add_options(ap)  # the real server's: fields, body cap, idle timeout, connections
+    cli = ap.parse_args()
     transformers.logging.set_verbosity_error()
     tok = AutoTokenizer.from_pretrained(ckpt("orig"))
     stop = (tok.eos_token_id, tok.convert_tokens_to_ids("<turn|>"), tok.convert_tokens_to_ids("<|tool_response>"))
     server = Canned(tok, stop)
     app = App(server, tok, False, 4096, {"bits_per_weight": 3.0})
     server.canon = None
+    C.apply(cli, app, Handler)
     threading.Thread(target=server.run, daemon=True).start()
-    httpd = ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler)
-    httpd.daemon_threads = True
+    httpd = C.BoundedHTTPServer(("127.0.0.1", cli.port), Handler, cli.max_connections)
     httpd.app = app
-    print(f"[canned] {MODEL} at http://127.0.0.1:{sys.argv[1]}/v1", flush=True)
+    print(f"[canned] {MODEL} at http://127.0.0.1:{cli.port}/v1", flush=True)
     httpd.serve_forever()
 
 

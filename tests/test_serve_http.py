@@ -94,7 +94,7 @@ def test_a_reply_that_ends_well(served):
         if not stream:
             got = json.loads(body)
             assert got["choices"][0]["message"]["content"] == "klm" and got["choices"][0]["finish_reason"] == "stop"
-            assert got["usage"] == DONE["usage"]
+            assert got["usage"] == {**DONE["usage"], "completion_tokens_details": {"reasoning_tokens": 0}}
         else:
             events = events_of(body)
             assert events[-1] == "[DONE]"

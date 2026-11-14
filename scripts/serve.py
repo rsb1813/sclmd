@@ -7,6 +7,7 @@
 #   GET  /v1/models, /health, / (what the server is doing)
 #
 # One thread owns the engine; the HTTP threads only hand it requests and turn the tokens it settles into text.
+# Fields it does not serve, the body's size and the connections: scripts/serve_contract.py.
 import argparse
 import json
 import os
@@ -16,7 +17,7 @@ import socket
 import threading
 import time
 import uuid
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 
 import torch
 
@@ -24,10 +25,12 @@ from sclmd import ckpt
 from sclmd import engine as E
 from sclmd import model as M
 from sclmd import plan as P
+from sclmd import tools as T
 from sclmd.batch import Batcher, Job
 from sclmd.generate import Picker
 from sclmd.text import Pieces
 from sclmd.stream import VRAM_MARGIN, cap_vram
+from scripts import serve_contract as C
 
 DEPTH = 6  # the drafter's generation_config.json: num_assistant_tokens
 SHARES = "own_v1"  # the measurements a plan is fitted from (scripts/chat.py)
@@ -35,8 +38,7 @@ LOAD_ROOM = 320 << 20
 MODEL = "gemma-4-31b-it"
 
 
-class Refused(Exception):
-    """A request that cannot be served: (HTTP status, message)."""
+Refused = C.Refused  # a request that cannot be served: (HTTP status, message[, field])
 
 
 class Request:
@@ -50,6 +52,13 @@ class Request:
         self.job = None
         self.reused = 0
         self.t_in, self.t_first = time.perf_counter(), None
+        self.stops = ()  # the client's stop strings
+        self.stop_text = None  # the answer as a stop string cut it: set by the HTTP thread before `cancelled`
+        self.ignored = []  # fields the request gave that are not served (serve_contract.check_fields)
+        self.tools = None  # the tools declared to the model (sclmd/tools.py); None: none, the reply is read as before
+        self.opened = False  # the reply begins inside a thought the prompt opened (after a tool's result, thinking on)
+        self.stop_ids = None  # the tokens that end its reply, where they are not the server's (parallel_tool_calls: false)
+        self.stop_calls = []  # the calls the client had got when a stop string cut the answer: set before stop_text
 
 
 class Kept:
@@ -235,7 +244,8 @@ class Server:
         # the sequence holds exactly what is counted as kept: nothing of another conversation
         assert eng.lengths[seq] == reused, f"sequence {seq} holds {eng.lengths[seq]} positions where {reused} were expected"
         req.reused = reused
-        req.job = Job(seq, req.full[reused:], req.max_new, req.pick, self.stop, emit=lambda t, q=req.events: q.put(("token", t)),
+        stop = self.stop if req.stop_ids is None else req.stop_ids
+        req.job = Job(seq, req.full[reused:], req.max_new, req.pick, stop, emit=lambda t, q=req.events: q.put(("token", t)),
                       start=req.start, base=req.full[:reused])
         if shared is not None and reused:
             self.prefixes.hits += 1
@@ -258,7 +268,10 @@ class Server:
     def _finish(self, req: Request) -> None:
         eng, job = self.eng, req.job
         seq = job.seq
-        if job.done in ("stop", "length") and job.out:
+        # a reply that a client's stop string ended is kept as one that ended by itself (with the answer as cut), unless
+        # it was cut while it read everything again after starting over (its sequence does not hold the turn start then)
+        stopped = job.done == "cancelled" and req.stop_text is not None and job.pending is not None and eng.lengths[seq] >= req.start
+        if (job.done in ("stop", "length") or stopped) and job.out:
             kept = self.kept[seq] = Kept(seq, req.full[: req.start], job.snapped)
             try:
                 later = self.canon(req, job.out) if self.canon is not None else None
@@ -378,18 +391,57 @@ class App:
         self.fingerprint = f"sclmd-{facts['bits_per_weight']}bit"
         self.lock = threading.Lock()  # the tokenizer's template is not known to be safe from several threads
         server.canon = self.canonical
+        self.fields, self.max_body = "default", C.MAX_BODY  # --lenient-fields / --strict-fields, --max-body-mb
+        self.look_s = C.LOOK_S  # --look-gone
+        self._marks = None  # the tool format's tokens (sclmd/tools.py), when a request first needs them
+
+    def marks(self) -> dict:
+        if self._marks is None:
+            enc = lambda s: self.tok.encode(s, add_special_tokens=False)  # noqa: E731
+            self._marks = {"ids": T.Ids(self.tok), "thought": enc("<|channel>thought\n"), "closed": enc("<turn|>\n"),
+                           "empty": enc("<|channel>thought\n<channel|>")}
+        return self._marks
+
+    def _writable(self, tool: dict) -> bool:
+        """Whether the chat template can write this tool's declaration (under self.lock)."""
+        try:
+            self.tok.apply_chat_template([{"role": "user", "content": "x"}], tools=[tool], tokenize=False, add_generation_prompt=True)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def pieces(self, req: Request):
+        """What reads the request's reply as it comes: thinking and answer apart (Pieces), and the calls too when it
+        declared tools (tools.Reader)."""
+        if req.tools is not None:
+            return T.Reader(self.tok, self.server.stop, self.opening, self.closing, self.marks()["ids"], req.opened)
+        pieces = Pieces(self.tok, self.server.stop, self.opening, self.closing)
+        if req.opened:
+            pieces.kind, pieces.name = "think", False
+        return pieces
 
     def canonical(self, req: Request, tokens: list):
         """The conversation with the reply just given as a later turn writes it: the answer as the client got it
-        (without the thinking), through the template."""
-        pieces, text = Pieces(self.tok, self.server.stop, self.opening, self.closing), ""
-        for token in tokens:
-            piece = pieces.add(token)
-            if piece is not None and piece[0] == "answer":
-                text += piece[1]
+        (without the thinking, and cut where a stop string of the client's cut it), through the template. A reply with
+        tool calls: the calls (tools.later_message)."""
+        calls = []
+        if req.stop_text is not None:
+            text, calls = req.stop_text, req.stop_calls
+        else:
+            pieces, text = self.pieces(req), ""
+            for token in tokens:
+                piece = pieces.add(token)
+                if piece is not None and piece[0] == "answer":
+                    text += piece[1]
+            if req.tools is not None:
+                piece = pieces.end()
+                text = text + (piece[1] if piece is not None else "")
+                calls = T.kept_before(pieces.calls, text, req.stops)  # those before a stop string, as the client got them
+            text = C.cut_at_stops(text, req.stops)  # the reply may have ended before the HTTP thread saw the stop string
+        message = T.later_message(text, calls) if calls else {"role": "assistant", "content": text}
+        kw = {"tools": req.tools} if req.tools else {}
         with self.lock:
-            out = self.tok.apply_chat_template(req.messages + [{"role": "assistant", "content": text}], tokenize=True,
-                                               add_generation_prompt=False, enable_thinking=req.think)
+            out = self.tok.apply_chat_template(req.messages + [message], tokenize=True, add_generation_prompt=False, enable_thinking=req.think, **kw)
         return list(out["input_ids"] if hasattr(out, "keys") else out)
 
     def card(self) -> dict:
@@ -397,7 +449,7 @@ class App:
         return {"id": MODEL, "object": "model", "created": self.created, "owned_by": "sclmd", "root": MODEL, "parent": None,
                 "max_model_len": eng.capacity, "context_length": eng.capacity, "max_output_tokens": self.max_tokens,
                 "quantization": f"{self.facts['bits_per_weight']} bits a weight",
-                "capabilities": {"streaming": True, "reasoning": True, "tools": False, "prompt_cache": True, "vision": False},
+                "capabilities": {"streaming": True, "reasoning": True, "tools": True, "prompt_cache": True, "vision": False},
                 "defaults": {"temperature": 1.0, "top_p": 0.95, "top_k": 64, "thinking": self.think, "max_tokens": self.max_tokens}}
 
     def about(self) -> dict:
@@ -406,20 +458,16 @@ class App:
                 "context_length": self.server.eng.capacity, "max_output_tokens": self.max_tokens, **self.facts, **self.server.about()}
 
     def request(self, body: dict) -> Request:
+        ignored = C.check_fields(body, self.fields)  # fields that are not served: refused, or named in the answer
         if not isinstance(body, dict) or not isinstance(body.get("messages"), list) or not body["messages"]:
             raise Refused(400, "messages: a list of {role, content} is needed")
-        messages = []
-        for m in body["messages"]:
-            role, content = m.get("role"), m.get("content")
-            if isinstance(content, list):  # parts: the text ones
-                if any(p.get("type") not in ("text", None) for p in content):
-                    raise Refused(400, "only text content is served")
-                content = "".join(p.get("text", "") for p in content)
-            if role == "developer":
-                role = "system"
-            if role not in ("system", "user", "assistant") or not isinstance(content, str):
-                raise Refused(400, "a message is {role: system | user | assistant, content: text}")
-            messages.append({"role": role, "content": content})
+        strict = self.fields == "strict"
+        try:  # {role, content}; tool calls and their results (sclmd/tools.py); the tools to declare
+            messages, left = T.messages_of(body["messages"], strict)
+            tools, more, at = T.tools_of(body, strict)
+        except T.BadRequest as e:
+            raise Refused(400, str(e), e.param) from None
+        ignored = sorted(set(ignored) | set(more) | set(left))
         if messages[-1]["role"] == "assistant":
             raise Refused(400, "the last message is the one to answer: a user's")
         think = self.think
@@ -440,18 +488,76 @@ class App:
             except (TypeError, ValueError):
                 shared = system
             shared = max(0, min(shared, len(messages) - 1))
+        def written(tools, messages):
+            """The prompt without and with the model's turn opened, and the shared part, through the template."""
+            kw = {"tools": tools} if tools else {}  # declared at the top of the system turn: in the shared part (--prefix-gib)
+            # no system message (and no mark of the client's): the tools' system turn alone
+            sharing = prefixes is not None and prefixes.ram > 0 and (shared > 0 or (bool(tools) and body.get("sclmd_prefix_messages") is None))
+            ids = lambda prompt, ms=messages: self.tok.apply_chat_template(ms, tokenize=True, add_generation_prompt=prompt, enable_thinking=think, **kw)  # noqa: E731
+            return ids(False), ids(True), (ids(False, messages[:shared]) if sharing and shared else []), sharing
+
+        def without_calls(messages):
+            """The conversation with its calls left out, as before tool calls were served (their results are then
+            written nowhere) -> (it, the names of what was left out)."""
+            out, names = [], []
+            for i, m in enumerate(messages):
+                if m.get("tool_calls"):
+                    out.append({"role": "assistant", "content": m["content"]})
+                    names.append(f"messages[{i}].tool_calls")
+                else:
+                    names += [f"messages[{i}]"] if m["role"] == "tool" else []
+                    out.append(m)
+            return out, names
+
+        def prompt(tools, messages, ignored):
+            """-> the prompt's parts through the template, the tools and the messages it was written with, and the names
+            left out. What the template cannot write is left out and named, as before tool calls were served (strict:
+            400): a tool's declaration (each one tried alone), else the conversation's calls."""
+            try:
+                return written(tools, messages), tools, messages, ignored
+            except Exception as e:  # noqa: BLE001  (tools or tool messages the template cannot write)
+                if not (tools or T.uses_tools(messages)):
+                    raise
+                why = e
+            bad = [k for t, k in zip(tools or [], at) if not self._writable(t)]
+            if bad and strict:
+                raise Refused(400, f"tools[{bad[0]}]: the chat template cannot write this tool's declaration (--strict-fields)", "tools")
+            if bad:
+                tools = [t for t, k in zip(tools, at) if k not in bad] or None
+                ignored = sorted(set(ignored) | {f"tools[{k}]" for k in bad})
+                try:
+                    return written(tools, messages), tools, messages, ignored
+                except Exception as e:  # noqa: BLE001
+                    why = e
+            if strict or not T.uses_tools(messages):
+                raise Refused(400, f"the chat template could not write these tools or tool messages: {type(why).__name__}: {why}", "messages")
+            messages, names = without_calls(messages)
+            try:
+                return written(tools, messages), tools, messages, sorted(set(ignored) | set(names))
+            except Exception as e:  # noqa: BLE001
+                raise Refused(400, f"the chat template could not write these tools or tool messages: {type(e).__name__}: {e}", "messages") from None
+
         with self.lock:
-            ids = lambda prompt, ms=messages: self.tok.apply_chat_template(ms, tokenize=True, add_generation_prompt=prompt, enable_thinking=think)  # noqa: E731
-            before, full = ids(False), ids(True)
-            part = ids(False, messages[:shared]) if shared else []
-        before, full, part = (list(x["input_ids"] if hasattr(x, "keys") else x) for x in (before, full, part))
+            (before, full, part, sharing), tools, messages, ignored = prompt(tools, messages, ignored)
+            eng = self.server.eng
+            if tools and not strict and eng.capacity - len(T.ids_of(full)) - eng.rows < 16:
+                # the tools' declarations leave no room in the context: left out and named, as before they were served
+                (before, full, part, sharing), tools, messages, ignored = prompt(None, messages, sorted(set(ignored) | {"tools"}))
+        before, full, part = (T.ids_of(x) for x in (before, full, part))
+        start, opened = len(before) + len(self.turn), False
+        if full[: len(before)] != before or full[len(before) : start] != self.turn:
+            # after a tool's result the template writes no turn: the reply goes on in the model's turn
+            mk = self.marks() if messages[-1]["role"] == "tool" else None
+            got = T.continuation(before, full, self.turn, mk["thought"], mk["closed"], mk["empty"]) if mk else None
+            if got is None:
+                raise Refused(500, "the chat template did not write the turn as expected")
+            start, full, opened = got
         cut = 0  # on token ids: where the template writes the part otherwise than in the whole, the part ends before that
         while cut < min(len(part), len(full)) and part[cut] == full[cut]:
             cut += 1
-        start = len(before) + len(self.turn)
-        if full[: len(before)] != before or full[len(before) : start] != self.turn:
-            raise Refused(500, "the chat template did not write the turn as expected")
-        eng = self.server.eng
+        if sharing and not shared:  # the tools' system turn alone (the template writes nothing for no message): up to its end
+            closed = self.marks()["closed"]
+            cut = next((i + len(closed) for i in range(len(full)) if full[i : i + len(closed)] == closed), 0)
         room = eng.capacity - len(full) - eng.rows
         if room < 16:
             raise Refused(400, f"the conversation is {len(full)} tokens: the context holds {eng.capacity}")
@@ -464,12 +570,18 @@ class App:
         top_k = int(body.get("top_k", 64) or 64)
         seed = body.get("seed")
         pick = Picker(temperature, max(1, min(top_k, 1024)), top_p, seed=int(seed) & 0x3FFFFFFF if seed is not None else uuid.uuid4().int & 0x3FFFFFFF)
-        return Request(full, start, max_new, pick, think, messages, cut)
+        req = Request(full, start, max_new, pick, think, messages, cut)
+        req.ignored = ignored
+        req.tools, req.opened = tools, opened
+        if tools and body.get("parallel_tool_calls") is False:  # one call: the reply ends with it
+            req.stop_ids = tuple(self.server.stop) + (self.marks()["ids"].end,)
+        return req
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "sclmd"
+    timeout = C.IDLE_TIMEOUT  # a connection's thread ends when it has been idle this long (--idle-timeout; None: for ever)
 
     def log_message(self, *args) -> None:  # the engine's thread prints a line per request
         pass
@@ -481,12 +593,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         for name, value in (headers or {}).items():
             self.send_header(name, value)
+        if self.close_connection:  # a body that was not read: the connection cannot carry another request
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(data)
 
-    def _error(self, status: int, message: str) -> None:
+    def _error(self, status: int, message: str, param: str | None = None) -> None:
         kind = "invalid_request_error" if status < 500 else "server_error"
-        self._json(status, {"error": {"message": message, "type": kind, "param": None, "code": None}})
+        self._json(status, {"error": {"message": message, "type": kind, "param": param, "code": None}})
 
     def _gone(self) -> bool:
         """Whether the client has closed the connection."""
@@ -516,27 +630,52 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._error(404, "unknown path: GET / lists the endpoints")
 
+    def handle_expect_100(self) -> bool:
+        """A client that waits to be told to send its body (Expect: 100-continue) hears at once when it would be refused."""
+        refusal = C.body_refusal(self.headers, getattr(self.server.app, "max_body", C.MAX_BODY)) if self.command == "POST" else None
+        if refusal is None:
+            return super().handle_expect_100()
+        self.close_connection = True
+        self._error(*refusal[0].args)
+        C.linger(self.connection, self.rfile, refusal[1], seconds=2.0, idle=0.5)  # it was not told to send, but may
+        return False
+
     def do_POST(self) -> None:
         app = self.server.app
         if self.path.split("?")[0].rstrip("/") != "/v1/chat/completions":
             return self._error(404, "unknown path: GET / lists the endpoints")
+        fields = getattr(app, "fields", "default")
+        self.unread = 0
         try:
-            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+            body = json.loads(C.read_body(self, getattr(app, "max_body", C.MAX_BODY)))
+            stops, odd = C.stops_of(body, fields)
             req = app.request(body)
         except Refused as e:
-            return self._error(*e.args)
-        except (ValueError, TypeError, AttributeError) as e:
-            return self._error(400, f"the body is not a chat completion request: {e}")
-        stops = body.get("stop") or []
-        stops = [stops] if isinstance(stops, str) else [s for s in stops if isinstance(s, str) and s]
-        app.server.submit(req)
+            self._error(*e.args)
+            if self.unread != 0:  # a body that was not read: it is thrown away after the answer, or the client gets a reset
+                C.linger(self.connection, self.rfile, self.unread)
+            return
+        except (ValueError, TypeError, AttributeError, OverflowError, RecursionError) as e:
+            return self._error(400, f"the body is not a chat completion request: {str(e)[:300]}")
+        req.stops = stops
+        if odd:  # a stop that is not text: what is text of it is served
+            req.ignored = sorted(set(req.ignored) | {"stop"})
         head = {"id": "chatcmpl-" + uuid.uuid4().hex, "created": int(time.time()), "model": MODEL, "system_fingerprint": app.fingerprint}
+        named = {"x-sclmd-ignored": C.names_of(req.ignored)} if req.ignored else {}  # fields given that are not served
+        if req.ignored:
+            print(f"[serve] {head['id']}: {C.names_of(req.ignored)} not served: ignored", flush=True)
         stream = bool(body.get("stream"))
-        pieces = Pieces(app.tok, app.server.stop, app.opening, app.closing)
+        tooled = req.tools is not None  # its reply's calls are read (sclmd/tools.py)
+        pieces = app.pieces(req) if tooled or req.opened else Pieces(app.tok, app.server.stop, app.opening, app.closing)
+        reasoning = C.Reasoning(app.opening, app.closing)
+        reasoning.inside = req.opened
+        calls = []  # the reply's tool calls, as the client gets them
         text = {"think": "", "answer": ""}
         sent = 0  # of the answer: what has gone out (a stop string may still be forming at its end)
         hold = max((len(s) for s in stops), default=1) - 1
         stopped = False
+        event, looked = None, time.monotonic()  # the last event taken; when the connection was last looked at
+        app.server.submit(req)
 
         def chunk(delta: dict, finish: str | None = None, **more) -> None:
             data = {**head, "object": "chat.completion.chunk",
@@ -551,6 +690,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "close")
                 self.send_header("x-request-id", head["id"])
+                for name, value in named.items():
+                    self.send_header(name, value)
                 self.end_headers()
                 self.close_connection = True
                 chunk({"role": "assistant", "content": ""})
@@ -569,6 +710,7 @@ class Handler(BaseHTTPRequestHandler):
                 if event[0] == "done":
                     result = event[1]
                     break
+                reasoning.add(event[1])
                 if stopped:
                     continue
                 # the tokens that have come by now are taken together (waiting 30 ms for more made no difference
@@ -579,10 +721,16 @@ class Handler(BaseHTTPRequestHandler):
                         more = req.events.get_nowait()
                         if more[0] == "token":
                             tokens.append(more[1])
+                            reasoning.add(more[1])
                         else:
                             last = more
                 except queue.Empty:
                     pass
+                look = getattr(app, "look_s", C.LOOK_S)  # --look-gone (off by default: a half-closed client reads as gone)
+                if look and not stream and time.monotonic() - looked > look:  # tokens keep coming: is anyone still waiting for them?
+                    looked = time.monotonic()
+                    if self._gone():
+                        raise ConnectionError
                 new = {"think": "", "answer": ""}
                 for token in tokens:
                     piece = pieces.add(token)
@@ -591,14 +739,25 @@ class Handler(BaseHTTPRequestHandler):
                         text[piece[0]] += piece[1]
                 if new["think"] and stream:
                     chunk({"reasoning_content": new["think"]})
+                done_calls = pieces.take() if tooled else []
+                calls += done_calls
                 if new["answer"]:
                     cut = min((text["answer"].find(s) for s in stops if s in text["answer"]), default=-1)
                     if cut >= 0:  # a stop string: the answer ends before it, and the engine is told to stop
-                        text["answer"], stopped, req.cancelled = text["answer"][:cut], True, True
+                        if tooled:  # and so do its calls: those after it are cut with it, however the tokens came
+                            calls = T.kept_before(calls, text["answer"], stops)
+                            done_calls = [c for c in done_calls if c in calls]
+                        text["answer"], stopped = text["answer"][:cut], True
+                        req.stop_calls = list(calls)
+                        req.stop_text = text["answer"]  # first: the engine's thread keeps the conversation with it
+                        req.cancelled = True
                     upto = len(text["answer"]) if stopped else len(text["answer"]) - hold
                     if stream and upto > sent:
                         chunk({"content": text["answer"][sent:upto]})
                         sent = upto
+                for call in done_calls:  # a call goes out whole once its block has closed
+                    if stream:
+                        chunk({"tool_calls": [{"index": calls.index(call), **T.public(call)}]})
                 if last is not None:
                     event = last
                     if event[0] == "error":
@@ -609,26 +768,69 @@ class Handler(BaseHTTPRequestHandler):
                     result = event[1]
                     break
             if event[0] == "done":
+                if tooled and not stopped:  # a block the reply's end left open: read as it is
+                    piece = pieces.end()
+                    whole = text["answer"] + (piece[1] if piece is not None else "")
+                    ended = pieces.take()
+                    text["answer"] = C.cut_at_stops(whole, stops)
+                    if len(text["answer"]) < len(whole):  # a stop string in that block: the answer ends before it, as the kept conversation does
+                        stopped = True
+                        kept = T.kept_before(calls + ended, whole, stops)
+                        ended = [c for c in ended if c in kept]
+                    for call in ended:
+                        calls.append(call)
+                        if stream:
+                            chunk({"tool_calls": [{"index": len(calls) - 1, **T.public(call)}]})
+                if tooled and pieces.malformed:
+                    print(f"[serve] {head['id']}: {len(pieces.malformed)} tool call block(s) did not parse ({pieces.malformed[0][0]}): "
+                          f"left in the content", flush=True)
+                undeclared = [c["function"]["name"] for c in calls if c["function"]["name"] not in {t["function"]["name"] for t in req.tools or []}]
+                if undeclared:  # returned as the model wrote them: the client decides
+                    print(f"[serve] {head['id']}: a call of a function not declared ({', '.join(undeclared)}): returned as it is", flush=True)
                 if stream and len(text["answer"]) > sent:
                     chunk({"content": text["answer"][sent:]})
                 finish = "stop" if stopped else result["finish_reason"]
+                if calls and finish == "stop":
+                    finish = "tool_calls"
+                usage = C.with_reasoning(result["usage"], reasoning.count)
                 if not stream:
                     message = {"role": "assistant", "content": text["answer"]}
+                    if calls:
+                        message["content"] = text["answer"] if text["answer"].strip() else None
+                        message["tool_calls"] = [T.public(c) for c in calls]
                     if text["think"]:
                         message["reasoning_content"] = text["think"]
                     choice = {"index": 0, "message": message, "logprobs": None, "finish_reason": finish}
-                    return self._json(200, {**head, "object": "chat.completion", "choices": [choice], "usage": result["usage"],
+                    return self._json(200, {**head, "object": "chat.completion", "choices": [choice], "usage": usage,
                                             "timings": result["timings"]},
-                                      {"x-request-id": head["id"], "openai-processing-ms": str(result["timings"]["total_ms"])})
+                                      {"x-request-id": head["id"], "openai-processing-ms": str(result["timings"]["total_ms"]), **named})
                 chunk({}, finish, timings=result["timings"])
-                if (body.get("stream_options") or {}).get("include_usage"):
-                    data = {**head, "object": "chat.completion.chunk", "choices": [], "usage": result["usage"]}
+                if C.include_usage(body):
+                    data = {**head, "object": "chat.completion.chunk", "choices": [], "usage": usage}
                     self.wfile.write(b"data: " + json.dumps(data).encode() + b"\n\n")
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except (ConnectionError, OSError):  # the client left: its text ends at the next pass
             req.cancelled = True
             self.close_connection = True
+        except Exception as e:  # noqa: BLE001  (a fault here: the client is told what it can be, the engine stops the reply)
+            import traceback
+
+            traceback.print_exc()
+            print(f"[serve] {head['id']}: the reply could not be sent: {type(e).__name__}: {e}", flush=True)
+            self.close_connection = True
+            try:
+                if stream:
+                    self.wfile.write(b"data: " + json.dumps({"error": {"message": f"the server failed while sending the reply: {type(e).__name__}",
+                                                                       "type": "server_error"}}).encode() + b"\n\ndata: [DONE]\n\n")
+                    self.wfile.flush()
+                else:
+                    self._error(500, f"the server failed while sending the reply: {type(e).__name__}")
+            except OSError:
+                pass
+        finally:
+            if event is None or event[0] not in ("done", "error"):  # the reply is not over, and nobody will read it
+                req.cancelled = True
 
 
 def conversations_at(eng: E.Engine, lengths) -> dict:
@@ -679,6 +881,7 @@ def main() -> None:
                     "for 2.0); other bits than without it, of the same precision")
     E.add_int8_option(ap)
     E.add_kv4_option(ap)
+    C.add_options(ap)
     cli = ap.parse_args()
     E.use_int8_option(cli)  # the whole engine: every request's rows on the integer products, so a reply's bits do not depend on its neighbours
     kv4 = E.use_kv4_option(cli)
@@ -720,9 +923,9 @@ def main() -> None:
     facts = {"bits_per_weight": bits, "kl_estimate": None if estimate is None else round(estimate, 3),
              "vram_gib": round(torch.cuda.memory_allocated() / 2**30, 2), "drafter": drafter is not None}
     app = App(server, tok, cli.think, cli.max_tokens, facts)
+    C.apply(cli, app, Handler)
     threading.Thread(target=server.run, daemon=True).start()
-    httpd = ThreadingHTTPServer((cli.host, cli.port), Handler)
-    httpd.daemon_threads = True
+    httpd = C.BoundedHTTPServer((cli.host, cli.port), Handler, cli.max_connections)
     httpd.app = app
     print(f"[serve] {MODEL} at http://{cli.host}:{cli.port}/v1 · {bits} bits a weight"
           + (f" (KL about {estimate:.3f} on its own text)" if estimate else " (KL about 0.10 on its own text)")

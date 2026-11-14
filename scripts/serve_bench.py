@@ -37,12 +37,15 @@ PROMPTS = [
 ]
 
 
+STOP = []  # --stop: the stop strings every request sends
+
+
 def chat(url: str, messages: list, max_tokens: int, think: bool, seed: int, out: dict) -> None:
     """One streamed chat completion: the reply's text and thinking, when its first token came, and the server's counts."""
     u = urlparse(url)
     conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=600)
     body = {"model": "any", "messages": messages, "stream": True, "max_tokens": max_tokens, "seed": seed,
-            "thinking": think, "stream_options": {"include_usage": True}}
+            "thinking": think, "stream_options": {"include_usage": True}, **({"stop": STOP} if STOP else {})}
     t0 = time.perf_counter()
     conn.request("POST", u.path.rstrip("/") + "/chat/completions", json.dumps(body), {"Content-Type": "application/json"})
     resp = conn.getresponse()
@@ -174,8 +177,11 @@ def main():
     ap.add_argument("--out")
     ap.add_argument("--long", default="", help="prompt lengths in tokens, with commas: the load is long prompts (see above)")
     ap.add_argument("--long-clients", default="1,4", help="how many send a long prompt at once")
+    ap.add_argument("--stop", action="append", default=[], help="a stop string every request sends (again for more; "
+                    "\\n is a newline): a client whose replies stop strings end")
     ap.add_argument("--doc", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "speed_check", "doc.txt"))
     args = ap.parse_args()
+    STOP[:] = [s.replace("\\n", "\n") for s in args.stop]
     if args.long:
         with open(args.doc, encoding="utf-8") as f:
             doc = f.read()
