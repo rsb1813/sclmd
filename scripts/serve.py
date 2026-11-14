@@ -249,7 +249,7 @@ class Server:
         """The job's sequence holds exactly its shared prefix: a copy of it goes to RAM for the requests that begin with it."""
         tokens, eng = job.base[:cut], self.eng
         if self.prefixes.wants(tokens) and eng.highs[job.seq] == cut:
-            size = sum(E.tile_bytes(eng.cfg, t, eng.lean) * sum(x >= 0 for x in eng.tiles[t][job.seq]) for t in eng.ring)
+            size = sum(E.tile_bytes(eng.cfg, t, eng.lean, eng.kv4) * sum(x >= 0 for x in eng.tiles[t][job.seq]) for t in eng.ring)
             if size > self.prefixes.ram:
                 self.prefixes.too_big.add(tuple(tokens))
                 return
@@ -355,7 +355,7 @@ class Server:
 
     def about(self) -> dict:
         eng = self.eng
-        tile = {t: E.tile_bytes(eng.cfg, t, eng.lean) for t in eng.ring}
+        tile = {t: E.tile_bytes(eng.cfg, t, eng.lean, eng.kv4) for t in eng.ring}
         free = eng.free_tiles()
         return {"requests": {"under_way": len(self.active), "waiting": len(self.waiting) + self.inbox.qsize(), **self.totals},
                 "conversations_kept": len(self.kept), "conversations_in_ram": len(self.parked),
@@ -631,11 +631,21 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
 
-def pool_for(cfg: M.Config, budget: int, full_per_sliding: float, keyless: bool = False) -> dict:
+def conversations_at(eng: E.Engine, lengths) -> dict:
+    """How many conversations of each length the engine's pool holds at once, by its tiles (the sliding layers' ring
+    and extra tiles, a full-attention tile every 16 tokens)."""
+    out = {}
+    for n in lengths:
+        need = {t: (min(-(-n // E.TILE), eng.ring[t]) + eng.extra[t] if t == M.SLIDING else -(-n // E.TILE)) for t in eng.ring}
+        out[n] = min(eng.pool[t] // need[t] for t in eng.ring)
+    return out
+
+
+def pool_for(cfg: M.Config, budget: int, full_per_sliding: float, keyless: bool = False, kv4: bool = False) -> dict:
     """Tiles of keys and values for `budget` bytes: `full_per_sliding` tiles of the full-attention layers for each of
     the sliding ones (a conversation needs one of each for every 16 tokens up to the sliding window, 1,024, and only
-    full-attention ones after that)."""
-    unit = E.tile_bytes(cfg, M.SLIDING) + full_per_sliding * E.tile_bytes(cfg, M.FULL, keyless)
+    full-attention ones after that; with kv4 a sliding tile more for its first tile's int8)."""
+    unit = E.tile_bytes(cfg, M.SLIDING, kv4=kv4) + full_per_sliding * E.tile_bytes(cfg, M.FULL, keyless)
     n = int(budget // unit)
     return {M.SLIDING: n, M.FULL: int(n * full_per_sliding)}
 
@@ -668,8 +678,10 @@ def main() -> None:
                     "the keys are made of them when read: 21 KB a token past 1,024 tokens for 41 (a conversation of 40,960 tokens 1.2 GiB "
                     "for 2.0); other bits than without it, of the same precision")
     E.add_int8_option(ap)
+    E.add_kv4_option(ap)
     cli = ap.parse_args()
     E.use_int8_option(cli)  # the whole engine: every request's rows on the integer products, so a reply's bits do not depend on its neighbours
+    kv4 = E.use_kv4_option(cli)
     import sys
 
     import transformers
@@ -687,7 +699,7 @@ def main() -> None:
     # the VRAM that is free now, less what is left to other programs, the head, the work memory, the drafter and room
     # to load in: that much is shared between the layers' codes and the conversations' keys and values
     free = torch.cuda.mem_get_info()[0] - reserve
-    rest = E.fixed_bytes(cfg, cli.head, context, pool={M.SLIDING: 0, M.FULL: 0}, rows=cli.rows, keyless=cli.keyless) + (0 if cli.no_drafter else E.DRAFTER_BYTES)
+    rest = E.fixed_bytes(cfg, cli.head, context, pool={M.SLIDING: 0, M.FULL: 0}, rows=cli.rows, keyless=cli.keyless, kv4=kv4) + (0 if cli.no_drafter else E.DRAFTER_BYTES)
     both = free - rest - LOAD_ROOM
     least = P.code_bytes(cfg, P.uniform(cfg, 6))
     if both - least < (256 << 20):
@@ -696,14 +708,15 @@ def main() -> None:
     kv = min(int(cli.kv_gib * 2**30), both - least) if cli.kv_gib > 0 else both - least
     plan, estimate = P.fit(cfg, cli.name, both - kv, of=SHARES) if both - kv > least else (P.uniform(cfg, 6), None)
     typical = max(cli.typical, cfg.window)
-    pool = pool_for(cfg, kv, typical / (cfg.window + E.SPARE), cli.keyless)
+    pool = pool_for(cfg, kv, typical / (cfg.window + E.SPARE + (E.TILE if kv4 else 0)), cli.keyless, kv4)
     with torch.no_grad():
-        eng = E.Engine.load(cli.name, plan, cli.head, context, sequences=cli.sequences, pool=pool, rows=cli.rows, keyless=cli.keyless)
+        eng = E.Engine.load(cli.name, plan, cli.head, context, sequences=cli.sequences, pool=pool, rows=cli.rows, keyless=cli.keyless, kv4=kv4)
         drafter = None if cli.no_drafter else E.EngineDrafter.load(eng, ckpt("drafter"), cli.name, depth=DEPTH)
     stop = (tok.eos_token_id, tok.convert_tokens_to_ids("<turn|>"), tok.convert_tokens_to_ids("<|tool_response>"))
     server = Server(tok, eng, drafter, stop, ram=int(cli.ram_gib * 2**30), prefix_ram=int(cli.prefix_gib * 2**30))
     bits = round(P.bits_per_weight(cfg, plan), 2)
-    one = E.tile_bytes(cfg, M.SLIDING) * E.ring_tiles(cfg, M.SLIDING, context, cli.rows) + E.tile_bytes(cfg, M.FULL, cli.keyless) * typical // E.TILE
+    one = (E.tile_bytes(cfg, M.SLIDING, kv4=kv4) * (E.ring_tiles(cfg, M.SLIDING, context, cli.rows) + E.extra_tiles(cfg, M.SLIDING, kv4))
+           + E.tile_bytes(cfg, M.FULL, cli.keyless) * typical // E.TILE)
     facts = {"bits_per_weight": bits, "kl_estimate": None if estimate is None else round(estimate, 3),
              "vram_gib": round(torch.cuda.memory_allocated() / 2**30, 2), "drafter": drafter is not None}
     app = App(server, tok, cli.think, cli.max_tokens, facts)
@@ -714,8 +727,11 @@ def main() -> None:
     print(f"[serve] {MODEL} at http://{cli.host}:{cli.port}/v1 · {bits} bits a weight"
           + (f" (KL about {estimate:.3f} on its own text)" if estimate else " (KL about 0.10 on its own text)")
           + f" · VRAM {facts['vram_gib']} GiB\n[serve] keys and values {kv / 2**30:.2f} GiB: about {kv // one} conversations of {typical} tokens "
-          f"at once, or {kv // (E.tile_bytes(cfg, M.SLIDING) + E.tile_bytes(cfg, M.FULL, cli.keyless)) * E.TILE} tokens of shorter ones; "
+          f"at once, or {kv // (E.tile_bytes(cfg, M.SLIDING, kv4=kv4) + E.tile_bytes(cfg, M.FULL, cli.keyless)) * E.TILE} tokens of shorter ones; "
           f"a conversation holds up to {context} tokens; thinking {'on' if cli.think else 'off'} unless asked", flush=True)
+    print(f"[serve] the pool's tiles {dict(eng.pool)}" + (" (keys and values of the sliding layers at 4 bits: --kv4)" if kv4 else "")
+          + ": conversations at once of " + ", ".join(f"{n:,} tokens {c}" for n, c in conversations_at(eng, (200, 500, 1000, 2000, 8000)).items())
+          + f" (and at most {eng.sequences} sequences)", flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

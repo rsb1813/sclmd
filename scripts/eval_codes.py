@@ -11,6 +11,7 @@ from safetensors.torch import load_file
 
 from sclmd import DATA, ckpt
 from sclmd import codes as C
+from sclmd import kvsim as KV
 from sclmd import model as M
 from sclmd.checkpoint import Checkpoint
 from sclmd.stream import Stream, cap_vram, compare
@@ -48,6 +49,11 @@ def main():
                          "times its rms (per token, or per rotation block with --int8-block), and its codebook rounded to int8 (one scale a matrix)")
     ap.add_argument("--int8-block", action="store_true", help="with --int8-inputs: a scale per rotation block instead of per token")
     ap.add_argument("--int8-book-only", action="store_true", help="with --int8-inputs: round only the codebooks (inputs as they are)")
+    ap.add_argument("--kv", choices=("none",) + KV.MODES,
+                    help="round the kept keys and values as an engine would (sclmd/kvsim.py); none or absent: not at all")
+    ap.add_argument("--seqs", type=int, help="only the first this many sequences of each category (as engine_check)")
+    ap.add_argument("--out", help="folder for the report, the kept outputs (--keep) and per-token KL (default: data/)")
+    ap.add_argument("--pair", help="tags of runs kept in --out (same set, codes and head) to score against directly, e.g. c6_kvnone,c6_kvint8")
     args = ap.parse_args()
     cap_vram()
     ck = Checkpoint(ckpt("orig"))
@@ -57,7 +63,16 @@ def main():
                                 + ([f"head{head}"] if head else [])))
     if args.int8_inputs:
         tag += f"_s8in{args.int8_inputs:g}" + ("blk" if args.int8_block else "") + ("_bookonly" if args.int8_book_only else "")
+    if args.kv and not args.tag:
+        tag += f"_kv{args.kv}" + (f"_s{args.seqs}" if args.seqs else "")
+    kept = KV.Kept(ck.cfg, args.kv) if args.kv and args.kv != "none" else None
+    out_dir = args.out or DATA
+    os.makedirs(out_dir, exist_ok=True)
     ids, category, names, target = load_set(args.set)
+    rows = None
+    if args.seqs:  # the first --seqs of each category, as engine_check scores them
+        rows = [i for c in range(len(names)) for i in [j for j, cj in enumerate(category) if cj == c][: args.seqs]]
+        ids, category, target = ids[rows], [category[i] for i in rows], target[rows]
 
     def weights(i, w):
         if i not in plan:
@@ -74,18 +89,29 @@ def main():
     t = time.time()
     if plan:
         hidden = Stream(ck, batch=args.batch).run(ids, weights=weights, dtype=torch.float32,
-                                                  linear=linear if args.int8_inputs else None)["hidden"].cpu()
+                                                  linear=linear if args.int8_inputs else None, kept=kept)["hidden"].cpu()
     else:  # only the head differs: the original's own outputs
+        if kept:
+            raise SystemExit("--kv needs codes (--layers or --plan): the original's stored outputs kept nothing")
         hidden = torch.load(os.path.join(DATA, f"{args.set}_orig_fp32.pt"), weights_only=True)["hidden"]
+        hidden = hidden if rows is None else hidden[rows]
     seconds = time.time() - t
     if args.keep:
-        torch.save({"hidden": hidden}, os.path.join(DATA, f"{args.set}_codes_{args.name}_{tag}.pt"))
+        torch.save({"hidden": hidden} | ({"rows": rows} if args.kv or rows else {}), os.path.join(out_dir, f"{args.set}_codes_{args.name}_{tag}.pt"))
     torch.cuda.empty_cache()
     norm = ck.norm("cuda")
     report = {"set": args.set, "codes": args.name, "tag": tag, "seconds": round(seconds, 1),
               "bits_per_weight": bits_per_weight(ck.cfg, plan), "head_bits_per_weight": head / 2 if head else None, "against": {}}
+    if args.kv:
+        report["kv"] = {"mode": args.kv, "rows": rows,
+                        "bytes_a_position": kept.bytes_a_position() if kept else None,
+                        "noise": kept.noise_report() if kept else None}
+    tokens = {}  # reference -> every target position's KL, in order
     for ref_name in ("orig_fp32", "orig"):
+        if args.kv and not os.path.exists(os.path.join(DATA, f"{args.set}_{ref_name}.pt")):
+            continue  # a set the original has not been run on: only the paired runs (--pair) score it
         ref = torch.load(os.path.join(DATA, f"{args.set}_{ref_name}.pt"), weights_only=True)["hidden"]
+        ref = ref if rows is None else ref[rows]
         # one float32 matrix of the head's size is 5.6 GB: the reference's and the path's are on the GPU together only
         # when they differ
         embed = ck.embed("cuda")
@@ -96,17 +122,56 @@ def main():
         result = compare(ck.cfg, ref, hidden, ref_norm, ref_embed, ids, target, test_norm=norm.float(), test_embed=test_embed, per_token=each)
         report["against"][ref_name] = by_category(result, category, names)
         each = torch.cat(each).float()
+        if args.kv:
+            tokens[ref_name] = each
         report["against"][ref_name]["all"] |= {f"kl_{n}": float(v) for n, v in zip(("p50", "p90", "p99", "p999"), torch.quantile(each, torch.tensor([0.5, 0.9, 0.99, 0.999])))} | {"kl_max": float(each.max())}
         del ref, ref_embed, test_embed
         torch.cuda.empty_cache()
+    if args.pair:  # other runs of the same codes and head: what this one changes, position by position
+        test_embed = C.load_head(args.name, head) if head else ck.embed("cuda").float()
+        for other in args.pair.split(","):
+            path = os.path.join(out_dir, f"{args.set}_codes_{args.name}_{other}.pt")
+            if other == tag or not os.path.exists(path):
+                continue
+            stored = torch.load(path, weights_only=True)
+            if stored.get("rows") != rows:
+                raise SystemExit(f"{path} holds other sequences ({stored.get('rows')}) than this run ({rows})")
+            each = []
+            result = compare(ck.cfg, stored["hidden"], hidden, norm.float(), test_embed, ids, target, test_norm=norm.float(), test_embed=test_embed,
+                             per_token=each)
+            report["against"][f"run:{other}"] = by_category(result, category, names)
+            tokens[f"run:{other}"] = torch.cat(each)
+            # per sequence: a sequence whose every target agrees (top1 1.0) has the same greedy choices all along
+            tokens[f"seq_top1:{other}"] = torch.tensor(result["top1"], dtype=torch.float64)
+            del stored
+        del test_embed
+        torch.cuda.empty_cache()
+    if tokens:
+        torch.save(tokens, os.path.join(out_dir, f"{args.set}_codes_{args.name}_{tag}_tokens.pt"))
+        report["per_token"] = {ref: KV.quantiles(v) for ref, v in tokens.items() if not ref.startswith("seq_")}
+        for ref, v in tokens.items():
+            if ref.startswith("seq_top1:"):  # sequences whose greedy choice never differs, by category
+                same = {nm: [int(v[j] == 1.0) for j, c in enumerate(category) if c == ci] for ci, nm in enumerate(names)}
+                report["against"]["run:" + ref.split(":", 1)[1]]["sequences_all_same"] = {nm: [sum(s), len(s)] for nm, s in same.items() if s}
     where = "" if args.set == "eval_v1" else args.set + "_"  # the evaluation set's reports carry no set name
-    with open(os.path.join(DATA, f"{where}codes_{args.name}_{tag}.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, f"{where}codes_{args.name}_{tag}.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
-    a, b = report["against"]["orig_fp32"], report["against"]["orig"]
-    print(f"{tag}: KL vs fp32 original {a['all']['kl']:.4f} (top1 {a['all']['top1']:.4f}), vs bf16 original {b['all']['kl']:.4f} (top1 {b['all']['top1']:.4f}), "
-          f"ppl {a['all']['ppl']:.3f} | " + " ".join(f"{c} {v['kl']:.4f}" for c, v in a.items() if c != "all"), flush=True)
-    print(f"  per-token KL vs bf16 original: p50 {b['all']['kl_p50']:.4f} p90 {b['all']['kl_p90']:.4f} p99 {b['all']['kl_p99']:.4f} "
-          f"p99.9 {b['all']['kl_p999']:.4f} max {b['all']['kl_max']:.3f}; vs fp32: p99 {a['all']['kl_p99']:.4f} max {a['all']['kl_max']:.3f}", flush=True)
+    if "orig_fp32" in report["against"]:
+        a, b = report["against"]["orig_fp32"], report["against"]["orig"]
+        print(f"{tag}: KL vs fp32 original {a['all']['kl']:.4f} (top1 {a['all']['top1']:.4f}), vs bf16 original {b['all']['kl']:.4f} (top1 {b['all']['top1']:.4f}), "
+              f"ppl {a['all']['ppl']:.3f} | " + " ".join(f"{c} {v['kl']:.4f}" for c, v in a.items() if c != "all"), flush=True)
+        print(f"  per-token KL vs bf16 original: p50 {b['all']['kl_p50']:.4f} p90 {b['all']['kl_p90']:.4f} p99 {b['all']['kl_p99']:.4f} "
+              f"p99.9 {b['all']['kl_p999']:.4f} max {b['all']['kl_max']:.3f}; vs fp32: p99 {a['all']['kl_p99']:.4f} max {a['all']['kl_max']:.3f}", flush=True)
+    else:
+        print(f"{tag}: no stored original for {args.set}; paired runs only", flush=True)
+    for ref, q in report.get("per_token", {}).items():
+        extra = report["against"][ref] if ref.startswith("run:") else None
+        print(f"  per-token KL vs {ref}: mean {q['mean']:.5f} p50 {q['p50']:.5f} p90 {q['p90']:.5f} p99 {q['p99']:.4f} p99.9 {q['p999']:.4f} max {q['max']:.3f}"
+              + (f" | top1 {extra['all']['top1']:.4f} | " + " ".join(f"{c} {v['kl']:.4f}/{v['top1']:.4f}" for c, v in extra.items() if c not in ("all", "sequences_all_same"))
+                 + (f" | sequences all same {extra['sequences_all_same']}" if "sequences_all_same" in extra else "") if extra else ""), flush=True)
+    if args.kv and kept:
+        nr = report["kv"]["noise"]
+        print(f"  noise energy: keys {nr['k']['mean_by_bits']} values {nr['v']['mean_by_bits']}; {report['kv']['bytes_a_position']:,} bytes a position", flush=True)
 
 
 _ROTATIONS = {}

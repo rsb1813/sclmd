@@ -52,14 +52,18 @@ def main():
     ap.add_argument("--seqs", type=int, default=1, help="sequences of each category to score (0: only time it)")
     ap.add_argument("--same", help="tag of an eval_codes --keep run with this plan, to compare with")
     E.add_int8_option(ap)
+    E.add_kv4_option(ap)
+    ap.add_argument("--tokens-out", help="also store every scored position's KL against each reference here (torch .pt)")
     args = ap.parse_args()
     int8 = E.use_int8_option(args)
+    kv4 = E.use_kv4_option(args)
     cap_vram()
     ck = Checkpoint(ckpt("orig"))
     cfg = ck.cfg
     plan, head, tag = plan_of(args, cfg)
     tag += "_keyless" if args.keyless else ""
     tag += f"_int8_{int8:g}" if int8 else ""
+    tag += "_kv4" if kv4 else ""
     t = time.time()
     eng = E.Engine.load(args.name, plan, head, args.capacity, keyless=args.keyless)
     torch.cuda.synchronize()
@@ -119,6 +123,7 @@ def main():
         if args.same:
             refs.insert(0, ("same_codes_pytorch", f"{args.set}_codes_{args.name}_{args.same}.pt"))
         sub_cat = [category[s] for s in rows]
+        tokens = {}
         for ref_name, file in refs:
             ref = torch.load(os.path.join(DATA, file), weights_only=True)["hidden"][rows]
             if ref_name == "same_codes_pytorch":
@@ -132,6 +137,7 @@ def main():
             report["against"][ref_name] = by_category(result, sub_cat, names)
             a = report["against"][ref_name]
             each = torch.cat(each).float()
+            tokens[ref_name] = each
             a["all"] |= {f"kl_{q}": float(v) for q, v in zip(("p50", "p90", "p99", "p999"), torch.quantile(each, torch.tensor([0.5, 0.9, 0.99, 0.999])))}
             a["all"]["kl_max"] = float(each.max())
             print(f"[engine] against {ref_name}: per-token KL p90 {a['all']['kl_p90']:.4f} p99 {a['all']['kl_p99']:.4f} p99.9 {a['all']['kl_p999']:.4f} "
@@ -140,6 +146,8 @@ def main():
                   + " ".join(f"{c} {v['kl']:.4f}" for c, v in a.items() if c != "all"), flush=True)
             del ref, ref_embed
             torch.cuda.empty_cache()
+    if rows and args.tokens_out:
+        torch.save({"rows": rows, **tokens}, args.tokens_out)
     with open(os.path.join(DATA, f"engine_{args.name}_{tag}.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
 

@@ -26,14 +26,17 @@ class Stream:
         self.ckpt, self.cfg, self.device, self.batch = ckpt, ckpt.cfg, device, batch
 
     @torch.no_grad()
-    def run(self, ids: torch.Tensor, n_layers: int | None = None, weights=None, tap=None, log=None, dtype=None, linear=None) -> dict:
+    def run(self, ids: torch.Tensor, n_layers: int | None = None, weights=None, tap=None, log=None, dtype=None, linear=None,
+            kept=None) -> dict:
         """ids [sequences, n], every sequence from position 0.
         weights(i, w) -> w: replaces a layer's weights (quantized variants).
         tap(i, name, tensor, rows): the input of each group of matrices of layer i, for the sequences `rows`.
         Returns "hidden" (the last layer's output, before the final norm) and "shared" (the keys and values the drafter
         attends to: layer type -> (keys, values)).
         dtype: compute in this type instead of the checkpoint's (float32: the arithmetic without bf16's rounding).
-        linear(i, x, weight): the matrix products of layer i (default F.linear), e.g. to simulate rounded inputs."""
+        linear(i, x, weight): the matrix products of layer i (default F.linear), e.g. to simulate rounded inputs.
+        kept(i, kind, x) -> x: what layer i keeps of its new keys (kind "k", after the rotary turn) and values ("v"),
+        e.g. a rounding of them (sclmd/kvsim.py); attention then reads what it returns."""
         cfg, dev = self.cfg, self.device
         n_layers = cfg.n_layers if n_layers is None else n_layers
         ids = ids.to(dev)
@@ -57,7 +60,8 @@ class Stream:
                 shared = {}
                 h[rows] = M.layer_forward(cfg, i, w, h[rows], positions, shared=shared,
                                           tap=(lambda name, x, i=i, rows=rows: tap(i, name, x, rows)) if tap else None,
-                                          linear=(lambda x, wt, i=i: linear(i, x, wt)) if linear else F.linear)
+                                          linear=(lambda x, wt, i=i: linear(i, x, wt)) if linear else F.linear,
+                                          kept=_kinds(kept, i) if kept else None)
                 for t, (k, v, _) in shared.items():
                     shared_all.setdefault(t, []).append((k.cpu(), v.cpu()))
             del w
@@ -65,6 +69,13 @@ class Stream:
                 log(f"layer {i + 1}/{n_layers}, {time.time() - t0:.0f} s")
         out = {"hidden": h, "shared": {t: (torch.cat([k for k, _ in kv]), torch.cat([v for _, v in kv])) for t, kv in shared_all.items()}}
         return out
+
+
+def _kinds(kept, i: int):
+    """kept(i, kind, x) as layer_forward's one-argument `kept`, for one call of it: layer_forward applies it to the
+    layer's new keys and then to its values (tests/test_kv4.py checks the order)."""
+    kinds = iter(("k", "v"))
+    return lambda x: kept(i, next(kinds), x)
 
 
 @torch.no_grad()

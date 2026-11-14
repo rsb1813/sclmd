@@ -290,8 +290,10 @@ def main() -> None:
     ap.add_argument("--reserve", type=float, default=VRAM_MARGIN / 2**30, help="GiB of the VRAM that is free now to leave to other "
                     "programs. Less means more matrices at 4 bits; if other programs then take more, Windows pages VRAM out and everything slows down")
     E.add_int8_option(ap)
+    E.add_kv4_option(ap)
     cli = ap.parse_args()
     E.use_int8_option(cli)
+    kv4 = E.use_kv4_option(cli)
     reserve = int(cli.reserve * 2**30)
     console = Console()
     console.print("[grey62]모델을 올리는 중입니다 (약 15초)…[/]")
@@ -306,7 +308,7 @@ def main() -> None:
     if cli.plan == "auto":
         # what is free now, less what PyTorch is kept from (cap_vram), the rest of the engine, and room to load in
         free = torch.cuda.mem_get_info()[0] - reserve
-        rest = E.fixed_bytes(cfg, head, cli.context, rows=cli.rows, keyless=cli.keyless) + (0 if cli.no_drafter else E.DRAFTER_BYTES)
+        rest = E.fixed_bytes(cfg, head, cli.context, rows=cli.rows, keyless=cli.keyless, kv4=kv4) + (0 if cli.no_drafter else E.DRAFTER_BYTES)
         budget = free - rest - LOAD_ROOM
         if budget < P.code_bytes(cfg, P.uniform(cfg, 6)):
             console.print(f"[yellow]VRAM이 모자랍니다: 지금 비어 있는 것은 {(free + reserve) / 2**30:.1f}GiB이고, 전부 3bit로도 "

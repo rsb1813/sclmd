@@ -82,6 +82,12 @@ struct Layer {
     int head_dim, kv_heads;
     int ring;      // sliding: (window + spare) / 16, so positions go round; full: capacity / 16
     int turned;    // the rotated pairs, in whole 16s: the first `turned` values of each half of a head are turned
+    // An option, off when 0 (brief K3, lossy): kv4 1: this sliding layer keeps its keys and values at 4 bits in a
+    // turned basis (see kv4_heads_k): keys and values are then 4-bit codes, kscale and vscale their scales, and a
+    // sequence's first tile is int8, its positions 8..15 in the pool tile first[sequence].
+    int kv4, kv4_pad;
+    const float* kv4_signs;  // [kv_heads][head_dim] +1 / -1: the signs of the turn (sclmd/kvsim.py)
+    const int32_t* first;    // [sequences]
 };
 
 struct Model {
@@ -989,6 +995,425 @@ __global__ void attend_wide_k(const uint16_t* probs, const int8_t* values, float
         }
 }
 
+// ---- Brief K3 (an option, off by default; lossy): a sliding layer's keys and values at 4 bits (Layer::kv4).
+// The format is sclmd/kvsim.py's k4v4t0, whose cost was simulated first (logs/exp/K3-kv4-sliding). A key (after the
+// rotary turn) or a value (RMS-normed) x of key head h is kept as
+//   y = H (s * x)           s: the layer's signs of the head (Layer::kv4_signs), H: the Walsh-Hadamard matrix / sqrt(hd)
+//   scale = RMS(y) * KV4_UNIT   (the top level, 127, is 2.73 RMS: the Gaussian Lloyd-Max levels), in today's scale slot
+//   code = the nearest of 16 levels on the int8 grid (+-6, 18, 31, 44, 58, 75, 96, 127): how many of the 15 midpoints are below y / scale
+// so that the kept vector is s * H (level * scale). H is symmetric and orthonormal, so q . that = (H (s * q)) . (level *
+// scale): the scores take the query turned the same way against the levels, and the weighted sum of the values is
+// turned back once a row and head (kv4_unrot_k). A sequence's first tile (positions 0..15, where attention's sinks sit)
+// is kept as without the option: int8 of x itself, its positions 0..7 in the bytes of its ring tile 0 and 8..15 in
+// those of a second tile, Layer::first[sequence] (an int8 vector is two 4-bit ones' bytes). The scores read that tile
+// with the query as it is, and kv4_unrot_k adds its share of the weighted sum. Every 4-bit position's bytes lie within
+// the int8 rows of position p / 2 there, so when the ring goes round, writing positions 16 ring + p over the ring tile 0
+// takes only first-tile positions no row of the pass (nor a turn cropped back to, Engine._kept) still reads, as int8 does.
+// A layer's tile holds 16 x kvh x hd / 2 bytes of keys and as many of values (and today's scales, a float a vector):
+//   keys:   [16 positions][kvh][hd / 2]: lane t's step u of the scores (values 16u + 2t, 2t+1, 2t+8, 2t+9, two to a
+//           byte, the lower value in the low nibble) at bytes 2 (t hd / 16 + u) and + 1 of the position's head
+//   values: [16 positions][kvh][hd / 2]: byte b of a position's head holds its values 2b (low nibble) and 2b + 1
+//   the first tile's int8: [8 positions][kvh][hd] in each of its two tiles' bytes
+static const int KV4_FIRST = 16;
+__host__ __device__ constexpr uint32_t kv4_word(int a, int b, int c, int d) {
+    return uint32_t(uint8_t(a)) | uint32_t(uint8_t(b)) << 8 | uint32_t(uint8_t(c)) << 16 | uint32_t(uint8_t(d)) << 24;
+}
+// the levels of codes 0..15, four to a word (sclmd/kvsim.py grid_levels(4))
+#define KV4_W0 kv4_word(-127, -96, -75, -58)
+#define KV4_W1 kv4_word(-44, -31, -18, -6)
+#define KV4_W2 kv4_word(6, 18, 31, 44)
+#define KV4_W3 kv4_word(58, 75, 96, 127)
+#define KV4_CUTS {-111.5f, -85.5f, -66.5f, -51.0f, -37.5f, -24.5f, -12.0f, 0.0f, 12.0f, 24.5f, 37.5f, 51.0f, 66.5f, 85.5f, 111.5f}
+__constant__ float kv4_cut[15] = KV4_CUTS;
+static const float kv4_cut_host[15] = KV4_CUTS;
+constexpr float KV4_UNIT = 0.021516453474760056f;  // the top Lloyd-Max level of 16 (2.7326 RMS) / 127, as float32
+
+// Four codes (the low 16 bits of w, a nibble each, the first lowest) as their levels, an int8 a byte in the same order.
+__device__ __forceinline__ uint32_t kv4_bytes(uint32_t w) {
+    const uint32_t s = w & 0x7777u;  // a code's low three bits pick a level among eight, its fourth which eight
+    const uint32_t lo = __byte_perm(KV4_W0, KV4_W1, s), hi = __byte_perm(KV4_W2, KV4_W3, s);
+    const uint32_t x = (w >> 3) & 0x1111u;
+    const uint32_t m = (__byte_perm(x, x >> 4, 0x5140) & 0x01010101u) * 0xFFu;  // 0xff in the bytes of codes 8..15
+    return (lo & ~m) | (hi & m);
+}
+
+// Two int8 bytes of w, picked by sel (0x4140: bytes 0 and 1; 0x4342: 2, 3; 0x4240: 0, 2; 0x4341: 1, 3), as two fp16
+// in one register (as i8x2).
+__device__ __forceinline__ uint32_t i8x2_of(uint32_t w, uint32_t sel) {
+    const uint32_t x = __byte_perm(w ^ 0x80808080u, 0x64646464u, sel);
+    const __half2 h = __hsub2(*(const __half2*)&x, __halves2half2(__ushort_as_half(0x6480), __ushort_as_half(0x6480)));
+    return *(const uint32_t*)&h;
+}
+
+// The code of y in a vector of this scale: how many midpoints are below y / scale (torch.bucketize, as kvsim does).
+__device__ __forceinline__ uint32_t kv4_code(float y, float scale) {
+    const float x = y / scale;
+    uint32_t c = 0;
+#pragma unroll
+    for (int i = 0; i < 15; ++i) c += kv4_cut[i] < x;
+    return c;
+}
+
+// heads_k for a 4-bit layer (same grid and threads): the queries go out twice, as they are (qplain, for the first
+// tile) and turned (qhat); a key or value at a position past the first tile as 4-bit codes, in the first tile as int8.
+__global__ void kv4_heads_k(const float* yq, const float* yk, const float* yv, const float* q_norm, const float* k_norm, const float* inv_freq,
+                            uint16_t* qhat, uint16_t* qplain, uint8_t* keys, uint8_t* values, float* kscale, float* vscale, const int32_t* tiles,
+                            const int32_t* first, const float* signs, Att a, int heads, int kvh, int ring, float eps) {
+    const int hd = blockDim.x, v = blockIdx.x, token = blockIdx.y, d = threadIdx.x, half = hd / 2;
+    const int kind = v < heads ? 0 : v < heads + kvh ? 1 : 2, head = kind == 0 ? v : kind == 1 ? v - heads : v - heads - kvh;
+    const float* src = kind == 0 ? yq + (size_t(token) * heads + head) * hd : (kind == 1 ? yk : yv) + (size_t(token) * kvh + head) * hd;
+    __shared__ float buf[1024];
+    const float val = src[d];
+    const float r = powf(block_sum(val * val) / hd + eps, -0.5f);
+    const int seg = seg_of_row(a, token), pos = a.pos0[seg] + token - a.row0[seg], seq = a.seq[seg];
+    float out = val * r;  // a value; a query or key is normed with its weight and turned by its position, as heads_k does
+    if (kind != 2) {
+        buf[d] = val * r * (kind == 0 ? q_norm[d] : k_norm[d]);
+        __syncthreads();
+        const float ang = float(pos) * inv_freq[d % half];
+        const float turned = d < half ? -buf[d + half] : buf[d - half];
+        out = buf[d] * cosf(ang) + turned * sinf(ang);
+    }
+    const int kh = kind == 0 ? head / (heads / kvh) : head;
+    const size_t tile_bytes = size_t(16) * kvh * hd / 2;
+    if (kind == 0) qplain[(size_t(token) * heads + head) * hd + d] = __half_as_ushort(__float2half(out));
+    if (kind != 0 && pos < KV4_FIRST) {  // the sequence's first tile: int8 of the vector itself, as heads_k keeps it
+        const float most = block_max(fabsf(out)), scale = most > 0 ? most / 127.0f : 1.0f;
+        const int tile = pos < 8 ? tiles[size_t(seq) * ring] : first[seq], sub = pos & 7;
+        (kind == 1 ? keys : values)[tile * tile_bytes + (size_t(sub) * kvh + kh) * hd + d] = uint8_t(int8_t(rintf(out / scale)));
+        if (d == 0) (kind == 1 ? kscale : vscale)[(size_t(tile) * 16 + sub) * kvh + kh] = scale;
+        return;
+    }
+    __syncthreads();  // (the rotary turn has read buf)
+    buf[d] = out * signs[kh * hd + d];
+    __syncthreads();
+    for (int h = 1; h < hd; h <<= 1) {
+        const float lo = buf[d & ~h], hi = buf[d | h];
+        __syncthreads();
+        buf[d] = (d & h) ? lo - hi : lo + hi;
+        __syncthreads();
+    }
+    const float y = buf[d] * (1.0f / sqrtf(float(hd)));
+    if (kind == 0) {
+        qhat[(size_t(token) * heads + head) * hd + d] = __half_as_ushort(__float2half(y));
+        return;
+    }
+    const float rms = sqrtf(block_sum(y * y) / hd), scale = rms > 0 ? rms * KV4_UNIT : 1.0f;
+    const uint32_t code = kv4_code(y, scale), other = __shfl_down_sync(0xffffffffu, code, 1);
+    const size_t slot = slot_of(tiles, ring, seq, pos);
+    if (d == 0) (kind == 1 ? kscale : vscale)[slot * kvh + kh] = scale;
+    if (d & 1) return;
+    const uint8_t byte = uint8_t(code | other << 4);  // values d and d + 1 of the position
+    if (kind == 1) {
+        const int u = d >> 4, c = d & 15, t = (c & 7) >> 1;
+        keys[(slot * kvh + kh) * (hd / 2) + 2 * (t * (hd / 16) + u) + (c >> 3)] = byte;
+    } else {
+        values[(slot * kvh + kh) * (hd / 2) + (d >> 1)] = byte;
+    }
+}
+
+// The first tile's scores, int8 in the plain basis, as scores_body takes a tile of int8 keys: its positions 0..7 from
+// the ring tile 0, 8..15 from the sequence's second tile. c: the sums; sa, sb: the scales of positions g and g + 8.
+template <int HD>
+__device__ __forceinline__ void kv4_first_scores(float c[4], float& sa, float& sb, const uint8_t* keys, const float* kscale, const int32_t* tiles,
+                                                 const int32_t* first, int seq, int ring, int kvh, int kh, int g, int t, const uint16_t* qa, bool has) {
+    const int ta = tiles[size_t(seq) * ring], tb = first[seq];
+    const size_t bytes = size_t(16) * kvh * HD / 2;
+    const int8_t* ka = (const int8_t*)keys + ta * bytes + (size_t(g) * kvh + kh) * HD + 2 * t;
+    const int8_t* kb = (const int8_t*)keys + tb * bytes + (size_t(g) * kvh + kh) * HD + 2 * t;
+    int j = 0;
+    scores_plain<HD / 16>(c, j, HD, ka, kb, qa, has);
+    sa = kscale[(size_t(ta) * 16 + g) * kvh + kh], sb = kscale[(size_t(tb) * 16 + g) * kvh + kh];
+}
+
+// The scores of a 4-bit layer, a warp a group as scores32_k: block (position tile of a segment, key head, blocks of
+// groups). A lane reads its two positions' codes of the whole head at once (hd / 8 bytes each) and makes the
+// instruction's fp16 of them step by step.
+template <int HD>
+__global__ void kv4_scores_k(const uint16_t* qhat, const uint16_t* qplain, const uint8_t* keys, const float* kscale, float* scores,
+                             const int32_t* tiles, const int32_t* first, Att a, int heads, int kvh, int ring) {
+    constexpr int NW = HD / 32, STEPS = HD / 16;  // a lane's words of a position, and the instruction's steps over a head
+    int seg = 0;
+    for (int i = 1; i < a.n; ++i)
+        if (int(blockIdx.x) >= a.tile0[i]) seg = i;
+    const int rep = heads / kvh, nq = rep * a.cnt[seg], stride = a.stride[seg];
+    const int tile = blockIdx.x - a.tile0[seg], kh = blockIdx.y, group = blockIdx.z * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    if (group * 8 >= nq) return;
+    const int query = group * 8 + g, at = a.base[seg] + 16 * tile, seq = a.seq[seg];
+    const bool has = query < nq;
+    const size_t qo = (size_t(a.row0[seg] + (has ? query / rep : 0)) * heads + kh * rep + (has ? query % rep : 0)) * HD + 2 * t;
+    float c[4] = {0, 0, 0, 0}, sa, sb;
+    if (at == 0) {
+        kv4_first_scores<HD>(c, sa, sb, keys, kscale, tiles, first, seq, ring, kvh, kh, g, t, qplain + qo, has);
+    } else {
+        const size_t slot = slot_of(tiles, ring, seq, at);
+        const uint8_t* ka = keys + ((slot + g) * kvh + kh) * (HD / 2) + t * (HD / 8);
+        const uint8_t* kb = keys + ((slot + g + 8) * kvh + kh) * (HD / 2) + t * (HD / 8);
+        uint32_t wa[NW], wb[NW], b0[STEPS], b1[STEPS];
+        if constexpr (NW % 4 == 0) {
+#pragma unroll
+            for (int k = 0; k < NW / 4; ++k) ((uint4*)wa)[k] = ((const uint4*)ka)[k], ((uint4*)wb)[k] = ((const uint4*)kb)[k];
+        } else {
+#pragma unroll
+            for (int k = 0; k < NW; ++k) wa[k] = ((const uint32_t*)ka)[k], wb[k] = ((const uint32_t*)kb)[k];
+        }
+#pragma unroll
+        for (int u = 0; u < STEPS; ++u)
+            b0[u] = has ? *(const uint32_t*)(qhat + qo + 16 * u) : 0, b1[u] = has ? *(const uint32_t*)(qhat + qo + 16 * u + 8) : 0;
+#pragma unroll
+        for (int u = 0; u < STEPS; ++u) {
+            const uint32_t xa = kv4_bytes(wa[u >> 1] >> (16 * (u & 1))), xb = kv4_bytes(wb[u >> 1] >> (16 * (u & 1)));
+            mma(c, i8x2_of(xa, 0x4140), i8x2_of(xb, 0x4140), i8x2_of(xa, 0x4342), i8x2_of(xb, 0x4342), b0[u], b1[u]);
+        }
+        sa = kscale[(slot + g) * kvh + kh], sb = kscale[(slot + g + 8) * kvh + kh];
+    }
+    float* out = scores + a.off[seg];
+    for (int i = 0; i < 4; ++i) {
+        const int q = group * 8 + 2 * t + (i & 1), r = 16 * tile + g + (i >= 2 ? 8 : 0);
+        if (q < nq) out[(size_t(kh) * nq + q) * stride + r] = c[i] * (i >= 2 ? sb : sa);
+    }
+}
+
+// kv4_scores_k with each tile's fp16 made once a block, as scores_once_k (the same products in the same order: the
+// same bits as kv4_scores_k). Thread i makes position i / 16's values of lane (i % 16) / 4's steps 4 (i % 4) .. + 3.
+template <int HD>
+__global__ void __launch_bounds__(256) kv4_scores_once_k(const uint16_t* qhat, const uint16_t* qplain, const uint8_t* keys, const float* kscale,
+                                                         float* scores, const int32_t* tiles, const int32_t* first, Att a, int heads, int kvh,
+                                                         int ring) {
+    static_assert(HD == 256, "a thread makes 16 values of a position: 8 bytes");
+    constexpr int SROW = HD + 8, STEPS = HD / 16;
+    __shared__ __align__(16) uint16_t sh[16 * SROW];
+    int seg = 0, c0 = 0;
+    for (int i = 0, c = 0; i < a.n; c += (a.stride[i] / 16 + ONCE_TILES - 1) / ONCE_TILES, ++i)
+        if (int(blockIdx.x) >= c) seg = i, c0 = c;
+    const int rep = heads / kvh, nq = rep * a.cnt[seg], stride = a.stride[seg], seq = a.seq[seg];
+    if (int(blockIdx.z) * 64 >= nq) return;  // the whole block: no group of it has a query in this segment
+    const int kh = blockIdx.y, group = blockIdx.z * 8 + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int query = group * 8 + g;
+    const bool has = query < nq, any = group * 8 < nq;
+    const size_t qo = (size_t(a.row0[seg] + (has ? query / rep : 0)) * heads + kh * rep + (has ? query % rep : 0)) * HD + 2 * t;
+    uint32_t b0[STEPS], b1[STEPS];
+#pragma unroll
+    for (int u = 0; u < STEPS; ++u)
+        b0[u] = has ? *(const uint32_t*)(qhat + qo + 16 * u) : 0, b1[u] = has ? *(const uint32_t*)(qhat + qo + 16 * u + 8) : 0;
+    float* out = scores + a.off[seg];
+    const int lrow = (lane & 7) + ((lane >> 3) & 1) * 8, lcol = (lane >> 4) * 8;
+    const int p = threadIdx.x >> 4, ch = threadIdx.x & 15, tq = ch >> 2, u0 = 4 * (ch & 3);
+    const int t0 = (blockIdx.x - c0) * ONCE_TILES, t1 = min(stride / 16, t0 + ONCE_TILES);
+    for (int tile = t0; tile < t1; ++tile) {
+        const int at = a.base[seg] + 16 * tile;
+        float c[4] = {0, 0, 0, 0}, sa, sb;
+        if (at == 0) {  // (the whole block) the first tile, int8: each warp for itself
+            if (!any) continue;
+            kv4_first_scores<HD>(c, sa, sb, keys, kscale, tiles, first, seq, ring, kvh, kh, g, t, qplain + qo, has);
+        } else {
+            const size_t slot = slot_of(tiles, ring, seq, at);
+            __syncthreads();
+            const uint2 w = *(const uint2*)(keys + ((slot + p) * kvh + kh) * (HD / 2) + 8 * ch);
+#pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                const uint32_t x = kv4_bytes((s < 2 ? w.x : w.y) >> (16 * (s & 1)));
+                uint32_t* at2 = (uint32_t*)(sh + p * SROW + 16 * (u0 + s) + 2 * tq);
+                at2[0] = i8x2_of(x, 0x4140), at2[4] = i8x2_of(x, 0x4342);  // values 2tq, 2tq + 1 of the step, and 8 on
+            }
+            __syncthreads();
+            if (!any) continue;
+#pragma unroll
+            for (int u = 0; u < STEPS; ++u) {
+                uint32_t r[4];
+                ldsm4(r, sh + lrow * SROW + 16 * u + lcol);
+                mma(c, r[0], r[1], r[2], r[3], b0[u], b1[u]);
+            }
+            sa = kscale[(slot + g) * kvh + kh], sb = kscale[(slot + g + 8) * kvh + kh];
+        }
+        for (int i = 0; i < 4; ++i) {
+            const int q = group * 8 + 2 * t + (i & 1), r = 16 * tile + g + (i >= 2 ? 8 : 0);
+            if (q < nq) out[(size_t(kh) * nq + q) * stride + r] = c[i] * (i >= 2 ? sb : sa);
+        }
+    }
+}
+
+// softmax_k for a 4-bit layer: the same sums; the scales of the first tile's positions are where it keeps them.
+__global__ void kv4_softmax_k(const float* scores, uint16_t* probs, const float* vscale, const int32_t* tiles, const int32_t* first, Att a, int heads,
+                              int kvh, int window, int ring) {
+    const int n = blockDim.x, rep = heads / kvh, kh = blockIdx.y, row = blockIdx.x / rep, seg = seg_of_row(a, row);
+    const int nq = rep * a.cnt[seg], query = blockIdx.x - rep * a.row0[seg], pos = a.pos0[seg] + row - a.row0[seg];
+    const int base = a.base[seg], stride = a.stride[seg];
+    const size_t at = a.off[seg] + (size_t(kh) * nq + query) * stride;
+    const float* s = scores + at;
+    uint16_t* p = probs + at;
+    const int lo = (window > 0 && pos - window + 1 > 0 ? pos - window + 1 : 0) - base, last = pos - base;  // inclusive, as indices
+    const int mine = lo + ((int(threadIdx.x) - (base + lo) % n + n) % n);
+    float mx = -INFINITY;
+    for (int r = mine; r <= last; r += n) mx = fmaxf(mx, s[r]);
+    mx = block_max(mx);
+    float sum = 0;
+    for (int r = mine; r <= last; r += n) sum += expf(s[r] - mx);
+    sum = block_sum(sum);
+    const int32_t* own = tiles + size_t(a.seq[seg]) * ring;
+    const int j0 = (base >> 4) % ring;
+    for (int r = threadIdx.x; r < stride; r += n) {
+        if (r < lo || r > last) {
+            p[r] = 0;
+            continue;
+        }
+        const int j = j0 + (r >> 4), q = base + r;
+        const float scale = q < KV4_FIRST ? vscale[(size_t(q < 8 ? own[0] : first[a.seq[seg]]) * 16 + (q & 7)) * kvh + kh]
+                                          : vscale[(size_t(own[j < ring ? j : j - ring]) * 16 + (r & 15)) * kvh + kh];
+        p[r] = __half_as_ushort(__float2half(expf(s[r] - mx) / sum * (scale * BOOST)));
+    }
+}
+
+// The weighted sum of a 4-bit layer's values, in the turned basis, as attend_wide_k: block (NDT-sixteens chunk of the
+// head x blocks of groups, key head, segment), a warp NDT sixteens (NDT 1: as attend32_k), a lane's rows g and g + 8 of
+// sixteen k the values c0 + 2 NDT g + 2k and + 1: its NDT bytes of a position are one load, four positions a tile
+// (2t, 2t + 1, 2t + 8, 2t + 9), and byte k of the four is its left operand's eight codes of sixteen k. The tiles are
+// added in order. A segment that reads the sequence's first tile leaves it out: kv4_unrot_k adds it.
+// -> turned[row][head][head_dim]
+template <int NDT>
+struct Bytes;
+template <>
+struct Bytes<1> {
+    using T = uint8_t;
+};
+template <>
+struct Bytes<2> {
+    using T = uint16_t;
+};
+template <>
+struct Bytes<4> {
+    using T = uint32_t;
+};
+
+template <int S, int NDT>
+__device__ __forceinline__ void kv4_attend_steps(float c[NDT][4], int& r, int stride, const int32_t* mine, int j0, int ring, const uint8_t* vals,
+                                                 size_t row, const uint16_t* pq, bool has) {
+    using W = typename Bytes<NDT>::T;
+    for (; r + 16 * S <= stride; r += 16 * S) {
+        int32_t where[S];
+        uint32_t x[S][4], b0[S], b1[S];
+#pragma unroll
+        for (int u = 0; u < S; ++u) {
+            const int j = j0 + (r >> 4) + u;
+            where[u] = mine[j < ring ? j : j - ring];
+            b0[u] = has ? *(const uint32_t*)(pq + r + 16 * u) : 0, b1[u] = has ? *(const uint32_t*)(pq + r + 16 * u + 8) : 0;
+        }
+#pragma unroll
+        for (int u = 0; u < S; ++u) {
+            const uint8_t* va = vals + size_t(where[u]) * 16 * row;  // position 2t of the tile
+            x[u][0] = *(const W*)va, x[u][1] = *(const W*)(va + row), x[u][2] = *(const W*)(va + 8 * row), x[u][3] = *(const W*)(va + 9 * row);
+        }
+#pragma unroll
+        for (int u = 0; u < S; ++u)
+#pragma unroll
+            for (int k = 0; k < NDT; ++k) {
+                const uint32_t sel = k | (4 + k) << 4;  // byte k of two positions
+                const uint32_t w = (__byte_perm(x[u][0], x[u][1], sel) & 0xffffu) | __byte_perm(x[u][2], x[u][3], sel) << 16;
+                const uint32_t lo = kv4_bytes(w), hi = kv4_bytes(w >> 16);  // positions 2t, 2t + 1; 2t + 8, 2t + 9
+                mma(c[k], i8x2_of(lo, 0x4240), i8x2_of(lo, 0x4341), i8x2_of(hi, 0x4240), i8x2_of(hi, 0x4341), b0[u], b1[u]);
+            }
+    }
+}
+
+template <int AHEAD, int NDT>
+__global__ void kv4_attend_k(const uint16_t* probs, const uint8_t* values, float* out, const int32_t* tiles, Att a, int heads, int kvh, int hd,
+                             int ring) {
+    const int seg = blockIdx.z, rep = heads / kvh, nq = rep * a.cnt[seg], stride = a.stride[seg], base = a.base[seg];
+    const int chunks = hd / (16 * NDT), dc = blockIdx.x % chunks, group = (blockIdx.x / chunks) * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int kh = blockIdx.y, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    if (group * 8 >= nq) return;
+    const int query = group * 8 + g;
+    const bool has = query < nq;
+    const size_t c0 = size_t(16 * NDT) * dc, row = size_t(kvh) * hd / 2;  // a position's bytes
+    const uint8_t* vals = values + 2 * t * row + size_t(kh) * hd / 2 + c0 / 2 + NDT * g;
+    const int32_t* mine = tiles + size_t(a.seq[seg]) * ring;
+    const uint16_t* pq = probs + a.off[seg] + (size_t(kh) * nq + (has ? query : 0)) * stride + 2 * t;
+    const int j0 = (base >> 4) % ring;
+    float c[NDT][4];
+#pragma unroll
+    for (int k = 0; k < NDT; ++k) c[k][0] = c[k][1] = c[k][2] = c[k][3] = 0;
+    int r = base == 0 ? 16 : 0;  // the first tile is kv4_unrot_k's
+    kv4_attend_steps<AHEAD, NDT>(c, r, stride, mine, j0, ring, vals, row, pq, has);
+    if (AHEAD > 8) kv4_attend_steps<8, NDT>(c, r, stride, mine, j0, ring, vals, row, pq, has);
+    if (AHEAD > 2) kv4_attend_steps<2, NDT>(c, r, stride, mine, j0, ring, vals, row, pq, has);
+    kv4_attend_steps<1, NDT>(c, r, stride, mine, j0, ring, vals, row, pq, has);
+#pragma unroll
+    for (int k = 0; k < NDT; ++k)
+        for (int i = 0; i < 4; ++i) {
+            const int q = group * 8 + 2 * t + (i & 1), d = int(c0) + 2 * NDT * g + 2 * k + (i >= 2 ? 1 : 0);
+            if (q < nq) out[(size_t(a.row0[seg] + q / rep) * heads + kh * rep + q % rep) * hd + d] = c[k][i] * (1.0f / BOOST);
+        }
+}
+
+// Attention's output of a 4-bit layer: the weighted sum turned back (s * H sum / sqrt(hd)), and the first tile's share
+// (its weights times its int8 values, in order) where the row's segment reads it. A warp a (query head, row), eight to a
+// block: lane l holds values V l .. V l + V - 1 of the head (V = hd / 32), so the transform's first steps are a lane's
+// own and the others go between lanes; no shared memory, no waits for the block.
+template <int HD>
+__global__ void __launch_bounds__(256) kv4_unrot_k(const float* turned, float* out, const uint16_t* probs, const uint8_t* values,
+                                                   const int32_t* tiles, const int32_t* first, const float* signs, Att a, int heads, int kvh,
+                                                   int ring, int pairs) {
+    constexpr int V = HD / 32;
+    const int pair = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (pair >= pairs) return;
+    const int head = pair % heads, row = pair / heads, rep = heads / kvh, kh = head / rep, seg = seg_of_row(a, row), d0 = V * lane;
+    const size_t at = (size_t(row) * heads + head) * HD + d0;
+    float x[V];
+#pragma unroll
+    for (int i = 0; i < V; ++i) x[i] = turned[at + i];
+#pragma unroll
+    for (int h = 1; h < V; h <<= 1)
+#pragma unroll
+        for (int i = 0; i < V; ++i)
+            if (!(i & h)) {
+                const float lo = x[i], hi = x[i | h];
+                x[i] = lo + hi, x[i | h] = lo - hi;
+            }
+#pragma unroll
+    for (int m = 1; m < 32; m <<= 1) {  // value pairs h = V m apart: the lanes l and l ^ m
+        const bool upper = lane & m;
+#pragma unroll
+        for (int i = 0; i < V; ++i) {
+            const float other = __shfl_xor_sync(0xffffffffu, x[i], m);
+            x[i] = upper ? other - x[i] : x[i] + other;
+        }
+    }
+    float o[V];
+#pragma unroll
+    for (int i = 0; i < V; ++i) o[i] = x[i] * (1.0f / sqrtf(float(HD))) * signs[kh * HD + d0 + i];
+    if (a.base[seg] == 0) {
+        const int nq = rep * a.cnt[seg], query = (row - a.row0[seg]) * rep + head % rep;
+        const uint16_t* p = probs + a.off[seg] + (size_t(kh) * nq + query) * a.stride[seg];
+        const size_t bytes = size_t(16) * kvh * HD / 2;
+        const int8_t* va = (const int8_t*)values + tiles[size_t(a.seq[seg]) * ring] * bytes + size_t(kh) * HD + d0;
+        const int8_t* vb = (const int8_t*)values + first[a.seq[seg]] * bytes + size_t(kh) * HD + d0;
+        float f[V];
+#pragma unroll
+        for (int i = 0; i < V; ++i) f[i] = 0;
+        for (int r = 0; r < KV4_FIRST; ++r) {
+            const float w = __half2float(__ushort_as_half(p[r]));
+            const int8_t* v = (r < 8 ? va : vb) + size_t(r & 7) * kvh * HD;
+#pragma unroll
+            for (int i = 0; i < V; ++i) f[i] += w * float(v[i]);
+        }
+#pragma unroll
+        for (int i = 0; i < V; ++i) o[i] += f[i] * (1.0f / BOOST);
+    }
+#pragma unroll
+    for (int i = 0; i < V; ++i) out[at + i] = o[i];
+}
+
+// The format's constants (sclmd/engine.py checks them against sclmd/kvsim.py): the 16 levels, the 15 midpoints, the unit.
+API int sclmd_kv4_format(int* levels, float* cuts, float* unit) {
+    const uint32_t w[4] = {KV4_W0, KV4_W1, KV4_W2, KV4_W3};
+    for (int i = 0; i < 16; ++i) levels[i] = int8_t(uint8_t(w[i >> 2] >> (8 * (i & 3))));
+    for (int i = 0; i < 15; ++i) cuts[i] = kv4_cut_host[i];
+    *unit = KV4_UNIT;
+    return KV4_FIRST;
+}
+
 // The soft cap on the logits: tanh(v / cap) * cap.
 __global__ void softcap_k(float* logits, size_t n, float cap) {
     const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -1178,6 +1603,60 @@ API int sclmd_linear(const Model* m, const Mat* mat, const Rot* rot, const float
     return int(cudaGetLastError());
 }
 
+// A 4-bit layer's (Layer::kv4) attention, in two calls a pass. kv4_write: every row's queries (turned into qhat, as
+// they are into qplain: m.qhat past the rows' turned ones) and keys and values. kv4_read: the attention of the rows of
+// `a` (their queries at qhat and qplain), into attn; `turned` is room for as much (m.attn past the rows' output).
+static void kv4_write(const Model& m, const Layer& l, const Att& a, int tokens, const float* yq, const float* yk, const float* yv) {
+    const int hd = l.head_dim, kvh = l.kv_heads;
+    kv4_heads_k<<<dim3(m.heads + 2 * kvh, tokens), hd>>>(yq, yk, yv, l.q_norm, l.k_norm, l.inv_freq, m.qhat, m.qhat + size_t(tokens) * m.heads * hd,
+                                                       (uint8_t*)l.keys, (uint8_t*)l.values, l.kscale, l.vscale, l.tiles, l.first, l.kv4_signs, a,
+                                                       m.heads, kvh, l.ring, m.eps);
+}
+
+static void kv4_read(const Layer& l, const Att& a, int groups, const uint16_t* qhat, const uint16_t* qplain, float* attn, float* turned, float* scores,
+                     uint16_t* probs, int heads, int window) {
+    const int hd = l.head_dim, kvh = l.kv_heads, rep = heads / kvh, rows = a.row0[a.n - 1] + a.cnt[a.n - 1];
+    const uint8_t *keys = (const uint8_t*)l.keys, *values = (const uint8_t*)l.values;
+    if (groups >= once_from() && hd == 256) {
+        int blocks = 0;
+        for (int i = 0; i < a.n; ++i) blocks += (a.stride[i] / 16 + ONCE_TILES - 1) / ONCE_TILES;
+        kv4_scores_once_k<256><<<dim3(blocks, kvh, (groups + 7) / 8), 256>>>(qhat, qplain, keys, l.kscale, scores, l.tiles, l.first, a, heads, kvh, l.ring);
+    } else {
+        const int per = groups > GROUPS_A_BLOCK ? GROUPS_A_BLOCK : groups;
+        const dim3 grid(tiles_of(a), kvh, (groups + per - 1) / per);
+#define KV4_SCORES(HD) kv4_scores_k<HD><<<grid, 32 * per>>>(qhat, qplain, keys, l.kscale, scores, l.tiles, l.first, a, heads, kvh, l.ring)
+        switch (hd) {
+            case 32: KV4_SCORES(32); break;
+            case 64: KV4_SCORES(64); break;
+            case 128: KV4_SCORES(128); break;
+            default: KV4_SCORES(256); break;  // sclmd/engine.py takes these four
+        }
+#undef KV4_SCORES
+    }
+    tick(P_SCORES);
+    kv4_softmax_k<<<dim3(rep * rows, kvh), 256>>>(scores, probs, l.vscale, l.tiles, l.first, a, heads, kvh, window, l.ring);
+    tick(P_SOFTMAX);
+    const int per = groups > GROUPS_A_BLOCK ? GROUPS_A_BLOCK : groups, blocks = (groups + per - 1) / per;
+    static const int force = getenv("SCLMD_ATTEND_NDT") ? atoi(getenv("SCLMD_ATTEND_NDT")) : 0;
+    const int ndt = force ? force : groups >= ATTEND_NDT4_FROM ? 4 : groups >= ATTEND_NDT2_FROM ? 2 : 1;
+    if (ndt == 4 && hd % 64 == 0)
+        kv4_attend_k<8, 4><<<dim3(hd / 64 * blocks, kvh, a.n), 32 * per>>>(probs, values, turned, l.tiles, a, heads, kvh, hd, l.ring);
+    else if (ndt == 2 && hd % 32 == 0)
+        kv4_attend_k<16, 2><<<dim3(hd / 32 * blocks, kvh, a.n), 32 * per>>>(probs, values, turned, l.tiles, a, heads, kvh, hd, l.ring);
+    else
+        kv4_attend_k<32, 1><<<dim3(hd / 16 * blocks, kvh, a.n), 32 * per>>>(probs, values, turned, l.tiles, a, heads, kvh, hd, l.ring);
+    const int pairs = heads * rows;
+#define KV4_UNROT(HD) kv4_unrot_k<HD><<<(pairs + 7) / 8, 256>>>(turned, attn, probs, values, l.tiles, l.first, l.kv4_signs, a, heads, kvh, l.ring, pairs)
+    switch (hd) {
+        case 32: KV4_UNROT(32); break;
+        case 64: KV4_UNROT(64); break;
+        case 128: KV4_UNROT(128); break;
+        default: KV4_UNROT(256); break;
+    }
+#undef KV4_UNROT
+    tick(P_ATTEND);
+}
+
 // The pass: m.h holds the scaled embeddings of `tokens` tokens, which are the rows of `segs`; afterwards it holds the
 // last layer's output, m.hn that output after the final norm, m.logits the logits, and every layer's keys and
 // values have the new positions of each sequence (whose tiles the caller has provided). Launches only; nothing waits.
@@ -1209,6 +1688,11 @@ static int pass(const Model* mp, int tokens, const Segs* segs, int logits_from) 
         tick(P_QKV);
         const Att a = att_for(*segs, l.full, m.heads, m.window - 1);
         const int rep = m.heads / kvh, groups = (rep * a.most + 7) / 8;
+        if (l.kv4) {  // brief K3: a sliding layer that keeps its keys and values at 4 bits
+            kv4_write(m, l, a, tokens, yq, yk, yv);
+            tick(P_HEADS);
+            kv4_read(l, a, groups, m.qhat, m.qhat + size_t(tokens) * nqo, m.attn, m.attn + size_t(tokens) * nqo, m.scores, m.probs, m.heads, m.window);
+        } else {
         heads_k<<<dim3(m.heads + 2 * kvh, tokens), hd>>>(yq, yk, l.v.rows ? yv : nullptr, l.q_norm, l.k_norm, l.inv_freq, m.qhat, l.keys,
                                                        l.values, l.kscale, l.vscale, l.tiles, a, m.heads, kvh, l.ring, m.eps,
                                                        l.keys ? nullptr : l.k_norm, l.turned);
@@ -1219,6 +1703,7 @@ static int pass(const Model* mp, int tokens, const Segs* segs, int logits_from) 
         tick(P_SOFTMAX);
         attend(groups, m.probs, l.values, m.attn, l.tiles, a, m.heads, kvh, hd, l.ring);
         tick(P_ATTEND);
+        }
         prep(m, m.attn, nullptr, nullptr, nqo, l.rot_o, 1, tokens);
         tick(P_INPUT);
         gemm_of(m, tokens, l.o, m.y);

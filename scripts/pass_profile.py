@@ -32,9 +32,11 @@ def main():
     ap.add_argument("--capacity", type=int, default=8192)
     ap.add_argument("--reserve", type=float, default=0.75, help="GiB of the free VRAM left to other programs")
     E.add_int8_option(ap)
+    E.add_kv4_option(ap)
     ap.add_argument("--keyless", action="store_true", help="the full-attention layers keep their values only (Engine: keyless)")
     args = ap.parse_args()
     E.use_int8_option(args)
+    E.use_kv4_option(args)
     cap_vram(margin=int(args.reserve * 2**30))
     cfg = M.Config.load(ckpt("orig"))
     if args.plan:

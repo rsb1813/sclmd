@@ -33,8 +33,10 @@ def main():
     ap.add_argument("--save", default="")
     ap.add_argument("--against", default="")
     E.add_int8_option(ap)
+    E.add_kv4_option(ap)
     args = ap.parse_args()
     int8 = E.use_int8_option(args)
+    kv4 = E.use_kv4_option(args)
     cap_vram(margin=int(args.reserve * 2**30))
     tok = AutoTokenizer.from_pretrained(ckpt("orig"))
     cfg = M.Config.load(ckpt("orig"))
@@ -50,7 +52,7 @@ def main():
         text = tok.encode(f.read(), add_special_tokens=False)
     text = text * (1 + max(lengths) // len(text))  # a prompt longer than the document goes round it again
     kind = "server" if args.server else "chat"
-    print(f"[prefill] the {kind}'s engine, {rows} rows a pass, context {capacity}" + (f", int8 products (sigma {int8:g})" if int8 else "")
+    print(f"[prefill] the {kind}'s engine, {rows} rows a pass, context {capacity}" + (f", int8 products (sigma {int8:g})" if int8 else "") + (", 4-bit sliding keys and values (--kv4)" if kv4 else "")
           + f"; the library: {os.path.abspath(E.DLL)}", flush=True)
     sums = []
     for n in lengths:
@@ -66,7 +68,7 @@ def main():
         assert logits.shape[0] == tail and hidden.shape[0] == tail
         sums.append([n] + bits(logits[-1]) + bits(hidden) + [x for group in eng.kv_all.values() for t2 in group if t2.dtype == torch.int8 for x in bits(t2)])
         print(f"[prefill] {n:6d} tokens in {s:6.2f} s = {n / s:7.1f} tok/s", flush=True)
-    name = f"prefill_{kind}_{rows}" + (f"_{capacity}" if args.capacity else "") + ("_keyless" if args.keyless else "") + (f"_int8_{int8:g}" if int8 else "")
+    name = f"prefill_{kind}_{rows}" + (f"_{capacity}" if args.capacity else "") + ("_keyless" if args.keyless else "") + (f"_int8_{int8:g}" if int8 else "") + ("_kv4" if kv4 else "")
     if args.save:
         with open(os.path.join(FOLDER, f"{name}_{args.save}.json"), "w", encoding="utf-8", newline="\n") as f:
             json.dump(sums, f)

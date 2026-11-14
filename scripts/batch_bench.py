@@ -38,10 +38,10 @@ PROMPTS = [
 ]
 
 
-def pool_for(cfg: M.Config, budget: int, full_per_sliding: float = 1.0) -> dict:
+def pool_for(cfg: M.Config, budget: int, full_per_sliding: float = 1.0, kv4: bool = False) -> dict:
     """Tiles of keys and values for `budget` bytes: `full_per_sliding` tiles of the full-attention layers for each tile
     of the sliding ones (texts shorter than the sliding window need one of each for every 16 tokens)."""
-    unit = E.tile_bytes(cfg, M.SLIDING) + full_per_sliding * E.tile_bytes(cfg, M.FULL)
+    unit = E.tile_bytes(cfg, M.SLIDING, kv4=kv4) + full_per_sliding * E.tile_bytes(cfg, M.FULL)
     n = int(budget // unit)
     return {M.SLIDING: n, M.FULL: int(n * full_per_sliding)}
 
@@ -61,8 +61,10 @@ def main():
     ap.add_argument("--rows", type=int, default=32, help="the most rows of a pass (8, 16 or 32)")
     ap.add_argument("--out", default=os.path.join(DATA, "batch_bench.json"))
     E.add_int8_option(ap)
+    E.add_kv4_option(ap)
     args = ap.parse_args()
     E.use_int8_option(args)
+    kv4 = E.use_kv4_option(args)
     counts = [int(c) for c in args.counts.split(",")]
     cap_vram()
     tok = AutoTokenizer.from_pretrained(ckpt("orig"))
@@ -74,9 +76,9 @@ def main():
         head = head or args.head
     # what the VRAM that is free now leaves for keys and values, after the codes, the head, the drafter and room to load in
     free = torch.cuda.mem_get_info()[0] - VRAM_MARGIN
-    rest = E.fixed_bytes(cfg, head, args.capacity, pool={M.SLIDING: 0, M.FULL: 0}, rows=args.rows) + (0 if args.no_drafter else E.DRAFTER_BYTES)
+    rest = E.fixed_bytes(cfg, head, args.capacity, pool={M.SLIDING: 0, M.FULL: 0}, rows=args.rows, kv4=kv4) + (0 if args.no_drafter else E.DRAFTER_BYTES)
     budget = free - P.code_bytes(cfg, plan) - rest - (320 << 20)
-    pool = pool_for(cfg, budget)
+    pool = pool_for(cfg, budget, kv4=kv4)
     eng = E.Engine.load(args.name, plan, head, args.capacity, sequences=max(counts), pool=pool, rows=args.rows)
     drafter = None if args.no_drafter else E.EngineDrafter.load(eng, ckpt("drafter"), args.name, depth=DEPTH)
     torch.cuda.synchronize()

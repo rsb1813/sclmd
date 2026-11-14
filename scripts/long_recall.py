@@ -26,10 +26,12 @@ def main():
     ap.add_argument("--new", type=int, default=120, help="tokens to write at most")
     ap.add_argument("--name", default="v1")
     ap.add_argument("--keyless", action="store_true", help="the full-attention layers keep their values only (Engine: keyless)")
+    E.add_kv4_option(ap)
     ap.add_argument("--plan", default=os.path.join(DATA, "plans", "fit_own_v1_11.1.json"))
     ap.add_argument("--capacity", type=int, default=8192)
     ap.add_argument("--reserve", type=float, default=VRAM_MARGIN / 2**30, help="GiB of VRAM left free (the benchmarks' 16,384 context with the chat's plan: 0.4)")
     args = ap.parse_args()
+    E.use_kv4_option(args)
     cap_vram(margin=int(args.reserve * 2**30))
     tok = AutoTokenizer.from_pretrained(ckpt("orig"))
     body = []

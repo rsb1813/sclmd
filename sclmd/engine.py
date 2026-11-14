@@ -40,19 +40,40 @@ def turned(cfg: M.Config, kind: str) -> int:
     return -(-cfg.rope[kind][1] // 16) * 16
 
 
-def tile_bytes(cfg: M.Config, kind: str, keyless: bool = False) -> int:
+def kv4_layers(cfg: M.Config) -> list:
+    """The layers an engine made with kv4=True keeps at 4 bits (brief K3, sclmd/kvsim.py's k4v4t0): the sliding layers
+    other than the last one, whose keys and values the drafter reads."""
+    if M.SLIDING not in cfg.layer_types:
+        return []
+    last = cfg.last_of(M.SLIDING)
+    return [i for i, t in enumerate(cfg.layer_types) if t == M.SLIDING and i != last]
+
+
+def extra_tiles(cfg: M.Config, kind: str, kv4: bool = False) -> int:
+    """Tiles a sequence holds of a kind besides its ring: with kv4, a sliding tile for the int8 of its positions 8..15
+    (its first tile is kept at int8, which takes two 4-bit tiles' bytes: positions 0..7 sit in its ring tile 0)."""
+    return 1 if kv4 and kind == M.SLIDING and kv4_layers(cfg) else 0
+
+
+def tile_bytes(cfg: M.Config, kind: str, keyless: bool = False, kv4: bool = False) -> int:
     """VRAM of one tile of a kind: 16 positions of keys and values (int8, and a float32 scale a head) in every layer
-    of the kind; of the values only where the layers keep no keys (keyless)."""
-    return cfg.layer_types.count(kind) * TILE * cfg.kv_heads[kind] * (cfg.head_dim[kind] + 4) * (1 if keyless_kind(kind, keyless) else 2)
+    of the kind; of the values only where the layers keep no keys (keyless); at 4 bits in kv4's layers."""
+    n, kvh, hd = cfg.layer_types.count(kind), cfg.kv_heads[kind], cfg.head_dim[kind]
+    if kv4 and kind == M.SLIDING:
+        n4 = len(kv4_layers(cfg))
+        return (n - n4) * TILE * kvh * (hd + 4) * 2 + n4 * TILE * kvh * (hd // 2 + 4) * 2
+    return n * TILE * kvh * (hd + 4) * (1 if keyless_kind(kind, keyless) else 2)
 
 
-def fixed_bytes(cfg: M.Config, head_bits: int, capacity: int, pool: dict | None = None, rows: int = 8, keyless: bool = False) -> int:
+def fixed_bytes(cfg: M.Config, head_bits: int, capacity: int, pool: dict | None = None, rows: int = 8, keyless: bool = False,
+                kv4: bool = False) -> int:
     """VRAM an Engine takes besides the layers' codes: the head's codes, the keys and values, the work memory.
     pool: tiles of keys and values by kind of layer (default: what one sequence of `capacity` positions can hold);
     rows: the rows of its passes."""
     head = cfg.vocab * cfg.hidden * head_bits // 16
     kinds = dict.fromkeys(cfg.layer_types)
-    kv = sum(tile_bytes(cfg, t, keyless) * (ring_tiles(cfg, t, capacity, rows) if pool is None else pool[t]) for t in kinds)
+    kv = sum(tile_bytes(cfg, t, keyless, kv4) * (ring_tiles(cfg, t, capacity, rows) + extra_tiles(cfg, t, kv4) if pool is None else pool[t])
+             for t in kinds)
     # the logits of the main model and the drafter, attention's scores and weights, and the rest
     work = 2 * rows * cfg.vocab * 4 + cfg.heads * rows * (max(capacity, cfg.window + rows) + 32) * 6 + (32 << 20)
     work += sum(capacity * turned(cfg, t) * 4 for t in kinds if keyless_kind(t, keyless))  # cos and sin of every position
@@ -73,7 +94,8 @@ class Layer(C.Structure):
                 [(r, Rot) for r in ("rot_in", "rot_o", "rot_mlp", "rot_down")] +
                 [(p, C.c_void_p) for p in ("in_ln", "post_attn_ln", "pre_ff_ln", "post_ff_ln", "q_norm", "k_norm", "inv_freq", "keys", "values",
                                            "tiles", "kscale", "vscale", "trig")] +
-                [("scalar", C.c_float), ("full", C.c_int), ("head_dim", C.c_int), ("kv_heads", C.c_int), ("ring", C.c_int), ("turned", C.c_int)])
+                [("scalar", C.c_float), ("full", C.c_int), ("head_dim", C.c_int), ("kv_heads", C.c_int), ("ring", C.c_int), ("turned", C.c_int)] +
+                [("kv4", C.c_int), ("kv4_pad", C.c_int), ("kv4_signs", C.c_void_p), ("first", C.c_void_p)])
 
 
 class Segs(C.Structure):
@@ -110,6 +132,26 @@ def use_int8_option(args) -> float:
     if args.int8:
         os.environ["SCLMD_INT8"] = repr(float(args.int8))
     return int8_default()
+
+
+# Keys and values of the sliding layers at 4 bits (brief K3, lossy, off by default): kv4_layers() keep theirs as 4-bit
+# codes in a turned basis, a sequence's first tile at int8 (engine/sclmd.cu: kv4_heads_k). SCLMD_KV4=1 turns it on
+# for every Engine made without kv4= (the scripts' --kv4 sets it); 0 or unset: off.
+def kv4_default() -> bool:
+    return os.environ.get("SCLMD_KV4", "") not in ("", "0")
+
+
+def add_kv4_option(ap):
+    """--kv4 on a script's arguments; use_kv4_option(args) after parsing turns it on for the Engines it makes."""
+    ap.add_argument("--kv4", action="store_true",
+                    help="the sliding layers (but the drafter's) keep their keys and values at 4 bits (lossy option, off by default): "
+                         "0.52 of the memory a position up to 1,024 tokens")
+
+
+def use_kv4_option(args) -> bool:
+    if getattr(args, "kv4", False):
+        os.environ["SCLMD_KV4"] = "1"
+    return kv4_default()
 
 
 _lib = None
@@ -214,9 +256,10 @@ class Engine:
 
     def __init__(self, cfg: M.Config, layers: list, head: tuple, norm: torch.Tensor, embed: torch.Tensor, capacity: int = 8192,
                  device: str = "cuda", sequences: int = 1, pool: dict | None = None, rows: int = 8, keyless: bool = False,
-                 int8: float | None = None):
+                 int8: float | None = None, kv4: bool | None = None):
         assert capacity % TILE == 0, "the capacity is a multiple of 16"
         self.int8 = int8_default() if int8 is None else float(int8)  # 0: off; else the clip in rms of the inputs (INT8_SIGMA)
+        self.kv4 = kv4_default() if kv4 is None else bool(kv4)  # brief K3: kv4_layers() keep their keys and values at 4 bits
         assert rows in (8, 16, 32), "a pass has 8, 16 or 32 rows"
         self.cfg, self.device, self.capacity, self.sequences, self.rows = cfg, device, capacity, sequences, rows
         self.lengths = [0] * sequences  # positions each sequence holds
@@ -233,10 +276,16 @@ class Engine:
         # the same table on the GPU for the kernels. Tiles are handed out lowest first: one sequence alone has
         # tile j for its positions 16j..
         self.ring = {t: ring_tiles(cfg, t, capacity, rows) for t in kinds}
-        self.pool = {t: sequences * self.ring[t] for t in kinds} if pool is None else {t: int(pool[t]) for t in kinds}
+        # with kv4 a sequence's tile list has one more entry past its ring (extra_tiles): the tile of its positions 8..15
+        # at int8, which the kernels find in self.firsts
+        self.extra = {t: extra_tiles(cfg, t, self.kv4) for t in kinds}
+        self.width = {t: self.ring[t] + self.extra[t] for t in kinds}
+        self.pool = {t: sequences * self.width[t] for t in kinds} if pool is None else {t: int(pool[t]) for t in kinds}
         self.free = {t: list(range(self.pool[t] - 1, -1, -1)) for t in kinds}
-        self.tiles = {t: [[-1] * self.ring[t] for _ in range(sequences)] for t in kinds}
+        self.tiles = {t: [[-1] * self.width[t] for _ in range(sequences)] for t in kinds}
         self.tables = {t: self._own(torch.zeros(sequences, self.ring[t], dtype=torch.int32, device=device)) for t in kinds}
+        self.kv4_set = set(kv4_layers(cfg)) if self.kv4 else set()
+        self.firsts = self._own(torch.zeros(sequences, dtype=torch.int32, device=device)) if self.kv4_set else None
         # Few, large allocations: PyTorch rounds each up to 2 MiB, and a tensor a matrix and a layer's keys wasted 0.57 GiB.
         # The keys and values of all layers of a kind are one tensor each: [layers of the kind, pool slots, heads, head_dim],
         # int8, and their scales [layers, pool slots, heads]: (keys, values, keys' scales, values' scales); of a kind
@@ -246,11 +295,29 @@ class Engine:
 
         def kept_of(t):
             n, slots = cfg.layer_types.count(t), self.pool[t] * TILE
-            vectors = lambda: self._own(torch.zeros(n, slots, cfg.kv_heads[t], cfg.head_dim[t], dtype=torch.int8, device=device))  # noqa: E731
-            scales = lambda: self._own(torch.zeros(n, slots, cfg.kv_heads[t], device=device))  # noqa: E731
-            return (vectors(), scales()) if self.keyless[t] else (vectors(), vectors(), scales(), scales())
+            n4 = sum(cfg.layer_types[i] == t for i in self.kv4_set)
+            vectors = lambda n: self._own(torch.zeros(n, slots, cfg.kv_heads[t], cfg.head_dim[t], dtype=torch.int8, device=device))  # noqa: E731
+            scales = lambda n: self._own(torch.zeros(n, slots, cfg.kv_heads[t], device=device))  # noqa: E731
+            if self.keyless[t]:
+                return vectors(n), scales(n)
+            if not n4:
+                return vectors(n), vectors(n), scales(n), scales(n)
+            # kv4: the kind's other layers as above, then the 4-bit ones (two codes a byte; kv4_heads_k's order in a tile)
+            codes = lambda: self._own(torch.zeros(n4, slots, cfg.kv_heads[t], cfg.head_dim[t] // 2, dtype=torch.uint8, device=device))  # noqa: E731
+            return vectors(n - n4), vectors(n - n4), scales(n - n4), scales(n - n4), codes(), codes(), scales(n4), scales(n4)
 
         self.kv_all = {t: kept_of(t) for t in kinds}
+        if self.kv4_set:
+            from . import kvsim as KV
+
+            fmt = KV.Kept(cfg, "k4v4t0")  # the simulated format: which layers, and each layer's signs of the turn
+            assert self.kv4_set == {i for i in range(cfg.n_layers) if fmt.bits[i]["k"] == 4 and fmt.bits[i]["v"] == 4}
+            hd = cfg.head_dim[M.SLIDING]
+            assert hd in (32, 64, 128, 256), "kv4: a sliding head of 32, 64, 128 or 256"
+            self.kv4_signs = {i: self._own(fmt.signs[i].float().contiguous().to(device)) for i in sorted(self.kv4_set)}
+            self.kv4_h = KV.hadamard(hd).to(device)
+            lv, top = KV.grid_levels(4)
+            self.kv4_levels, self.kv4_unit = lv.to(device), float(torch.tensor(top / 127, dtype=torch.float32))
         # what the scores make a keyless kind's keys with: the rotated pairs in whole 16s, and cos and sin (fp16) of
         # every position's angle for those pairs [capacity, pairs, 2] (the angle as heads_k and model.rope_tables
         # compute it: position * inv_freq in float32)
@@ -289,8 +356,13 @@ class Engine:
                 assert "v" not in mats, "a keyless layer's value is its key's projection"
                 (values, vscale), keys, kscale = (x[nth] for x in self.kv_all[t]), None, None
                 cl.keys, cl.kscale, cl.trig, cl.turned = None, None, self.trig[t].data_ptr(), self.turn[t]
+            elif i in self.kv4_set:  # 4-bit codes: keys and values as bytes, their scales as ever
+                keys, values, kscale, vscale = (x[sum(j in self.kv4_set for j in range(i))] for x in self.kv_all[t][4:])
+                cl.keys, cl.kscale, cl.trig, cl.turned = keys.data_ptr(), kscale.data_ptr(), None, 0
+                cl.kv4, cl.kv4_signs, cl.first = 1, self.kv4_signs[i].data_ptr(), self.firsts.data_ptr()
             else:
-                keys, values, kscale, vscale = (x[nth] for x in self.kv_all[t])
+                nth -= sum(j in self.kv4_set for j in range(i) if cfg.layer_types[j] == t)  # (kv4: the kind's int8 layers by themselves)
+                keys, values, kscale, vscale = (x[nth] for x in self.kv_all[t][:4])
                 cl.keys, cl.kscale, cl.trig, cl.turned = keys.data_ptr(), kscale.data_ptr(), None, 0
             self.kv.append((keys, values, kscale, vscale))  # keys and their scales: None of a keyless layer
             cl.values, cl.vscale, cl.tiles = values.data_ptr(), vscale.data_ptr(), self.tables[t].data_ptr()
@@ -298,6 +370,8 @@ class Engine:
             if device != "cpu":
                 torch.cuda.empty_cache()  # packing's temporaries, or the allocator keeps them beside the codes
         widest_head = cfg.heads * max(cfg.head_dim.values())
+        if self.kv4_set:  # a 4-bit layer's queries twice (turned and as they are) and its output twice (turned and back)
+            widest_head = max(widest_head, 2 * cfg.heads * cfg.head_dim[M.SLIDING])
         y_size = max(max(cfg.heads * cfg.head_dim[t] + 2 * cfg.kv_heads[t] * cfg.head_dim[t] for t in cfg.head_dim), cfg.mlp, cfg.hidden)
         x_size = max(cfg.hidden, widest_head, cfg.mlp)
         # attention takes the positions a pass reads in whole tiles of 16: up to 15 more at either end
@@ -318,10 +392,15 @@ class Engine:
         for name, t in self.work.items():
             setattr(m, name, t.data_ptr())
         self.lib = lib()
+        if self.kv4_set:  # the kernels' levels, midpoints and unit are the simulation's
+            levels, cuts, unit = (C.c_int * 16)(), (C.c_float * 15)(), C.c_float()
+            assert self.lib.sclmd_kv4_format(levels, cuts, C.byref(unit)) == TILE
+            lv = self.kv4_levels.cpu()
+            assert list(levels) == lv.int().tolist() and list(cuts) == ((lv[1:] + lv[:-1]) / 2).tolist() and unit.value == self.kv4_unit
 
     @classmethod
     def load(cls, name: str, plan: dict, head: int, capacity: int = 8192, device: str = "cuda", sequences: int = 1,
-             pool: dict | None = None, rows: int = 8, keyless: bool = False, int8: float | None = None) -> "Engine":
+             pool: dict | None = None, rows: int = 8, keyless: bool = False, int8: float | None = None, kv4: bool | None = None) -> "Engine":
         """The original model with the stored codes `name`: plan is layer -> {matrix: bits a pair}, head the output
         head's bits. The layers come off the disk one at a time; the embedding table stays in RAM."""
         from . import ckpt
@@ -336,7 +415,7 @@ class Engine:
                 yield ck.layer(i, "cpu", skip=M.LINEARS) | {"mats": CD.stored(name, i, {m: plan[i][m] for m in has})}
 
         eng = cls(cfg, layers(), CD.stored(name, "head", {"head": head})["head"], ck.norm("cpu"), ck.embed("cpu"), capacity, device,
-                  sequences, pool, rows, keyless, int8)
+                  sequences, pool, rows, keyless, int8, kv4=kv4)
         torch.cuda.empty_cache()  # packing left about 1 GiB reserved and unused: whatever loads next needs it
         return eng
 
@@ -395,17 +474,33 @@ class Engine:
         rows = self.embed_table[torch.as_tensor(ids, device=self.embed_table.device)]
         return rows.to(device=self.device, dtype=torch.float32) * self.embed_scale
 
+    def _entries(self, kind: str, pos: int, n: int) -> list:
+        """The entries of a sequence's tile list of a kind that positions pos .. pos + n - 1 are written to: its ring
+        tiles, and with kv4 the extra one (the int8 of positions 8..15) when the first tile is among them."""
+        ring = self.ring[kind]
+        return list(dict.fromkeys((q >> 4) % ring for q in range(pos, pos + n))) + ([ring] if self.extra[kind] and pos < TILE else [])
+
+    def _put(self, kind: str, seq: int, js: list, tiles: list):
+        """The kernels' tables: a sequence's entries js of a kind are the pool tiles `tiles` (the ring's in its row of
+        self.tables, the extra one in self.firsts)."""
+        ring = self.ring[kind]
+        at = [(j, x) for j, x in zip(js, tiles) if j < ring]
+        if at:
+            self.tables[kind][seq, torch.tensor([j for j, _ in at], device=self.device)] = torch.tensor([x for _, x in at], dtype=torch.int32, device=self.device)
+        for j, x in zip(js, tiles):
+            if j >= ring:
+                self.firsts[seq] = x
+
     def lacks(self, seq: int, pos: int, n: int) -> dict:
         """Tiles by kind the sequence would have to be given to write positions pos .. pos + n - 1."""
-        return {t: sum(self.tiles[t][seq][j] < 0 for j in dict.fromkeys((q >> 4) % ring for q in range(pos, pos + n)))
-                for t, ring in self.ring.items()}
+        return {t: sum(self.tiles[t][seq][j] < 0 for j in self._entries(t, pos, n)) for t in self.ring}
 
     def _provide(self, need: list):
         """Tiles for the positions a pass is about to write: need is [(sequence, first position, count)]. All or none."""
         want = {t: [] for t in self.ring}
-        for t, ring in self.ring.items():
+        for t in self.ring:
             for seq, pos, n in need:
-                for j in dict.fromkeys((q >> 4) % ring for q in range(pos, pos + n)):
+                for j in self._entries(t, pos, n):
                     if self.tiles[t][seq][j] < 0:
                         want[t].append((seq, j))
         for t in want:
@@ -415,7 +510,10 @@ class Engine:
             for seq, j in want[t]:
                 tile = self.free[t].pop()
                 self.tiles[t][seq][j] = tile
-                self.tables[t][seq, j] = tile
+                if j < self.ring[t]:
+                    self.tables[t][seq, j] = tile
+                else:
+                    self.firsts[seq] = tile
 
     def advance(self, parts: list, logits_from: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
         """One pass over the rows that are in self.h: parts is [(sequence, rows)] in row order, each sequence once,
@@ -470,8 +568,10 @@ class Engine:
     def kv_float(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
         """A layer's keys and values as numbers: [pool slots, heads, head_dim] (the int8 values times their scales).
         A keyless layer's keys are made as the scores make them, taking a slot's number for its position (which it is
-        while the engine holds one sequence)."""
+        while the engine holds one sequence); so are a 4-bit layer's positions (kv4_float of sequence 0)."""
         k, v, ks, vs = self.kv[layer]
+        if layer in self.kv4_set:
+            return self.kv4_float(layer, torch.arange(v.shape[0], device=v.device))
         if k is None:
             k, ks = self._made(layer, v, torch.arange(v.shape[0], device=v.device) % self.capacity), vs
         return k.float() * ks[..., None], v.float() * vs[..., None]
@@ -491,6 +591,40 @@ class Engine:
         out[..., :n] = (a * cos - b * sin).half().float()
         out[..., half : half + n] = (b * cos + a * sin).half().float()
         return out
+
+    def kv4_codes(self, layer: int, positions: torch.Tensor, seq: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+        """A 4-bit layer's codes (0..15, the levels' order) of the keys and values at positions of a sequence past its
+        first tile: [m, heads, head_dim] each, read where engine/sclmd.cu's kv4_heads_k writes them."""
+        hd, kvh = self.cfg.head_dim[M.SLIDING], self.cfg.kv_heads[M.SLIDING]
+        k4, v4, _, _ = self.kv[layer]
+        slot = self.slots(M.SLIDING, positions, seq).long()
+        d = torch.arange(hd, device=k4.device)
+        c = d & 15
+        kbyte = 2 * (((c & 7) >> 1) * (hd // 16) + (d >> 4)) + (c >> 3)  # a key's value d: that byte of its head
+        keys = (k4[slot][..., kbyte].long() >> (4 * (d & 1))) & 15
+        values = (v4[slot][..., d >> 1].long() >> (4 * (d & 1))) & 15  # a value's byte: values 2b and 2b + 1 of the head
+        return keys, values
+
+    def kv4_float(self, layer: int, positions: torch.Tensor, seq: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+        """A 4-bit layer's keys and values at positions of a sequence as numbers [m, heads, head_dim]: the codes' levels
+        times their scales, turned back (signs * H (level * scale)); the first tile's int8 times its scales."""
+        hd, kvh = self.cfg.head_dim[M.SLIDING], self.cfg.kv_heads[M.SLIDING]
+        k4, v4, ks, vs = self.kv[layer]
+        positions = positions.to(k4.device)
+        slot = self.slots(M.SLIDING, positions, seq).long()
+        out = []
+        signs = self.kv4_signs[layer][None]
+        first = positions < TILE
+        own = self.tiles[M.SLIDING][seq]
+        for codes, data, scale in zip(self.kv4_codes(layer, positions, seq), (k4, v4), (ks, vs)):
+            x = ((self.kv4_levels[codes] * scale[slot][..., None]) @ self.kv4_h) * signs
+            if first.any():
+                p = positions[first].long()
+                tile = torch.where(p < 8, own[0], own[self.ring[M.SLIDING]])
+                raw = data.view(-1, 8, kvh, hd).view(torch.int8)[tile, p & 7]
+                x[first] = raw.float() * scale[tile * TILE + (p & 7)][..., None]
+            out.append(x)
+        return out[0], out[1]
 
     def folded(self, layer: int) -> torch.Tensor | None:
         """What a keyless layer's queries are multiplied by before they are kept [head_dim]: k_norm where the scores
@@ -513,7 +647,7 @@ class Engine:
         own = [x for x in self.tiles[M.SLIDING][seq] if x >= 0]
         snap = self._snaps.get(seq)
         if snap is None or not snap["data"]:
-            shape = lambda t: (t.shape[0], self.ring[M.SLIDING], TILE, *t.shape[2:])  # noqa: E731
+            shape = lambda t: (t.shape[0], self.width[M.SLIDING], TILE, *t.shape[2:])  # noqa: E731
             snap = self._snaps[seq] = {"data": [torch.empty(shape(t), dtype=t.dtype).pin_memory() for t in self.kv_all[M.SLIDING]]}
         self._copy_tiles(M.SLIDING, own, snap["data"], out=True)
         snap["tiles"], snap["at"] = own, (self.lengths[seq], self.highs[seq])
@@ -586,7 +720,7 @@ class Engine:
             frm = [self.tiles[t][src][j] for j in js[t]]
             for j, tile in zip(js[t], own):
                 self.tiles[t][dst][j] = tile
-            self.tables[t][dst, torch.tensor(js[t], device=self.device)] = torch.tensor(own, dtype=torch.int32, device=self.device)
+            self._put(t, dst, js[t], own)
             a, b = torch.tensor(frm, device=self.device), torch.tensor(own, device=self.device)
             for x in self.kv_all[t]:
                 v = self._tiles_view(x, t)
@@ -604,8 +738,7 @@ class Engine:
             own = [self.free[t].pop() for _ in part["js"]]
             for j, tile in zip(part["js"], own):
                 self.tiles[t][seq][j] = tile
-            if own:
-                self.tables[t][seq, torch.tensor(part["js"], device=self.device)] = torch.tensor(own, dtype=torch.int32, device=self.device)
+            self._put(t, seq, part["js"], own)
             self._copy_tiles(t, own, part["data"], out=False)
         self.lengths[seq], self.highs[seq] = state["length"], state["high"]
 
@@ -628,7 +761,7 @@ class Engine:
         """The sequence is over: its tiles go back to the pool."""
         for t in self.ring:
             self.free[t] += sorted((x for x in self.tiles[t][seq] if x >= 0), reverse=True)
-            self.tiles[t][seq] = [-1] * self.ring[t]
+            self.tiles[t][seq] = [-1] * self.width[t]
         self.lengths[seq] = self.highs[seq] = 0
         self._snaps.pop(seq, None)
 
@@ -640,7 +773,8 @@ class Engine:
             if t != M.FULL and self.highs[seq] > self.kept():
                 continue
             own = self.tiles[t][seq]
-            for j in range(last + 1, self.ring[t]):
+            # (kv4: the extra tile is the first tile's, in use while a position is)
+            for j in list(range(last + 1, self.ring[t])) + ([self.ring[t]] if self.extra[t] and last < 0 else []):
                 if own[j] >= 0:
                     self.free[t].append(own[j])
                     own[j] = -1
