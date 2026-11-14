@@ -141,7 +141,7 @@ if [ -s "$ROOT/gpu.only" ]; then
         case "$label" in $pat) allowed=1; break ;; esac
     done < "$ROOT/gpu.only"
     if [ $allowed -eq 0 ]; then
-        echo "[gpu] RESERVED BY THE OWNER: the card is kept for other briefs ($(grep -v '^\s*#' "$ROOT/gpu.only" | tr '\n' ' ')); '$label' gets no more GPU time. Do not call gpu.sh again. Go on WITHOUT the GPU: code, reading and review, CPU-only checks (the stand-in engine, tokenizer, replays). Then hand in; list every GPU run you could not do under not_run, and as exact commands under long_jobs, so the owner can run them later."
+        echo "[gpu] RESERVED BY THE OWNER: the card is kept for other briefs ($(grep -v '^\s*#' "$ROOT/gpu.only" | tr '\n' ' ')); '$label' gets no more GPU time. Do not call gpu.sh again. Go on WITHOUT the GPU: code, reading and review, and checks that need no GPU (the stand-in engine, tokenizer, replays), run with CUDA_VISIBLE_DEVICES=-1 (an empty value does NOT hide the card on this machine; anything that still needs CUDA waits). Then hand in; list every GPU run you could not do under not_run, and as exact commands under long_jobs, so the owner can run them later."
         exit 78
     fi
 fi
