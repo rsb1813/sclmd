@@ -432,7 +432,8 @@ class App:
         # how many of the first), else the leading system messages. Read only when the store is on; a mark that is not a
         # number counts as no mark.
         shared = 0
-        if self.server.prefixes.ram > 0:
+        prefixes = getattr(self.server, "prefixes", None)  # stand-ins for the engine (serve_canned, tests) have none
+        if prefixes is not None and prefixes.ram > 0:
             system = next((i for i, m in enumerate(messages) if m["role"] != "system"), len(messages))
             try:
                 shared = int(body["sclmd_prefix_messages"]) if body.get("sclmd_prefix_messages") is not None else system
