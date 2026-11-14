@@ -28,7 +28,10 @@ DEPTH = 7
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SHARES = "own_v1"  # the measurements the plan is fitted from: on text the model wrote itself (on unseen text of that kind a plan
 # fitted from them is KL 0.055 where one of the same size fitted from other people's text is 0.066)
-ROWS = 16  # rows of a pass: a prompt is read 16 tokens at a time (590 tok/s; 8 at a time is 370), for 30 MB more of work memory
+# Rows of a pass: a prompt is read that many tokens at a time. On the chat's engine (scripts/prefill_check.py): 16 rows
+# 668 tok/s for a prompt of 512 tokens and 543 for one of 12,000; 32 rows 957 and 768, for 62 MB more of work memory
+# (86 MB at a context of 16,384) that the plan cannot give to 4-bit matrices (--rows).
+ROWS = 16
 LOAD_ROOM = 320 << 20  # VRAM left over the engine: what loading uses for a moment, and the allocator's leftovers
 
 HELP = """[bold]명령[/]
@@ -280,6 +283,8 @@ def main() -> None:
     ap.add_argument("--head", type=int, default=8)
     ap.add_argument("--context", type=int, default=8192, help="tokens a conversation can hold (41 KB of VRAM each, taken at the start: what it takes, the plan cannot spend on 4-bit matrices)")
     ap.add_argument("--no-drafter", action="store_true")
+    ap.add_argument("--rows", type=int, default=ROWS, choices=(8, 16, 32), help="tokens of a prompt read in one pass: 32 reads a prompt about 45%% "
+                    "faster than 16 and takes 62 MB more VRAM (86 MB at a context of 16,384), which the plan cannot spend on 4-bit matrices")
     ap.add_argument("--reserve", type=float, default=VRAM_MARGIN / 2**30, help="GiB of the VRAM that is free now to leave to other "
                     "programs. Less means more matrices at 4 bits; if other programs then take more, Windows pages VRAM out and everything slows down")
     cli = ap.parse_args()
@@ -297,7 +302,7 @@ def main() -> None:
     if cli.plan == "auto":
         # what is free now, less what PyTorch is kept from (cap_vram), the rest of the engine, and room to load in
         free = torch.cuda.mem_get_info()[0] - reserve
-        rest = E.fixed_bytes(cfg, head, cli.context, rows=ROWS) + (0 if cli.no_drafter else E.DRAFTER_BYTES)
+        rest = E.fixed_bytes(cfg, head, cli.context, rows=cli.rows) + (0 if cli.no_drafter else E.DRAFTER_BYTES)
         budget = free - rest - LOAD_ROOM
         if budget < P.code_bytes(cfg, P.uniform(cfg, 6)):
             console.print(f"[yellow]VRAM이 모자랍니다: 지금 비어 있는 것은 {(free + reserve) / 2**30:.1f}GiB이고, 전부 3bit로도 "
@@ -311,7 +316,7 @@ def main() -> None:
         plan, head = P.read(cli.plan)
         head = head or cli.head
     with torch.no_grad():
-        eng = E.Engine.load(cli.name, plan, head, -(-cli.context // E.TILE) * E.TILE, rows=ROWS)
+        eng = E.Engine.load(cli.name, plan, head, -(-cli.context // E.TILE) * E.TILE, rows=cli.rows)
         drafter = None if cli.no_drafter else E.EngineDrafter.load(eng, ckpt("drafter"), cli.name, depth=DEPTH)
         opts = {"temperature": 1.0, "top_p": 0.95, "top_k": 64, "num_predict": 4096, "verbose": True, "showthink": False}
         session = Session(tok, eng, drafter)

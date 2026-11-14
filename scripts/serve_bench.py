@@ -4,10 +4,14 @@
 # With --check every client's two requests are then asked once more, alone, and every reply that was written under load
 # is compared with that: a client's prompt and seed are the same in every round and the server's choices depend only
 # on the seed and the position, so the texts must be the same, whatever else the server was doing.
+# With --long 2000,6000 the load is long prompts instead: a document of about that many tokens and a question, from one
+# client and from four at once; what is shown is the time to the first token and the prompt tokens a second it makes
+# (every document starts with a line of its own, so the server has kept nothing of it).
 # Stands alone (no project imports):  python scripts/serve_bench.py --clients 1,2,4,8
 import argparse
 import http.client
 import json
+import os
 import threading
 import time
 from urllib.parse import urlparse
@@ -129,6 +133,34 @@ def line(label: str, outs: list, seconds: float) -> dict:
     return stats
 
 
+def long_prompts(url: str, doc: str, lengths: list, at_once: list) -> list:
+    """Documents of about `lengths` tokens with a question, from each number of clients in `at_once` at the same moment."""
+    probe = {}
+    chat(url, [{"role": "user", "content": f"[{time.time():.3f}]\n" + doc[:2000]}], 1, False, 1, probe)
+    if probe.get("status") != 200 or not probe.get("usage"):
+        print(f"long prompts: the server did not answer: {probe.get('error') or probe}", flush=True)
+        return []
+    per_token = 2000 / probe["usage"]["prompt_tokens"]  # characters a token of this document
+    report = []
+    for tokens in lengths:
+        for n in at_once:
+            chars, tag = int(tokens * per_token), f"{time.time():.3f}"
+            asks = [[{"role": "user", "content": f"[{tag}-{i}]\n" + doc[i * 997 : i * 997 + chars] + "\n\n위 글의 요지를 한 문장으로 말해 줘."}] for i in range(n)]
+            outs, seconds = together(url, asks, 16, False)
+            bad = [o for o in outs if o.get("status") != 200 or not o.get("usage") or o["first"] is None]
+            if bad:
+                print(f"{n} at once, about {tokens} tokens each: {len(bad)} of {n} failed: {bad[0].get('error') or bad[0].get('status')}", flush=True)
+                continue
+            prompt, firsts = sum(o["usage"]["prompt_tokens"] for o in outs), sorted(o["first"] for o in outs)
+            kept = sum(o["usage"].get("prompt_tokens_details", {}).get("cached_tokens", 0) for o in outs)
+            stats = {"clients": n, "prompt_tokens": prompt, "prompt_kept": kept, "first_token_s": round(sum(firsts) / n, 2),
+                     "first_token_worst_s": round(firsts[-1], 2), "prompt_tok_s": round((prompt - kept) / firsts[-1], 1)}
+            print(f"{n} at once, {prompt // n:5d} prompt tokens each: first token after {stats['first_token_s']:.2f} s (worst {stats['first_token_worst_s']:.2f}): "
+                  f"{stats['prompt_tok_s']:7.1f} prompt tokens a second in all" + (f" ({kept} tokens were kept by the server)" if kept else ""), flush=True)
+            report.append(stats)
+    return report
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--url", default="http://127.0.0.1:8001/v1")
@@ -138,7 +170,18 @@ def main():
     ap.add_argument("--pause", type=float, default=3.0, help="seconds between a reply and the follow-up (a user reads and types)")
     ap.add_argument("--check", action="store_true", help="afterwards ask every request alone and compare the replies written under load with that")
     ap.add_argument("--out")
+    ap.add_argument("--long", default="", help="prompt lengths in tokens, with commas: the load is long prompts (see above)")
+    ap.add_argument("--long-clients", default="1,4", help="how many send a long prompt at once")
+    ap.add_argument("--doc", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "speed_check", "doc.txt"))
     args = ap.parse_args()
+    if args.long:
+        with open(args.doc, encoding="utf-8") as f:
+            doc = f.read()
+        report = long_prompts(args.url, doc, [int(x) for x in args.long.split(",")], [int(x) for x in args.long_clients.split(",")])
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2)
+        return
     report, seen = [], {}
     for n in [int(c) for c in args.clients.split(",")]:
         asks = [[{"role": "user", "content": PROMPTS[i][0]}] for i in range(n)]

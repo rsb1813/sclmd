@@ -12,9 +12,9 @@ from .generate import Picker
 
 
 # What a pass of up to 16, 24 or 32 rows costs next to one of up to 8 (scripts/pass_profile.py --rows 32 on the real
-# model at 3 bits a weight: 21.7 ms for 8 rows, 26.6 for 16, 35.6 for 24, 37.8 for 32 at 64 positions; 24.4, 30.8,
-# 41.6, 45.2 at 2,048)
-COST = ((8, 1.0), (16, 1.25), (24, 1.67), (32, 1.80))
+# model at 3 bits a weight: 20.2 ms for 8 rows, 22.6 for 16, 30.0 for 24, 31.3 for 32 at 64 positions; 22.0, 25.8,
+# 34.7, 37.4 at 2,048; before the matrix kernel's blocks took four strips: 21.7, 26.6, 35.6, 37.8 and 1.25, 1.67, 1.80)
+COST = ((8, 1.0), (16, 1.17), (24, 1.58), (32, 1.70))
 
 
 def cost(rows: int) -> float:
@@ -194,21 +194,29 @@ class Batcher:
         if asks:
             got = self.drafter.guess_many([(j.pending, j.hidden, eng.lengths[j.seq], j.seq, k) for j, k in asks])
             guesses = {j: g for (j, _), g in zip(asks, got)}
+        # The rows whose logits nobody looks at go first: a prompt being read needs none until its last token is in
+        # (and none at all when it is read ahead, or read again after starting over). The pass computes the logits
+        # from the first row that needs them, and only those rows' choices are fetched.
+        quiet = lambda j: j.pending is None and (len(j.todo) > rows[j] or j.only_read or j.resume is not None)  # noqa: E731
+        use = [j for j in use if quiet(j)] + [j for j in use if not quiet(j)]
         parts = []
         for j in use:
             if j.pending is None:
                 parts.append((j.seq, j.todo[: rows[j]]))
             else:
                 parts.append((j.seq, [j.pending] + guesses.get(j, [])))
-        logits, hidden = eng.run(parts)
+        skip = sum(len(ids) for j, (_, ids) in zip(use, parts) if quiet(j))  # the rows without logits
+        logits, hidden = eng.run(parts, skip)
         # the choices of all texts come off the GPU together: every row's first choice, and for the texts that sample
         # every row's largest logits (one wait for the pass, not one a text)
-        top = max((j.pick.top_k for j in use if j.pick is not None and j.pick.temperature > 0), default=0)
-        vals, idx = (t.cpu() for t in logits.float().topk(top, dim=-1)) if top else (None, None)
-        first = logits.argmax(-1).cpu() if any(j.pick is not None and j.pick.temperature <= 0 for j in use) else None
+        loud = [j for j in use if not quiet(j)]
+        top = max((j.pick.top_k for j in loud if j.pick is not None and j.pick.temperature > 0), default=0)
+        vals, idx = (t.cpu() for t in logits[skip:].float().topk(top, dim=-1)) if top else (None, None)
+        first = logits[skip:].argmax(-1).cpu() if any(j.pick is not None and j.pick.temperature <= 0 for j in loud) else None
 
         def choose(j: Job, a: int, b: int, position: int) -> list:
             """Job j's tokens at `position`.. from rows a..b-1 of the pass."""
+            a, b = a - skip, b - skip
             return first[a:b].tolist() if j.pick.temperature <= 0 else j.pick.draw(vals[a:b], idx[a:b], position)
 
         self.passes += 1

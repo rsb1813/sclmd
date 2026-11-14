@@ -15,6 +15,7 @@
 #include <cuda_runtime.h>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <utility>
 
@@ -139,10 +140,11 @@ __device__ __forceinline__ uint32_t two(const uint16_t* table, const int8_t* p) 
 // the first value that has not come from memory, so a step's loads at a time is a wait a step; with the loads of many
 // steps on their way together the wait is shared (attend_k at 12,288 positions, a pass of 7 rows: 5.4 ms a pass one
 // tile at a time, 3.8 ms by eights, 2.8 ms by sixteens). The loaded values are held in registers, and a block's
-// threads share its registers (65,536): by 32 steps a block may have 256 threads, by 16 steps 512, and beyond that
-// by 2 (a pass of more than 16 rows). The sums are the same bits whichever: the steps are added in the same order.
-// The wide forms carry no bound on a block's threads: with one, the compiler kept them to 64 registers and put the
-// rest on the stack, which was as slow as a step at a time.
+// threads share its registers (65,536): by 32 steps a block may have 256 threads, which is eight groups of queries;
+// a pass with more groups has more blocks (GROUPS_A_BLOCK). The sums are the same bits however many steps go
+// together: the steps are added in the same order.
+// The kernels carry no bound on a block's threads: with one, the compiler kept them to 64 registers and put the rest
+// on the stack, which was as slow as a step at a time.
 
 // The sum of v over the block's threads (a multiple of 32, at most 1024), returned to every thread.
 __device__ float block_sum(float v) {
@@ -281,25 +283,32 @@ __global__ void __launch_bounds__(1024) prep_k(const float* a, const float* b, c
     }
 }
 
-// y[token][row] = scale[row] * fps[token] * sum over columns of W[row][col] * x[token][col], one block a strip of 16
-// rows, its `segs` warps splitting the strip's tiles (a multiple of 4 each) between them. Up to three matrices that
-// share the input go in one launch: the blocks are the first one's strips, then the second's, then the third's.
+// y[token][row] = scale[row] * fps[token] * sum over columns of W[row][col] * x[token][col]. A strip is 16 rows; its
+// `segs` warps split the strip's tiles (a multiple of 4 each) between them. A block is `strips` strips that follow
+// each other (up to GEMM_STRIPS): their warps walk the same tiles of the input, so what one reads of it the others
+// find in the block's cache. Up to three matrices that share the input go in one launch: the strips are the first
+// one's, then the second's, then the third's.
 // G: the groups of eight tokens. A tile's codes are read and decoded once and multiplied with each group's inputs.
+#define GEMM_STRIPS 4
 template <int G>
-__global__ void gemm_k(Mat m0, Mat m1, Mat m2, float* y0, float* y1, float* y2, const uint64_t* xf, const float* fps, int segs, int tokens) {
-    __shared__ uint32_t slut[256];
-    __shared__ float part[8][32][4 * G];
-    int strip = blockIdx.x;
+__global__ void gemm_k(Mat m0, Mat m1, Mat m2, float* y0, float* y1, float* y2, const uint64_t* xf, const float* fps, int segs, int tokens,
+                       int strips) {
+    __shared__ uint32_t luts[GEMM_STRIPS][256];
+    __shared__ float part[GEMM_STRIPS][8][32][4];
+    const int local = (threadIdx.x >> 5) / segs, warp = (threadIdx.x >> 5) % segs, lane = threadIdx.x & 31;  // the block's strip, and its warp
+    int strip = blockIdx.x * strips + local;
     Mat m = m0;
     float* y = y0;
     if (strip >= m0.rows / 16) {
         strip -= m0.rows / 16, m = m1, y = y1;
         if (strip >= m1.rows / 16) strip -= m1.rows / 16, m = m2, y = y2;
     }
-    for (int i = threadIdx.x; i < (1 << m.bits); i += blockDim.x) slut[i] = m.lut[i];
+    const bool idle = strip >= m.rows / 16;  // past the last strip (the last block may not be full)
+    uint32_t* slut = luts[local];
+    if (!idle)
+        for (int i = threadIdx.x - local * segs * 32; i < (1 << m.bits); i += segs * 32) slut[i] = m.lut[i];
     __syncthreads();
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int tiles = m.cols / 16, per = tiles / segs, first = warp * per;
+    const int tiles = m.cols / 16, per = idle ? 0 : tiles / segs, first = warp * per;
     float c[G][4];
     for (int g = 0; g < G; ++g) c[g][0] = c[g][1] = c[g][2] = c[g][3] = 0;
     const uint64_t* xw = xf + size_t(first) * 32 + lane;
@@ -307,47 +316,60 @@ __global__ void gemm_k(Mat m0, Mat m1, Mat m2, float* y0, float* y1, float* y2, 
     if (m.bits == 8) {
         const uint32_t* cw = m.codes + (size_t(strip) * tiles + first) * 32 + lane;
         for (int j = 0; j < per; j += 4) {
+            // the four tiles' codes and every group's inputs for them are asked for together, before the first is
+            // used: a warp waits at the first value that has not come, and an input read when its product is due was
+            // a wait a group and tile (what a wide pass paid for its rows)
             uint32_t w[4];
+            uint64_t b[G][4];
             for (int i = 0; i < 4; ++i) w[i] = cw[size_t(j + i) * 32];
+#pragma unroll
+            for (int g = 0; g < G; ++g)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) b[g][i] = xw[g * group + size_t(j + i) * 32];
             for (int i = 0; i < 4; ++i) {
                 const uint32_t a0 = slut[w[i] & 255], a1 = slut[w[i] >> 8 & 255], a2 = slut[w[i] >> 16 & 255], a3 = slut[w[i] >> 24];
-                for (int g = 0; g < G; ++g) {
-                    const uint64_t b = xw[g * group + size_t(j + i) * 32];
-                    mma(c[g], a0, a1, a2, a3, uint32_t(b), uint32_t(b >> 32));
-                }
+                for (int g = 0; g < G; ++g) mma(c[g], a0, a1, a2, a3, uint32_t(b[g][i]), uint32_t(b[g][i] >> 32));
             }
         }
     } else {  // 6 bits a pair: four tiles of a lane are 16 codes in 96 bits, stored as three words
         const uint32_t* cw = m.codes + (size_t(strip) * (tiles / 4) + first / 4) * 96 + lane;
         for (int j = 0; j < per; j += 4) {
             const uint32_t* q = cw + size_t(j / 4) * 96;
-            const uint64_t lo = uint64_t(q[0]) | uint64_t(q[32]) << 32, hi = q[64];
+            const uint32_t q0 = q[0], q1 = q[32], q2 = q[64];
+            uint64_t b[G][4];  // every group's inputs, asked for with the codes (see the 8-bit loop)
+#pragma unroll
+            for (int g = 0; g < G; ++g) {
+                const uint64_t* x = xw + g * group + size_t(j) * 32;
+                b[g][0] = x[0], b[g][1] = x[32], b[g][2] = x[64], b[g][3] = x[96];
+            }
+            const uint64_t lo = uint64_t(q0) | uint64_t(q1) << 32, hi = q2;
             const uint32_t k10 = uint32_t(lo >> 60 | hi << 4) & 63;
             const uint32_t a[16] = {slut[lo & 63],       slut[lo >> 6 & 63],  slut[lo >> 12 & 63], slut[lo >> 18 & 63],
                                     slut[lo >> 24 & 63], slut[lo >> 30 & 63], slut[lo >> 36 & 63], slut[lo >> 42 & 63],
                                     slut[lo >> 48 & 63], slut[lo >> 54 & 63], slut[k10],           slut[hi >> 2 & 63],
                                     slut[hi >> 8 & 63],  slut[hi >> 14 & 63], slut[hi >> 20 & 63], slut[hi >> 26 & 63]};
             for (int g = 0; g < G; ++g) {
-                const uint64_t* x = xw + g * group + size_t(j) * 32;
-                const uint64_t b0 = x[0], b1 = x[32], b2 = x[64], b3 = x[96];
-                mma(c[g], a[0], a[1], a[2], a[3], uint32_t(b0), uint32_t(b0 >> 32));
-                mma(c[g], a[4], a[5], a[6], a[7], uint32_t(b1), uint32_t(b1 >> 32));
-                mma(c[g], a[8], a[9], a[10], a[11], uint32_t(b2), uint32_t(b2 >> 32));
-                mma(c[g], a[12], a[13], a[14], a[15], uint32_t(b3), uint32_t(b3 >> 32));
+                mma(c[g], a[0], a[1], a[2], a[3], uint32_t(b[g][0]), uint32_t(b[g][0] >> 32));
+                mma(c[g], a[4], a[5], a[6], a[7], uint32_t(b[g][1]), uint32_t(b[g][1] >> 32));
+                mma(c[g], a[8], a[9], a[10], a[11], uint32_t(b[g][2]), uint32_t(b[g][2] >> 32));
+                mma(c[g], a[12], a[13], a[14], a[15], uint32_t(b[g][3]), uint32_t(b[g][3] >> 32));
             }
         }
     }
-    for (int g = 0; g < G; ++g)
-        for (int i = 0; i < 4; ++i) part[warp][lane][4 * g + i] = c[g][i];
-    __syncthreads();
-    if (warp) return;
-    for (int g = 0; g < G; ++g)
-        for (int i = 0; i < 4; ++i) {
-            float sum = 0;
-            for (int w = 0; w < segs; ++w) sum += part[w][lane][4 * g + i];
-            const int row = strip * 16 + (lane >> 2) + (i >= 2 ? 8 : 0), token = 8 * g + 2 * (lane & 3) + (i & 1);
-            if (token < tokens) y[size_t(token) * m.rows + row] = m.scale[row] * fps[token] * sum;
-        }
+    // a strip's warps hand their sums to its first warp, a group of tokens at a time (the shared memory a block needs
+    // does not grow with the groups: it is taken from what the block's cache has)
+    for (int g = 0; g < G; ++g) {
+        for (int i = 0; i < 4; ++i) part[local][warp][lane][i] = c[g][i];
+        __syncthreads();
+        if (warp == 0 && !idle)
+            for (int i = 0; i < 4; ++i) {
+                float sum = 0;
+                for (int w = 0; w < segs; ++w) sum += part[local][w][lane][i];
+                const int row = strip * 16 + (lane >> 2) + (i >= 2 ? 8 : 0), token = 8 * g + 2 * (lane & 3) + (i & 1);
+                if (token < tokens) y[size_t(token) * m.rows + row] = m.scale[row] * fps[token] * sum;
+            }
+        __syncthreads();
+    }
 }
 
 // What attention does to the projections' outputs, block (vector, token) with head_dim threads. Vector v of a token is
@@ -430,7 +452,9 @@ __device__ __forceinline__ void scores_body(const uint16_t* qhat, const int8_t* 
     for (int i = 1; i < a.n; ++i)
         if (int(blockIdx.x) >= a.tile0[i]) seg = i;
     const int rep = heads / kvh, nq = rep * a.cnt[seg], stride = a.stride[seg];
-    const int tile = blockIdx.x - a.tile0[seg], kh = blockIdx.y, group = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    // a block's warps are groups of queries; with more groups than a block takes, blockIdx.z counts the blocks before
+    const int tile = blockIdx.x - a.tile0[seg], kh = blockIdx.y, group = blockIdx.z * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     if (group * 8 >= nq) return;
     // the left operand: rows are the tile's positions (this lane: g and g + 8), columns sixteen of the head's values
     const size_t slot = slot_of(tiles, ring, a.seq[seg], a.base[seg] + 16 * tile);
@@ -460,8 +484,6 @@ __device__ __forceinline__ void scores_body(const uint16_t* qhat, const int8_t* 
         scores_body<AHEAD>(qhat, keys, kscale, scores, tiles, a, heads, kvh, hd, ring);                                                 \
     }
 SCORES_K(scores32_k, 32, )
-SCORES_K(scores16_k, 16, )
-SCORES_K(scores2_k, 2, __launch_bounds__(1024))
 #undef SCORES_K
 
 // The softmax of a query's scores over the positions it may read, as fp16 in the same layout: block (query of the
@@ -550,7 +572,9 @@ __device__ __forceinline__ void attend_body(const uint16_t* probs, const int8_t*
     __shared__ uint16_t table[256];
     fill_table(table);
     const int seg = blockIdx.z, rep = heads / kvh, nq = rep * a.cnt[seg], stride = a.stride[seg], base = a.base[seg];
-    const int dt = blockIdx.x, kh = blockIdx.y, group = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    // a block's warps are groups of queries; with more groups than a block takes, the blocks of a sixteen follow each other
+    const int dt = blockIdx.x % (hd / 16), group = (blockIdx.x / (hd / 16)) * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int kh = blockIdx.y, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     if (group * 8 >= nq) return;
     // the right operand: rows are the tile's positions, column g is query group * 8 + g
     const int query = group * 8 + g;
@@ -580,8 +604,6 @@ __device__ __forceinline__ void attend_body(const uint16_t* probs, const int8_t*
         attend_body<AHEAD>(probs, values, out, tiles, a, heads, kvh, hd, ring);                                                         \
     }
 ATTEND_K(attend32_k, 32, )
-ATTEND_K(attend16_k, 16, )
-ATTEND_K(attend2_k, 2, __launch_bounds__(1024))
 #undef ATTEND_K
 
 // The soft cap on the logits: tanh(v / cap) * cap.
@@ -600,13 +622,16 @@ static int segs_for(int cols) {
 // One launch for a matrix, or for up to three that share the input in xf (b and c may have no rows).
 static void gemm(const uint64_t* xf, const float* fps, int tokens, const Mat& a, float* ya, const Mat& b = Mat{}, float* yb = nullptr,
                  const Mat& c = Mat{}, float* yc = nullptr) {
-    const int segs = segs_for(a.cols), blocks = (a.rows + b.rows + c.rows) / 16;
+    const int segs = segs_for(a.cols), all = (a.rows + b.rows + c.rows) / 16;
+    // as many strips a block as its threads allow, up to four. Measured on the real model (a pass at 64 positions):
+    // 32 rows 36.3 ms with a strip a block, 31.4 ms with four; 16 rows 25.2 -> 22.6 ms; 8 rows the same (20.3 ms)
+    const int strips = GEMM_STRIPS * segs * 32 <= 1024 ? GEMM_STRIPS : 1024 / (segs * 32), blocks = (all + strips - 1) / strips;
     if (tokens <= 8)
-        gemm_k<1><<<blocks, 32 * segs>>>(a, b, c, ya, yb, yc, xf, fps, segs, tokens);
+        gemm_k<1><<<blocks, 32 * segs * strips>>>(a, b, c, ya, yb, yc, xf, fps, segs, tokens, strips);
     else if (tokens <= 16)
-        gemm_k<2><<<blocks, 32 * segs>>>(a, b, c, ya, yb, yc, xf, fps, segs, tokens);
+        gemm_k<2><<<blocks, 32 * segs * strips>>>(a, b, c, ya, yb, yc, xf, fps, segs, tokens, strips);
     else  // a pass of 17 to 24 rows multiplies a fourth group that nothing has written and nothing reads the products of
-        gemm_k<4><<<blocks, 32 * segs>>>(a, b, c, ya, yb, yc, xf, fps, segs, tokens);
+        gemm_k<4><<<blocks, 32 * segs * strips>>>(a, b, c, ya, yb, yc, xf, fps, segs, tokens, strips);
 }
 
 // What prep_k is told of the residual step still owed: the matrix output it adds, the norm's weight and the layer's scalar.
@@ -660,28 +685,21 @@ static Att att_for(const Segs& g, bool full, int heads, int back) {
 
 static int tiles_of(const Att& a) { return a.tile0[a.n - 1] + a.stride[a.n - 1] / 16; }
 
-// The two attention kernels with a warp for each of `groups` groups of eight queries, in the form the block's threads
-// allow (see scores_k).
+// Groups of queries a block of the attention kernels takes at most: eight (256 threads), so that the form that asks
+// for 32 steps' loads has its registers whatever the rows of the pass; a pass with more groups has more blocks.
+static const int GROUPS_A_BLOCK = 8;
+
+// The two attention kernels with a warp for each of `groups` groups of eight queries.
 static void scores(int tiles, int kvh, int groups, const uint16_t* qhat, const int8_t* keys, const float* kscale, float* out, const int32_t* table,
                    const Att& a, int heads, int hd, int ring) {
-    const dim3 grid(tiles, kvh);
-    if (32 * groups <= 256)
-        scores32_k<<<grid, 32 * groups>>>(qhat, keys, kscale, out, table, a, heads, kvh, hd, ring);
-    else if (32 * groups <= 512)
-        scores16_k<<<grid, 32 * groups>>>(qhat, keys, kscale, out, table, a, heads, kvh, hd, ring);
-    else
-        scores2_k<<<grid, 32 * groups>>>(qhat, keys, kscale, out, table, a, heads, kvh, hd, ring);
+    const int per = groups > GROUPS_A_BLOCK ? GROUPS_A_BLOCK : groups;
+    scores32_k<<<dim3(tiles, kvh, (groups + per - 1) / per), 32 * per>>>(qhat, keys, kscale, out, table, a, heads, kvh, hd, ring);
 }
 
 static void attend(int groups, const uint16_t* probs, const int8_t* values, float* out, const int32_t* table, const Att& a, int heads, int kvh,
                    int hd, int ring) {
-    const dim3 grid(hd / 16, kvh, a.n);
-    if (32 * groups <= 256)
-        attend32_k<<<grid, 32 * groups>>>(probs, values, out, table, a, heads, kvh, hd, ring);
-    else if (32 * groups <= 512)
-        attend16_k<<<grid, 32 * groups>>>(probs, values, out, table, a, heads, kvh, hd, ring);
-    else
-        attend2_k<<<grid, 32 * groups>>>(probs, values, out, table, a, heads, kvh, hd, ring);
+    const int per = groups > GROUPS_A_BLOCK ? GROUPS_A_BLOCK : groups;
+    attend32_k<<<dim3(hd / 16 * ((groups + per - 1) / per), kvh, a.n), 32 * per>>>(probs, values, out, table, a, heads, kvh, hd, ring);
 }
 
 // Where a pass's time goes (sclmd_profile): with a table set, the pass waits for the GPU after every launch and adds
@@ -718,7 +736,16 @@ API int sclmd_linear(const Model* m, const Mat* mat, const Rot* rot, const float
 // values have the new positions of each sequence (whose tiles the caller has provided). Launches only; nothing waits.
 // A layer's two residual steps are not kernels of their own: each is taken by the kernel that prepares the next
 // matrix input from the residual stream, which writes the stream's next state to the other of m.h and m.h2.
-API int sclmd_pass(const Model* mp, int tokens, const Segs* segs) {
+static int pass(const Model* mp, int tokens, const Segs* segs, int logits_from);
+
+API int sclmd_pass(const Model* mp, int tokens, const Segs* segs) { return pass(mp, tokens, segs, 0); }
+
+// The pass with the logits of the rows from `logits_from` on only (of its group of eight rows on; from `tokens`: of
+// none): a prompt's rows need no logits, and the head is 0.66 GiB to read and a multiplication a group of rows.
+// m.logits of the rows before is whatever an earlier pass left there.
+API int sclmd_pass_from(const Model* mp, int tokens, const Segs* segs, int logits_from) { return pass(mp, tokens, segs, logits_from); }
+
+static int pass(const Model* mp, int tokens, const Segs* segs, int logits_from) {
     const Model& m = *mp;
     const int n = m.hidden;
     float *h = m.h, *spare = m.h2;
@@ -763,10 +790,14 @@ API int sclmd_pass(const Model* mp, int tokens, const Segs* segs) {
     }
     // the last residual step, the final norm (kept in m.hn) and the head. Two steps a layer: the stream ends in m.h
     prep(m, h, nullptr, m.norm, n, m.rot_head, 0, tokens, owed, spare, m.hn);
-    gemm(m.xf, m.fps, tokens, m.head, m.logits);
-    if (m.softcap > 0) {
-        const size_t count = size_t(tokens) * m.vocab;
-        softcap_k<<<unsigned((count + 1023) / 1024), 1024>>>(m.logits, count, m.softcap);
+    const int first = logits_from < 0 ? 0 : logits_from / 8 * 8;  // the first row of the group of eight the logits start in
+    if (first < tokens) {
+        float* logits = m.logits + size_t(first) * m.vocab;
+        gemm(m.xf + size_t(first / 8) * (n / 16) * 32, m.fps + first, tokens - first, m.head, logits);
+        if (m.softcap > 0) {
+            const size_t count = size_t(tokens - first) * m.vocab;
+            softcap_k<<<unsigned((count + 1023) / 1024), 1024>>>(logits, count, m.softcap);
+        }
     }
     tick(P_HEAD);
     return int(cudaGetLastError());

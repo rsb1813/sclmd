@@ -83,6 +83,8 @@ def lib():
         assert _lib.sclmd_sizes(*[C.byref(s) for s in sizes]) == MAX_TOKENS
         assert [s.value for s in sizes] == [C.sizeof(Mat), C.sizeof(Rot), C.sizeof(Layer), C.sizeof(Model), C.sizeof(Segs)], "struct layouts differ"
         _lib.sclmd_pass.argtypes = [C.c_void_p, C.c_int, C.c_void_p]
+        if hasattr(_lib, "sclmd_pass_from"):  # an older build (SCLMD_DLL, to compare builds) computes every row's logits
+            _lib.sclmd_pass_from.argtypes = [C.c_void_p, C.c_int, C.c_void_p, C.c_int]
         _lib.sclmd_linear.argtypes = [C.c_void_p] * 5 + [C.c_int]
     return _lib
 
@@ -329,10 +331,12 @@ class Engine:
                 self.tiles[t][seq][j] = tile
                 self.tables[t][seq, j] = tile
 
-    def advance(self, parts: list) -> tuple[torch.Tensor, torch.Tensor]:
+    def advance(self, parts: list, logits_from: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
         """One pass over the rows that are in self.h: parts is [(sequence, rows)] in row order, each sequence once,
         up to self.rows rows in all; a sequence's rows are its next positions. -> (logits [rows, vocab], outputs
-        after the final norm): views of the engine's memory, which the next pass writes over."""
+        after the final norm): views of the engine's memory, which the next pass writes over.
+        logits_from: the first row whose logits are wanted (the rows before it are a prompt's: their logits are not
+        computed and hold what an earlier pass left; the number of rows: none are)."""
         total = sum(n for _, n in parts)
         assert 0 < total <= self.rows and len({seq for seq, _ in parts}) == len(parts) and all(n > 0 for _, n in parts)
         segs, row = Segs(), 0
@@ -344,17 +348,20 @@ class Engine:
             row += n
         segs.n = len(parts)
         self._provide([(seq, self.lengths[seq], n) for seq, n in parts])
-        self._check(self.lib.sclmd_pass(C.byref(self.model), total, C.byref(segs)))
+        if hasattr(self.lib, "sclmd_pass_from"):
+            self._check(self.lib.sclmd_pass_from(C.byref(self.model), total, C.byref(segs), logits_from))
+        else:
+            self._check(self.lib.sclmd_pass(C.byref(self.model), total, C.byref(segs)))
         for seq, n in parts:
             self.lengths[seq] += n
             self.highs[seq] = max(self.highs[seq], self.lengths[seq])
         return self.logits[:total], self.hn[:total]
 
-    def run(self, parts: list) -> tuple[torch.Tensor, torch.Tensor]:
+    def run(self, parts: list, logits_from: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
         """One pass over tokens of several sequences: parts is [(sequence, token ids)] (see advance)."""
         flat = [t for _, ids in parts for t in ids]
         self.h[: len(flat)] = self.embed(flat)
-        return self.advance([(seq, len(ids)) for seq, ids in parts])
+        return self.advance([(seq, len(ids)) for seq, ids in parts], logits_from)
 
     def feed(self, ids: list, keep: str = "all", seq: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
         """Run tokens at a sequence's next positions, a pass's rows at a time -> (logits [n, vocab], last outputs after
@@ -362,8 +369,10 @@ class Engine:
         assert self.lengths[seq] + len(ids) <= self.capacity, "past the engine's capacity"
         logits, hidden = [], []
         for a in range(0, len(ids), self.rows):
-            lg, hn = self.run([(seq, ids[a : a + self.rows])])
-            if keep == "all" or a + self.rows >= len(ids):
+            last = a + self.rows >= len(ids)
+            # with keep="last" only the last pass's logits are looked at: the passes before compute none
+            lg, hn = self.run([(seq, ids[a : a + self.rows])], 0 if keep == "all" or last else self.rows)
+            if keep == "all" or last:
                 logits.append(lg.clone())
                 hidden.append(hn.clone())
         return torch.cat(logits), torch.cat(hidden)
