@@ -74,6 +74,7 @@ ssalmuck-ai.duckdns.org {
 	@slash path_regexp slash ^/(keys|guide|trust|terms|privacy)/$
 	@assets path /assets/*
 	# Google Search Console's ownership file (the OAuth consent screen's home page check): /srv/ssalmuck-ai/verify/
+	# (google648f85958943202a.html, 2026-11-16). Google checks it again from time to time: a new copy of the site keeps verify/
 	@gverify path_regexp gverify ^/google[0-9a-f]{8,32}\.html$
 
 	handle @api {
