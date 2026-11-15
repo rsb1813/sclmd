@@ -15,9 +15,15 @@
 #   default: --look-gone, looking every second while the tokens of a reply that is not streamed come whether its client
 #   has left (a client that closes its sending side after the request looks the same, and would get no answer).
 # - usage.completion_tokens_details.reasoning_tokens: the reply's tokens from <|channel> to <channel|>.
+# - ZDR (design.md 6.16, 6.17): nothing of a prompt or a reply reaches a log. An error the server logs is written by
+#   why() and trace(): the exception's type and where it was raised, never its message (a ValueError of int() carries
+#   the value it could not read, a template's error the text it could not write). The client's own error answers are
+#   as before.
 import socket
+import sys
 import threading
 import time
+import traceback
 from http.server import ThreadingHTTPServer
 
 MAX_BODY = 0  # bytes of a request body at most (--max-body-mb; 0: no cap, as before R1; 32 MB suggested: a prompt the context could hold is far less)
@@ -30,7 +36,41 @@ MODES = ("lenient", "default", "strict")
 
 
 class Refused(Exception):
-    """A request that cannot be served: (HTTP status, message[, the field it is about])."""
+    """A request that cannot be served: (HTTP status, message[, the field it is about[, the error's code]])."""
+
+
+def why(e: BaseException) -> str:
+    """An exception for a log line (ZDR): its type, never its message, which may carry a piece of a prompt or a
+    reply. One kind of message is kept: a RuntimeError (torch's) whose first line is the CUDA driver's or allocator's
+    own words ("CUDA error: an illegal memory access ...", "CUDA out of memory ..."), which no request writes."""
+    name = type(e).__name__
+    first = str(e).splitlines()[0][:200] if isinstance(e, RuntimeError) and str(e) else ""
+    return f"{name}: {first}" if first.startswith(("CUDA error", "CUDA out of memory", "CUDA driver")) else name
+
+
+def trace(e: BaseException, file=None) -> None:
+    """A traceback for the log without the exception's message (ZDR): the frames (file, line, function and the line of
+    code), then the exception's type (why()); the exceptions it came from as well, as Python prints them."""
+    out = file if file is not None else sys.stderr
+    chain, seen = [], set()
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        chain.append(e)
+        e = e.__cause__ if e.__cause__ is not None else (None if e.__suppress_context__ else e.__context__)
+    lines = []
+    for k, x in enumerate(reversed(chain)):
+        if k:
+            lines.append("\nDuring the handling of the exception above, another one was raised:\n")
+        lines.append("Traceback (most recent call last; the message is left out: ZDR):")
+        for frame in traceback.extract_tb(x.__traceback__):
+            lines.append(f'  File "{frame.filename}", line {frame.lineno}, in {frame.name}')
+            if frame.line:
+                lines.append(f"    {frame.line.strip()}")
+        lines.append(why(x))
+    try:
+        print("\n".join(lines), file=out, flush=True)
+    except (OSError, ValueError):
+        pass
 
 
 def _number(v):
@@ -341,6 +381,17 @@ class BoundedHTTPServer(ThreadingHTTPServer):
             if self.slots is not None:
                 self.slots.release()
             raise
+
+    def handle_error(self, request, client_address) -> None:
+        """A handler that failed outside its own error answers (socketserver prints the whole traceback, its message
+        too): the trace without the message (ZDR)."""
+        e = sys.exc_info()[1]
+        if isinstance(e, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):  # the client's doing: a line, no trace
+            print(f"[serve] a connection ended under its handler: {why(e)}", file=sys.stderr, flush=True)
+            return
+        print(f"[serve] a connection's handler failed: {why(e) if e is not None else 'unknown'}", file=sys.stderr, flush=True)
+        if e is not None:
+            trace(e)
 
     def process_request_thread(self, request, client_address):
         with self._count:

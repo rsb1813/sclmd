@@ -4,6 +4,13 @@
 # The back-pressure items (R4: --max-waiting's 429 and Retry-After) need a stand-in that answers one request slowly:
 #   python -m scripts.serve_canned PORT --max-waiting 1 --token-ms 300
 #   uv run --no-project --with openai python scripts/openai_client_check.py PORT --rate-limit
+# The internet server's items (N1: scripts/serve_net.py; who a request is, the limits, the pings) need a stand-in with
+# a key, --anonymous, 127.0.0.1 as a trusted proxy, small limits and a first token held back past two pings:
+#   SCLMD_API_KEY=n1:KEY python -m scripts.serve_canned PORT --anonymous --trusted-proxies 127.0.0.1 --metrics-local
+#       --max-prompt 64 --max-output 100 --max-tokens 100 --stream-ping 1 --first-ms 3500
+#   SCLMD_CHECK_KEY=KEY uv run --no-project --with openai python scripts/openai_client_check.py PORT --net
+# SCLMD_CHECK_KEY is the key the client sends (default "none": a server without keys takes any).
+import os
 import sys
 import threading
 import time
@@ -11,7 +18,8 @@ import time
 import openai
 from openai import OpenAI
 
-client = OpenAI(base_url=f"http://127.0.0.1:{sys.argv[1]}/v1", api_key="none", max_retries=0, timeout=20)
+KEY = os.environ.get("SCLMD_CHECK_KEY", "none")
+client = OpenAI(base_url=f"http://127.0.0.1:{sys.argv[1]}/v1", api_key=KEY, max_retries=0, timeout=20)
 print("openai", openai.__version__)
 ok = True
 
@@ -28,7 +36,7 @@ if "--rate-limit" in sys.argv[2:]:
     # by logs/exp/R4-land/retry_after.py). Without retries the library raises RateLimitError at once; with
     # max_retries=2 it waits what the server said and is served once the slow reply is over.
     def slow():
-        OpenAI(base_url=client.base_url, api_key="none", max_retries=0, timeout=60).chat.completions.create(
+        OpenAI(base_url=client.base_url, api_key=KEY, max_retries=0, timeout=60).chat.completions.create(
             model="x", messages=[{"role": "user", "content": "a long one"}])
 
     def refused_once() -> float:
@@ -58,6 +66,83 @@ if "--rate-limit" in sys.argv[2:]:
     print("ALL OK" if ok else "SOMETHING FAILED")
     sys.exit(0 if ok else 1)
 
+
+if "--net" in sys.argv[2:]:
+    # who a request is: a key, no key (the anonymous tier), a key the server does not have
+    import http.client
+    import json
+
+    base = client.base_url
+    hello = [{"role": "user", "content": "hi"}]
+    want = "Hello! You said: hi 안녕하세요."
+    r = client.chat.completions.create(model="x", messages=hello)
+    check("the right key", r.choices[0].message.content == want, repr(r.choices[0].message.content))
+    # the library always sends a key (api_key="" raises before any request, measured with 3.51.0): an empty Authorization
+    # header is how it sends none
+    anon = OpenAI(base_url=base, api_key="-", default_headers={"Authorization": ""}, max_retries=0, timeout=20)
+    name = 'no key (default_headers={"Authorization": ""}): served as its address (--anonymous)'
+    try:
+        r = anon.chat.completions.create(model="x", messages=hello)
+        check(name, r.choices[0].message.content == want)
+    except openai.APIStatusError as e:
+        check(name, False, f"{type(e).__name__} {e.status_code}")
+    for wrong in ("none", "sk-not-a-key-of-this-server"):
+        try:
+            OpenAI(base_url=base, api_key=wrong, max_retries=0, timeout=20).chat.completions.create(model="x", messages=hello)
+            check(f"a key the server does not have ({wrong!r}): 401", False, "no error raised")
+        except openai.AuthenticationError as e:
+            check(f"a key the server does not have ({wrong!r}): 401", e.status_code == 401 and (e.body or {}).get("code") == "invalid_api_key",
+                  str(e)[:90])
+    # the limits
+    try:
+        client.chat.completions.create(model="x", messages=[{"role": "user", "content": "word " * 200}])
+        check("a prompt above --max-prompt: 400 context_length_exceeded", False, "no error raised")
+    except openai.BadRequestError as e:
+        check("a prompt above --max-prompt: 400 context_length_exceeded", e.status_code == 400 and e.code == "context_length_exceeded"
+              and e.param == "messages" and "maximum prompt length" in e.message, f"{e.code} {e.param}: {e.message[:80]}")
+    raw = client.chat.completions.with_raw_response.create(model="x", messages=hello, max_tokens=5000)
+    check("max_tokens above --max-output: cut and named", raw.headers.get("x-sclmd-ignored") == "max_tokens" and raw.parse().choices[0].message.content == want,
+          repr(raw.headers.get("x-sclmd-ignored")))
+    raw = client.chat.completions.with_raw_response.create(model="x", messages=hello, max_completion_tokens=5000)
+    check("  max_completion_tokens too", raw.headers.get("x-sclmd-ignored") == "max_completion_tokens", repr(raw.headers.get("x-sclmd-ignored")))
+    raw = client.chat.completions.with_raw_response.create(model="x", messages=hello, max_tokens=100)
+    check("  at the cap: nothing named", raw.headers.get("x-sclmd-ignored") is None, repr(raw.headers.get("x-sclmd-ignored")))
+    card = client.models.retrieve("gemma-4-31b-it").model_extra or {}
+    check("the model card says the limits", card.get("max_prompt_tokens") == 64 and card.get("max_output_tokens") == 100, str(card.get("max_prompt_tokens")))
+    # the pings: the first token is held back 3.5 s, a ping every 1 s; the library skips the comments
+    t, text, finish, n = time.perf_counter(), "", None, 0
+    for chunk in client.chat.completions.create(model="x", messages=hello, stream=True, stream_options={"include_usage": True}):
+        n += 1
+        for c in chunk.choices:
+            text += c.delta.content or ""
+            finish = c.finish_reason or finish
+    check("a stream with pings before its first token: the library's text is the same", text == want and finish == "stop",
+          f"{repr(text)} after {time.perf_counter() - t:.1f} s, {n} chunks")
+    with client.chat.completions.stream(model="x", messages=hello) as s:
+        final = s.get_final_completion()
+    check("  the library's stream helper", final.choices[0].message.content == want)
+    with anon.chat.completions.stream(model="x", messages=hello) as s:
+        final = s.get_final_completion()
+    check("  anonymous, the stream helper", final.choices[0].message.content == want)
+    conn = http.client.HTTPConnection("127.0.0.1", int(sys.argv[1]), timeout=30)
+    conn.request("POST", "/v1/chat/completions", json.dumps({"messages": hello, "stream": True}), {"Content-Type": "application/json",
+                                                                                                 "Authorization": f"Bearer {KEY}"})
+    resp = conn.getresponse()
+    events = resp.read().decode("utf-8").split("\n\n")
+    conn.close()
+    pings = [e for e in events if e == ": ping"]
+    first = next(i for i, e in enumerate(events) if e.startswith("data: ") and '"content": "H' in e)
+    check("  on the wire: pings, all before the first token", len(pings) >= 2 and all(i < first for i, e in enumerate(events) if e == ": ping"),
+          f"{len(pings)} pings, the first token in event {first}")
+    # /metrics from this PC only (--metrics-local): through the trusted proxy (127.0.0.1 with X-Forwarded-For) it is not this PC
+    for headers, want_status, name in (({}, 200, "GET /metrics from this PC"), ({"X-Forwarded-For": "198.51.100.7"}, 404, "  through the proxy: 404")):
+        conn = http.client.HTTPConnection("127.0.0.1", int(sys.argv[1]), timeout=10)
+        conn.request("GET", "/metrics", headers={"Authorization": f"Bearer {KEY}", **headers})
+        st = conn.getresponse().status
+        conn.close()
+        check(name, st == want_status, str(st))
+    print("ALL OK" if ok else "SOMETHING FAILED")
+    sys.exit(0 if ok else 1)
 
 models = client.models.list()
 model = models.data[0].id
@@ -142,7 +227,7 @@ if len(sys.argv) > 2:  # a second server, started with --max-body-mb 1 --max-con
     import socket
     import time
 
-    busy = OpenAI(base_url=f"http://127.0.0.1:{sys.argv[2]}/v1", api_key="none", max_retries=0, timeout=20)
+    busy = OpenAI(base_url=f"http://127.0.0.1:{sys.argv[2]}/v1", api_key=KEY, max_retries=0, timeout=20)
     try:  # sent whole before the answer is read: the answer must not be lost to a reset
         busy.chat.completions.create(model=model, messages=[{"role": "user", "content": "a " * (3 << 20)}])
         check("a body over --max-body-mb 1 (6 MB)", False, "no error raised")

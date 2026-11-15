@@ -518,7 +518,8 @@ def test_every_request_gets_a_line_in_the_log_and_the_log_is_rotated(stand, tmp_
     assert files == ["requests.jsonl", "requests.jsonl.1", "requests.jsonl.2", "requests.jsonl.3"]  # three old ones kept
     lines = [json.loads(x) for p in sorted(tmp_path.iterdir(), reverse=True) for x in p.read_text(encoding="utf-8").splitlines()]
     last = lines[-1]
-    assert last["status"] == 400 and last["finish"] == "refused" and "not a chat completion" in last["error"]
+    # the refusal's line has its status, not its message (ZDR: a message may quote the request; scripts/serve_net.py)
+    assert last["status"] == 400 and last["finish"] == "refused" and "error" not in last and "not a chat" not in json.dumps(last)
     served = [x for x in lines if x.get("status") == 200]
     assert served and all(x["id"].startswith("chatcmpl-") and x["finish"] == "stop" and x["ttft_ms"] == 300 and x["reply"] == 3 for x in served)
     assert all(re.match(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}[+-]\d\d:\d\d$", x["t"]) for x in lines)

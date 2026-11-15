@@ -12,8 +12,9 @@
 # removed the server starts again (a start-up from its image with --image auto). Kept conversations are read again at
 # their next turn.
 #
-#   python -m scripts.supervise [supervisor options] [serve.py's options ...]      (serve.bat --supervise ...)
-#   log: logs/supervise.log
+#   python -m scripts.supervise [supervisor options] [serve.py's options ...]      (serve.bat --supervise ..., or
+#                                                                                  supervise = true in serve.toml)
+#   log: logs/supervise.log (the supervisor's own lines: starts, exits, waits; nothing of a request)
 import argparse
 import os
 import signal
@@ -52,20 +53,32 @@ def option(args: list, name: str, default: str) -> str:
     return default
 
 
+def configured(args: list, config: str = os.path.join(ROOT, "serve.toml")) -> dict:
+    """The server's serve.toml (--config another, --config "" none; scripts/serve_admin.py), names with _: {} when there
+    is none or it cannot be read (the server reports that)."""
+    path = option(args, "--config", None)
+    path = path if path is not None else (config if os.path.exists(config) else "")
+    if not path:
+        return {}
+    import tomllib
+
+    try:
+        with open(path, "rb") as f:
+            return {k.replace("-", "_"): v for k, v in tomllib.load(f).items()}
+    except (OSError, ValueError):
+        return {}
+
+
+def wanted(args: list, config: str = os.path.join(ROOT, "serve.toml")) -> bool:
+    """Whether serve.bat runs the server through the supervisor: --supervise among its arguments, or supervise = true
+    in its serve.toml (serve.public.example.toml)."""
+    return any(a.lower() == "--supervise" for a in args) or configured(args, config).get("supervise") is True
+
+
 def served_at(args: list, config: str = os.path.join(ROOT, "serve.toml")) -> tuple:
     """(host, port) the server will take: its command line, then its serve.toml (--config another, --config "" none;
     scripts/serve_admin.py), then its defaults. A file that cannot be read is left to the server to report."""
-    path = option(args, "--config", None)
-    path = path if path is not None else (config if os.path.exists(config) else "")
-    data = {}
-    if path:
-        import tomllib
-
-        try:
-            with open(path, "rb") as f:
-                data = {k.replace("-", "_"): v for k, v in tomllib.load(f).items()}
-        except (OSError, ValueError):
-            data = {}
+    data = configured(args, config)
     host = option(args, "--host", None) or str(data.get("host") or "127.0.0.1")
     port = int(option(args, "--port", None) or data.get("port") or 8001)
     return host, port
@@ -137,6 +150,9 @@ class Watch:
 
 
 def main() -> None:
+    if sys.argv[1:2] == ["--wanted"]:  # serve.bat: through the supervisor? (yes or no; serve.toml's supervise = true)
+        print("yes" if wanted(sys.argv[2:]) else "no")
+        return
     ap = argparse.ArgumentParser(description="Keeps scripts/serve.py up; options it does not know go to the server.", allow_abbrev=False)
     ap.add_argument("--log", default=LOG)
     ap.add_argument("--backoff-max", type=float, default=60.0, help="the longest wait before a restart (seconds)")

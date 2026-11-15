@@ -32,6 +32,7 @@ import time
 from datetime import datetime
 
 from scripts import serve_contract as C
+from scripts import serve_net as N
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG = os.path.join(ROOT, "serve.toml")  # read when it is there (--config another; --config "" none)
@@ -44,6 +45,7 @@ RETRY_MOST = 60.0
 TTFT_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60, 120)
 LATENCY_BUCKETS = (0.25, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600)
 SECRET = {"api_key", "api_keys", "key", "keys", "sclmd_api_key"}  # never from serve.toml
+SERVE_BAT = {"supervise"}  # serve.toml's keys for serve.bat (scripts/supervise.py: wanted), which the server passes over
 PATHS = ("/v1/chat/completions", "/v1/models", "/health", "/metrics", "/debug", "/")
 # the label values of /metrics: fixed sets, whatever a request says (a made-up method is "other")
 METHODS = ("GET", "POST", "HEAD", "PUT", "DELETE", "OPTIONS", "PATCH")
@@ -117,15 +119,7 @@ def load_keys(cli) -> list:
     return keys
 
 
-def presented(headers) -> bytes | None:
-    """The key a request gives: Authorization: Bearer <key>, else x-api-key."""
-    auth = headers.get("Authorization")
-    if auth:
-        scheme, _, value = auth.strip().partition(" ")
-        if scheme.lower() == "bearer" and value.strip():
-            return value.strip().encode()
-    other = headers.get("x-api-key")
-    return other.strip().encode() if other and other.strip() else None
+presented = N.presented  # the key a request gives: Authorization: Bearer <key>, else x-api-key
 
 
 def key_name(keys: list, got: bytes | None) -> str | None:
@@ -279,7 +273,7 @@ class RequestLog:
                     try:
                         self._rotate()
                     except OSError as e:  # another program holds it open (Windows): go on in the same file
-                        print(f"[serve] the request log could not be rotated: {e}", flush=True)
+                        print(f"[serve] the request log could not be rotated: {C.why(e)}", flush=True)
                     f = open(self.path, "ab")
                 f.write(line)
                 f.flush()
@@ -287,7 +281,7 @@ class RequestLog:
             except Exception as e:  # noqa: BLE001  (the log never stops the server)
                 self.failed += 1
                 if self.failed in (1, 10, 100):
-                    print(f"[serve] the request log failed ({self.failed}): {type(e).__name__}: {e}", flush=True)
+                    print(f"[serve] the request log failed ({self.failed}): {C.why(e)}", flush=True)
                 try:
                     if f is not None:
                         f.close()
@@ -310,9 +304,10 @@ class Entry:
 class Admin:
     def __init__(self, app, server, httpd=None, keys=(), max_waiting: int = 0, queue_timeout: float = 0.0, debug: bool = False,
                  request_log: str = "", request_log_mb: float = 64.0, status_file: str = "", status_every: float = 5.0, port: int = 0,
-                 host: str = "127.0.0.1"):
+                 host: str = "127.0.0.1", users=None):
         self.app, self.server, self.httpd = app, server, httpd
         self.keys, self.max_waiting, self.queue_timeout, self.debug = list(keys), max_waiting, queue_timeout, debug
+        self.users = users if users is not None else N.Users(self.keys, name_of=key_name)  # who a request is (scripts/serve_net.py)
         self.host, self.port = host, port
         self.lock = threading.Lock()
         self.inflight = {}  # id(request) -> Entry
@@ -454,7 +449,7 @@ class Admin:
         except ConnectionError:
             raise
         except Exception as e:  # noqa: BLE001  (a fault of this wait: the request goes on as without the option)
-            print(f"[serve] --queue-timeout's wait failed: {type(e).__name__}: {e}", flush=True)
+            print(f"[serve] --queue-timeout's wait failed: {C.why(e)}", flush=True)
             return True
 
     def _wait_placed(self, handler, req) -> bool:
@@ -485,10 +480,11 @@ class Admin:
         return True
 
     def failed(self, handler, error: BaseException) -> None:
-        """The reply's loop failed on the server's side (not the client leaving): its finish is server_error."""
+        """The reply's loop failed on the server's side (not the client leaving): its finish is server_error. The log
+        gets the error's type, not its message (ZDR)."""
         entry = getattr(handler, "_r4", None)
         if entry is not None:
-            entry.finish, entry.error = "server_error", f"{type(error).__name__}: {error}"[:300]
+            entry.finish, entry.error = "server_error", C.why(error)
 
     def ended(self, handler, req, event, finish=None) -> None:
         """The HTTP thread is done with the request: its line in the log, the histograms. finish: what the client was
@@ -521,6 +517,8 @@ class Admin:
             record["finish"] = "client_left"
         if req.ignored:
             record["ignored"] = req.ignored
+        if getattr(req, "tenant", None) is not None:  # tenancy on (scripts/serve_net.py): who it was
+            record["tenant"] = req.tenant
         if getattr(job, "seq", None) is not None:
             record["seq"] = job.seq
         s = self.server
@@ -709,7 +707,7 @@ class Admin:
             except Exception as e:  # noqa: BLE001  (a reader holding the file open, say: next time)
                 self.status_errors = getattr(self, "status_errors", 0) + 1
                 if self.status_errors in (1, 10, 100):
-                    print(f"[serve] the status file could not be written ({self.status_errors}): {type(e).__name__}: {e}", flush=True)
+                    print(f"[serve] the status file could not be written ({self.status_errors}): {C.why(e)}", flush=True)
             time.sleep(self.status_every)
 
 
@@ -728,6 +726,7 @@ def _begin(handler) -> None:
     """A request's own state on its handler (a connection's handler serves its requests one after another)."""
     handler._r4, handler._r4_status, handler._r4_logged, handler._r4_key, handler._r4_message = None, None, False, None, None
     handler._r4_line = getattr(handler, "raw_requestline", None)
+    handler._n1_who = None
 
 
 def _fresh(handler) -> None:
@@ -737,13 +736,16 @@ def _fresh(handler) -> None:
         _begin(handler)
 
 
+UNKNOWN_KEY = ("this API key is not known here: send a key this server gave you, or none to be served as your address "
+               "(the openai library: default_headers={\"Authorization\": \"\"})")
+
+
 def _allowed(adm, handler, path: str) -> bool:
-    """Whether the request may go on; else a 401 has been sent. Without keys everything may."""
-    if not adm.keys or path == "/health":
-        return True
-    name = key_name(adm.keys, presented(handler.headers))
-    if name is not None:
-        handler._r4_key = name
+    """Whether the request may go on; else a 401 has been sent. Who it is (scripts/serve_net.py) goes on the handler
+    first. Without keys (and without --anonymous) everything may."""
+    w = handler._n1_who = adm.users.who(handler)
+    if path == "/health" or w.refusal is None:
+        handler._r4_key = w.key
         return True
     with adm.lock:
         adm.refused["unauthorized"] += 1
@@ -763,7 +765,8 @@ def _allowed(adm, handler, path: str) -> bool:
         unread = None if unread is not None and unread < 0 else unread
     if unread != 0:
         handler.close_connection = True
-    handler._json(401, {"error": {"message": "an API key is needed: Authorization: Bearer <key> (or x-api-key)", "type": "invalid_request_error",
+    text = UNKNOWN_KEY if adm.users.anonymous and w.refusal == "unknown_key" else "an API key is needed: Authorization: Bearer <key> (or x-api-key)"
+    handler._json(401, {"error": {"message": text, "type": "invalid_request_error",
                                   "param": None, "code": "invalid_api_key"}}, {"WWW-Authenticate": 'Bearer realm="sclmd"'})
     if unread != 0:
         C.linger(handler.connection, handler.rfile, unread)
@@ -783,6 +786,8 @@ def get(handler) -> bool:
     path = handler.path.split("?")[0].rstrip("/")
     if not _allowed(adm, handler, path):
         return True
+    if path == "/metrics" and N.metrics_refused(handler):  # --metrics-local: an unknown path from anywhere but this PC
+        return False
     if path == "/metrics":
         data = adm.metrics().encode()
         handler.send_response(200)
@@ -875,12 +880,13 @@ def ended(handler, req, event, finish=None) -> None:
     try:
         adm.ended(handler, req, event, finish)
     except Exception as e:  # noqa: BLE001  (bookkeeping never fails a request)
-        print(f"[serve] the request's bookkeeping failed: {type(e).__name__}: {e}", flush=True)
+        print(f"[serve] the request's bookkeeping failed: {C.why(e)}", flush=True)
 
 
 def answered(handler, code: int) -> None:
     """Every answer's status (Handler.send_response): counted; a refusal that is not a request's (400, 404, 411, 413
-    before it was taken in) gets its own line in the request log."""
+    before it was taken in) gets its own line in the request log: the field it is about and the error's code, never
+    its message (ZDR: a message may quote the request)."""
     adm = _admin(handler)
     if adm is None:
         return
@@ -893,15 +899,21 @@ def answered(handler, code: int) -> None:
         adm.responses[key] = adm.responses.get(key, 0) + 1
     if code >= 400 and getattr(handler, "_r4", None) is None and not getattr(handler, "_r4_logged", False) and command == "POST":
         handler._r4_logged = True
-        adm._write({"status": code, "finish": "refused", "client": handler.client_address[0], "key": getattr(handler, "_r4_key", None),
-                    "path": path, "error": getattr(handler, "_r4_message", None)})
+        record = {"status": code, "finish": "refused", "client": handler.client_address[0], "key": getattr(handler, "_r4_key", None),
+                  "path": path}
+        param, kind = getattr(handler, "_r4_message", None) or (None, None)
+        record.update({k: v for k, v in (("param", param), ("code", kind)) if v is not None})
+        tenant = N.who_of(handler).tenant
+        if tenant is not None:
+            record["tenant"] = tenant
+        adm._write(record)
 
 
-def message(handler, text: str) -> None:
-    """The message of an error answer (Handler._error), for the request log (which may come before do_POST ran: a
-    refused Expect: 100-continue)."""
+def message(handler, param=None, code=None) -> None:
+    """What the request log keeps of an error answer (Handler._error): the field it is about and its code, not its
+    message (ZDR). It may come before do_POST ran (a refused Expect: 100-continue)."""
     _fresh(handler)
-    handler._r4_message = text
+    handler._r4_message = (param, code)
 
 
 # the books of the keys and values (the soak's audit)
@@ -1015,6 +1027,7 @@ def add_options(ap) -> None:
     g.add_argument("--request-log-mb", type=float, default=64.0, help="the request log is rotated (.1, .2, .3) past this size")
     g.add_argument("--status-file", default="", help="the server's state as JSON, rewritten every 5 s, e.g. logs/serve_status.json (\"\": none)")
     g.add_argument("--debug", action="store_true", help="POST /debug/fault and GET /debug/audit, for scripts/soak.py (a loopback --host only)")
+    N.add_options(ap)  # who a request is and the limits (scripts/serve_net.py)
 
 
 def _defaults_from(ap, data: dict, path: str) -> dict:
@@ -1022,12 +1035,18 @@ def _defaults_from(ap, data: dict, path: str) -> dict:
     out = {}
     for k, v in data.items():
         dest = k.replace("-", "_")
+        if dest in SERVE_BAT:  # serve.bat's own (supervise = true: through scripts/supervise.py), not the server's
+            if not isinstance(v, bool):
+                raise SystemExit(f"{path}: {k} is a switch: true or false")
+            continue
         if dest in SECRET:
             raise SystemExit(f"{path}: {k}: API keys are not read from a file that may be committed: set {ENV_KEY} or --api-key-file")
         if dest == "config" or dest not in actions:
             raise SystemExit(f"{path}: {k} is not an option of the server (python -m scripts.serve -h lists them)")
         a = actions[dest]
-        if a.nargs == 0:  # a switch
+        if a.nargs == "?" and a.const is not None and isinstance(v, bool):  # int8 = true: the option given alone (its const)
+            v = a.const if v else a.default
+        elif a.nargs == 0:  # a switch
             if not isinstance(v, bool):
                 raise SystemExit(f"{path}: {k} is a switch: true or false")
         elif isinstance(v, (dict, list, bool)):
@@ -1072,6 +1091,7 @@ def start(cli) -> list:
     """Checks made before the model loads -> the API keys. A host other than loopback without a key: a loud warning
     (--require-key: no start)."""
     keys = load_keys(cli)
+    N.check(cli)
     if cli.debug and not loopback(cli.host):
         raise SystemExit("--debug serves its fault endpoint only on a loopback --host (127.0.0.1)")
     if not loopback(cli.host) and not keys:
@@ -1090,13 +1110,19 @@ def start(cli) -> list:
 
 def install(app, server, cli, httpd, keys: list) -> Admin:
     """The operator's side of a running server: app.admin, the engine's methods timed, the log and the status writer."""
+    users = N.users_of(cli, keys, key_name)  # who a request is (scripts/serve_net.py): off without --anonymous and keys
     adm = Admin(app, server, httpd, keys, max_waiting=cli.max_waiting, queue_timeout=cli.queue_timeout, debug=cli.debug,
-                request_log=cli.request_log, request_log_mb=cli.request_log_mb, status_file=cli.status_file, port=cli.port, host=cli.host)
+                request_log=cli.request_log, request_log_mb=cli.request_log_mb, status_file=cli.status_file, port=cli.port, host=cli.host,
+                users=users)
     adm.time_engine()
     app.admin = adm
+    N.apply(cli, app)
     on = [f"API keys: {', '.join(n for n, _ in keys)}" if keys else None, f"--max-waiting {cli.max_waiting}" if cli.max_waiting else None,
           f"--queue-timeout {cli.queue_timeout:g} s" if cli.queue_timeout else None, f"request log {cli.request_log}" if cli.request_log else None,
           f"status file {cli.status_file}" if cli.status_file else None, "--debug (fault and audit endpoints)" if cli.debug else None]
     on = [x for x in on if x]
     print("[serve] GET /metrics" + (f"; {'; '.join(on)}" if on else ""), flush=True)
+    said = N.line(cli, users)
+    if said:
+        print(said, flush=True)
     return adm

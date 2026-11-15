@@ -1,0 +1,52 @@
+# The proxy PC's Caddy for the internet server (design.md 6.17): TLS for the owner's domain, and every request over
+# the LAN to the GPU PC's server (serve.public.example.toml: port 8001; its trusted-proxies is THIS PC's LAN address).
+# Caddy 2.7 or later. Edit the lines marked EDIT, then: caddy run --config Caddyfile (or caddy reload --config Caddyfile).
+#
+# - TLS: Caddy gets and renews the certificate for the domain by itself (ports 80 and 443 must reach this PC, and the
+#   domain's DNS A/AAAA record must point to it).
+# - X-Forwarded-For: reverse_proxy sets it to the address the request came from. An internet client is not one of
+#   Caddy's own trusted_proxies (none are set here), so a header the client sent is dropped, not passed on. The GPU
+#   PC's server reads the header only from this PC, from the right.
+# - Streams: a response of Content-Type text/event-stream is flushed at once, by Caddy's own rule; flush_interval is
+#   left alone (a negative one would also keep the GPU writing for a client that has left).
+# - Timeouts: none on the server's answer. A 32,768-token prompt takes 22.5 s to its first token and an 8,192-token
+#   reply minutes more; a stream gets ": ping" every 15 s until its first token, and a request that is not streamed
+#   gets nothing until its reply is whole. An idle connection to the server is closed after 60 s (keepalive), before
+#   the server's own 120 s (idle-timeout), so that Caddy never sends a request on a connection the server is closing.
+# - While the GPU PC's supervisor restarts the server, a refused connection is tried again for up to 15 s
+#   (lb_try_duration: only a connection that failed, so no request reaches the server twice).
+# - Bodies: 32 MiB at most (413), as the server's max-body-mb.
+# - /metrics and /debug are not served from the internet (the server answers /metrics to the GPU PC itself only).
+# - No access log (Caddy writes none unless a `log` directive asks): the GPU PC keeps the metadata (ZDR).
+
+{
+	# EDIT (optional): an address for the certificate authority's notices
+	email you@example.com
+	servers {
+		timeouts {
+			read_header 30s
+			read_body 10m
+			idle 5m
+		}
+	}
+}
+
+# EDIT: the owner's domain
+llm.example.com {
+	request_body {
+		max_size 32MiB
+	}
+
+	@inside path /metrics /metrics/* /debug /debug/*
+	respond @inside 404
+
+	# EDIT: the GPU PC's LAN address
+	reverse_proxy 192.168.0.20:8001 {
+		lb_try_duration 15s
+		lb_try_interval 500ms
+		transport http {
+			dial_timeout 5s
+			keepalive 60s
+		}
+	}
+}

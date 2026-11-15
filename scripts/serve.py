@@ -8,7 +8,9 @@
 #
 # One thread owns the engine; the HTTP threads only hand it requests and turn the tokens it settles into text.
 # Fields it does not serve, the body's size and the connections: scripts/serve_contract.py. API keys, back-pressure,
-# GET /metrics, the request log and the status file: scripts/serve_admin.py.
+# GET /metrics, the request log and the status file: scripts/serve_admin.py. Who a request is, the prompt's and the
+# reply's limits and a stream's pings (the internet server): scripts/serve_net.py. ZDR: what it logs of a request is
+# metadata (scripts/serve_contract.py: why, trace).
 import argparse
 import json
 import os
@@ -33,6 +35,7 @@ from sclmd.text import Pieces
 from sclmd.stream import VRAM_MARGIN, cap_vram
 from scripts import serve_admin as A
 from scripts import serve_contract as C
+from scripts import serve_net as N
 from scripts import serve_ops
 
 DEPTH = 6  # the drafter's generation_config.json: num_assistant_tokens
@@ -69,6 +72,9 @@ class Request:
         self.opened = False  # the reply begins inside a thought the prompt opened (after a tool's result, thinking on)
         self.stop_ids = None  # the tokens that end its reply, where they are not the server's (parallel_tool_calls: false)
         self.stop_calls = []  # the calls the client had got when a stop string cut the answer: set before stop_text
+        # who sent it (scripts/serve_net.py: tag), the seams of the later stages: the tenant's id (None: tenancy off),
+        # its priority (0: everyone alike), the scope of its prompt caches (None: shared, as before)
+        self.tenant, self.priority, self.scope = None, 0, None
 
 
 class Kept:
@@ -289,7 +295,7 @@ class Server:
             try:
                 later = self.canon(req, job.out) if self.canon is not None else None
             except Exception as e:  # noqa: BLE001  (a template that cannot write the reply: nothing is read ahead)
-                print(f"[serve] seq {seq}: the reply's later form could not be made ({type(e).__name__}: {e})", flush=True)
+                print(f"[serve] seq {seq}: the reply's later form could not be made ({C.why(e)})", flush=True)
                 later = None
             if later is not None and later[: req.start] == kept.base and req.start < len(later) <= eng.capacity - 2 * narrow(eng):
                 # the reply as a later turn writes it is read in from the turn's start, with rows nothing else needs
@@ -358,18 +364,17 @@ class Server:
 
     def run(self) -> None:
         """Turns for ever. If one fails, every request that is under way or waiting is told (the HTTP threads answer
-        with an error instead of waiting for tokens that will not come), and the engine starts from nothing."""
-        import traceback
-
+        with an error instead of waiting for tokens that will not come), and the engine starts from nothing. The log
+        gets the failure's frames and type, not its message (ZDR)."""
         while True:
             try:
                 self.turn()
                 if self.ops is not None:
                     self.ops.beat()
             except Exception as e:  # noqa: BLE001
-                traceback.print_exc()
+                C.trace(e)
                 told = self.ops.failed(e) if self.ops is not None else None  # --crash-only: (503, why) when the engine is dead
-                print(f"[serve] the engine's thread failed: {type(e).__name__}: {e}; {len(self.active) + len(self.waiting)} requests are told", flush=True)
+                print(f"[serve] the engine's thread failed: {C.why(e)}; {len(self.active) + len(self.waiting)} requests are told", flush=True)
                 for req in self.active + self.waiting:
                     req.events.put(("error",) + (told or (500, f"the server failed while answering: {type(e).__name__}")))
                 self.reset()
@@ -411,6 +416,7 @@ class App:
         server.canon = self.canonical
         self.fields, self.max_body = "default", C.MAX_BODY  # --lenient-fields / --strict-fields, --max-body-mb
         self.look_s = C.LOOK_S  # --look-gone
+        self.max_prompt, self.max_output, self.ping_s = 0, 0, 0.0  # --max-prompt, --max-output, --stream-ping (scripts/serve_net.py; 0: off)
         self._marks = None  # the tool format's tokens (sclmd/tools.py), when a request first needs them
 
     def marks(self) -> dict:
@@ -464,8 +470,10 @@ class App:
 
     def card(self) -> dict:
         eng = self.server.eng
+        limits = {"max_prompt_tokens": self.max_prompt} if getattr(self, "max_prompt", 0) else {}  # --max-prompt
         return {"id": MODEL, "object": "model", "created": self.created, "owned_by": "sclmd", "root": MODEL, "parent": None,
-                "max_model_len": eng.capacity, "context_length": eng.capacity, "max_output_tokens": self.max_tokens,
+                "max_model_len": eng.capacity, "context_length": eng.capacity, **limits,
+                "max_output_tokens": getattr(self, "max_output", 0) or self.max_tokens,
                 "quantization": f"{self.facts['bits_per_weight']} bits a weight",
                 "capabilities": {"streaming": True, "reasoning": True, "tools": True, "prompt_cache": True, "vision": False},
                 "defaults": {"temperature": 1.0, "top_p": 0.95, "top_k": 64, "thinking": self.think, "max_tokens": self.max_tokens}}
@@ -577,10 +585,20 @@ class App:
             closed = self.marks()["closed"]
             cut = next((i + len(closed) for i in range(len(full)) if full[i : i + len(closed)] == closed), 0)
         room = eng.capacity - len(full) - narrow(eng)
+        most = getattr(self, "max_prompt", 0)  # --max-prompt (scripts/serve_net.py): OpenAI's 400
+        if most and len(full) > most:
+            raise Refused(*N.context_exceeded(most, len(full)))
         if room < 16:
+            if most:  # in OpenAI's shape too
+                raise Refused(*N.context_exceeded(eng.capacity, len(full), "context"))
             raise Refused(400, f"the conversation is {len(full)} tokens: the context holds {eng.capacity}")
         asked = body.get("max_completion_tokens", body.get("max_tokens"))
-        max_new = min(int(asked) if asked else self.max_tokens, room)
+        wanted = int(asked) if asked else self.max_tokens
+        cap = getattr(self, "max_output", 0)  # --max-output: more is cut to it and named
+        if cap and wanted > cap:
+            wanted = cap
+            ignored = sorted(set(ignored) | {"max_completion_tokens" if "max_completion_tokens" in body else "max_tokens"})
+        max_new = min(wanted, room)
         if max_new < 1:
             raise Refused(400, "max_tokens is at least 1")
         temperature = float(body.get("temperature", 1.0) if body.get("temperature") is not None else 1.0)
@@ -620,10 +638,10 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _error(self, status: int, message: str, param: str | None = None) -> None:
+    def _error(self, status: int, message: str, param: str | None = None, code: str | None = None) -> None:
         kind = "invalid_request_error" if status < 500 else "server_error"
-        A.message(self, message)
-        self._json(status, {"error": {"message": message, "type": kind, "param": param, "code": None}})
+        A.message(self, param, code)  # the request log keeps the field and the code, not the message (ZDR)
+        self._json(status, {"error": {"message": message, "type": kind, "param": param, "code": code}})
 
     def _gone(self) -> bool:
         """Whether the client has closed the connection."""
@@ -684,6 +702,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         except (ValueError, TypeError, AttributeError, OverflowError, RecursionError) as e:
             return self._error(400, f"the body is not a chat completion request: {str(e)[:300]}")
+        N.tag(self, req)  # who sent it: req.tenant, req.priority, req.scope (scripts/serve_net.py)
         req.stops = stops
         if odd:  # a stop that is not text: what is text of it is served
             req.ignored = sorted(set(req.ignored) | {"stop"})
@@ -703,6 +722,7 @@ class Handler(BaseHTTPRequestHandler):
         stopped = False
         event, looked = None, time.monotonic()  # the last event taken; when the connection was last looked at
         finish = None  # what the client is told the reply ended with (the request log)
+        ping = getattr(app, "ping_s", 0.0) if stream else 0.0  # --stream-ping: ": ping" until the first token
         if not A.submit(self, req, head["id"], stream):  # app.server.submit(req), or 429 past --max-waiting
             return
 
@@ -726,13 +746,19 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.close_connection = True
                 chunk({"role": "assistant", "content": ""})
+            wrote = time.monotonic()  # the stream's last bytes: a ping S seconds after them, until anything comes
             while True:
                 try:
-                    event = req.events.get(timeout=1.0)
+                    event = req.events.get(timeout=min(1.0, ping) if ping else 1.0)
                 except queue.Empty:
                     if self._gone():
                         raise ConnectionError
+                    if ping and time.monotonic() - wrote >= ping:  # an SSE comment: clients skip it, proxies see the stream alive
+                        self.wfile.write(b": ping\n\n")
+                        self.wfile.flush()
+                        wrote = time.monotonic()
                     continue
+                ping = 0.0  # a token (or the end) has come: no more pings
                 if event[0] == "error":
                     if stream:
                         self.wfile.write(b"data: " + json.dumps({"error": {"message": event[2], "type": "server_error"}}).encode() + b"\n\n")
@@ -812,12 +838,11 @@ class Handler(BaseHTTPRequestHandler):
                         calls.append(call)
                         if stream:
                             chunk({"tool_calls": [{"index": len(calls) - 1, **T.public(call)}]})
-                if tooled and pieces.malformed:
-                    print(f"[serve] {head['id']}: {len(pieces.malformed)} tool call block(s) did not parse ({pieces.malformed[0][0]}): "
-                          f"left in the content", flush=True)
+                if tooled and pieces.malformed:  # (counted, not quoted: the block and why it did not parse are the model's text: ZDR)
+                    print(f"[serve] {head['id']}: {len(pieces.malformed)} tool call block(s) did not parse: left in the content", flush=True)
                 undeclared = [c["function"]["name"] for c in calls if c["function"]["name"] not in {t["function"]["name"] for t in req.tools or []}]
-                if undeclared:  # returned as the model wrote them: the client decides
-                    print(f"[serve] {head['id']}: a call of a function not declared ({', '.join(undeclared)}): returned as it is", flush=True)
+                if undeclared:  # returned as the model wrote them: the client decides (the names are the model's text: counted)
+                    print(f"[serve] {head['id']}: {len(undeclared)} call(s) of a function not declared: returned as the model wrote them", flush=True)
                 if stream and len(text["answer"]) > sent:
                     chunk({"content": text["answer"][sent:]})
                 finish = "stop" if stopped else result["finish_reason"]
@@ -845,10 +870,8 @@ class Handler(BaseHTTPRequestHandler):
             req.cancelled = True
             self.close_connection = True
         except Exception as e:  # noqa: BLE001  (a fault here: the client is told what it can be, the engine stops the reply)
-            import traceback
-
-            traceback.print_exc()
-            print(f"[serve] {head['id']}: the reply could not be sent: {type(e).__name__}: {e}", flush=True)
+            C.trace(e)  # the frames and the type, not the message (ZDR)
+            print(f"[serve] {head['id']}: the reply could not be sent: {C.why(e)}", flush=True)
             A.failed(self, e)  # logged as the server's failure, not as the client leaving
             self.close_connection = True
             try:
@@ -885,7 +908,8 @@ def pool_for(cfg: M.Config, budget: int, full_per_sliding: float, keyless: bool 
     return {M.SLIDING: n, M.FULL: int(n * full_per_sliding)}
 
 
-def main() -> None:
+def parser() -> argparse.ArgumentParser:
+    """The server's options (serve.toml takes the same names: scripts/serve_admin.py parse_args)."""
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--host", default="127.0.0.1", help="address to listen on (this machine only by default; 0.0.0.0 lets others in: "
                     "set SCLMD_API_KEY, else there is no password)")
@@ -924,6 +948,11 @@ def main() -> None:
     C.add_options(ap)
     A.add_options(ap)
     serve_ops.add_options(ap)
+    return ap
+
+
+def main() -> None:
+    ap = parser()
     cli = A.parse_args(ap)  # serve.toml's options (--config) under the command line's
     keys = A.start(cli)  # the API keys; a host other than loopback without one: a warning (--require-key: no start)
     E.use_int8_option(cli)  # the whole engine: every request's rows on the integer products, so a reply's bits do not depend on its neighbours

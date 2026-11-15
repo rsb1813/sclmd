@@ -1,0 +1,39 @@
+# The internet server (design.md 6.16, 6.17): the owner's settings. Copy to serve.toml (git ignores it), edit the
+# lines marked EDIT, and start serve.bat: supervise = true runs it through scripts/supervise.py. The proxy PC:
+# deploy/Caddyfile.example. This PC's firewall (port 8001 from the proxy PC only): deploy/firewall.example.ps1.
+# API keys are never read from here (the repository is pushed to a mirror): set SCLMD_API_KEY ("name:key", commas)
+# or name a key file outside the repository (api-key-file below). Names are the command line's, with - or _.
+
+supervise = true                 # serve.bat: through the supervisor (restarts after an engine failure; logs\supervise.log)
+host = "0.0.0.0"                 # the proxy PC reaches this PC over the LAN (the firewall lets only it in)
+port = 8001
+
+# the engine (design.md 6.8, 6.10, 6.13, 6.6, 6.7, 6.15)
+int8 = true                      # integer products (lossy option; no loss measured on translation into Korean)
+kv4 = true                       # the sliding layers' keys and values at 4 bits (lossy option, KL +0.009)
+wide-rows = 256                  # several prompts read in passes of up to 256 rows
+keyless = true                   # long conversations: the full-attention layers keep values only (21 KB a token)
+context = 40960                  # one conversation: a prompt of 32,768 tokens and its reply
+typical = 8192                   # the pool's split: conversations at once of 2,000 tokens 4, of 32k 1
+prefix-gib = 2                   # shared prompt prefixes in page-locked RAM
+image = "auto"                   # starts in about 6 s from an engine image (data\images, 11.7 GB, written once a build)
+
+# limits (scripts/serve_net.py, scripts/serve_contract.py)
+max-prompt = 32768               # a longer prompt: 400 context_length_exceeded
+max-output = 8192                # a larger max_tokens is cut to it and named in x-sclmd-ignored
+max-tokens = 8192                # the reply of a request that does not say
+stream-ping = 15                 # ": ping" every 15 s until a stream's first token (a 32k prompt: 22.5 s)
+max-body-mb = 32                 # 413 above it
+idle-timeout = 120               # an idle connection closed (between requests, or one that stopped sending)
+max-connections = 256            # 503 past it
+
+# users (scripts/serve_net.py, scripts/serve_admin.py)
+require-key = true               # does not start without an API key (SCLMD_API_KEY or api-key-file)
+# api-key-file = "C:/Users/me/sclmd-keys.txt"    # EDIT: "name: key" a line, OUTSIDE the repository
+anonymous = true                 # a request without a key is served as its address (IPv4, or IPv6's /64)
+trusted-proxies = "192.168.0.10" # EDIT: the proxy PC's LAN address: its X-Forwarded-For alone is read
+metrics-local = true             # GET /metrics from this PC only
+
+# what is written: metadata only (ZDR: no prompt or reply)
+request-log = "logs/serve_requests.jsonl"
+status-file = "logs/serve_status.json"

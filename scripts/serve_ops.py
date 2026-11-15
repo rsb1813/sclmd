@@ -109,7 +109,7 @@ class Ops:
             many = self.exits and self.failures > 0 and len(self.recent) >= self.failures
             why = f"{len(self.recent)} failures within {self.window_s:.0f} s" if many else None
         except Exception as e:  # noqa: BLE001
-            why = f"the device is lost ({type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''})"
+            why = f"the device is lost ({C.why(e)})"  # the type, and a CUDA error's own words (ZDR: no other message)
         self.beat()
         if why is None:
             self._log(f"a turn failed ({type(error).__name__}); the device answers: going on")

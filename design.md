@@ -845,6 +845,75 @@ R1 열은 마지막 코드로 잰 것이다(그 전 코드로 한 번 더: 80.3%
 
 **바로 하지 않는 것.** K2(풀이 모자랄 때)는 보류. S1의 짧은 것 먼저·잡아두기는 뺌.
 
+### 6.17 인터넷 서버의 바탕 (N1: 사용자, ZDR, 한도, 프록시) [실측, 무손실]
+
+6.16의 첫 단계다. 엔진·스케줄러·커널은 그대로이고 서버의 HTTP 쪽만 고쳤다: 새 모듈 `scripts/serve_net.py`(사용자, 이음매, 한도), `scripts/zdr_check.py`(카나리 관문), `serve.public.example.toml`, `deploy/Caddyfile.example`, `deploy/firewall.example.ps1`, 그리고 `serve.py`·`serve_admin.py`·`serve_contract.py`·`serve_ops.py`·`supervise.py`·`serve_canned.py`·`openai_client_check.py`·`serve.bat`에 몇 줄. 새 동작은 모두 선택지이고 **기본은 꺼져 있다**. 6.16대로 기본에서 달라지는 것은 ZDR 로그 고침뿐이다(아래). 클라이언트가 받는 바이트는 같다: 가짜 엔진에서 10fd0af와 같은 요청 165개(R4-land의 `ab_wire.py`) 중 164개가 바이트 단위로 같고, 다른 하나는 `GET /metrics`다(숫자를 빼면 87줄이 같다: uptime 같은 값). 진짜 엔진에서도 같은 토큰이다(아래).
+
+**사용자 (`serve_net.who`: 연결의 주소, 머리글, 키, 선택지만 보는 함수 하나; 몸통은 읽지 않는다).**
+- 키(`Authorization: Bearer`, `x-api-key`)가 서버의 키면 `key:<이름>`. 서버에 없는 키는 401이다(IP로 넘기지 않음; 이 PC에서 온 것도).
+- 키가 없으면 IP: IPv4는 주소(`ip:203.0.113.7`), IPv6는 /64(`ip:2001:db8:1:2::/64`). `::ffff:a.b.c.d`는 IPv4로 읽는다. 키가 있어도 받는 것은 `--anonymous`다(없으면 R4대로 401, 메시지도 R4 그대로).
+- `X-Forwarded-For`는 연결이 `--trusted-proxies`(프록시 PC의 주소나 망)에서 왔을 때만 읽는다. 모든 머리글을 차례로 이어 오른쪽부터, 믿는 프록시를 건너뛴 첫 주소가 사용자다. 그 머리글에서 나온 주소는 무엇이든 "이 PC"가 아니다(클라이언트가 `127.0.0.1`을 써도 `ip:127.0.0.1`). 믿는 프록시가 읽을 수 없는 값을 적었으면(주소가 아님) 프록시 자신의 주소, 모두 믿는 프록시면 맨 왼쪽, 머리글이 비었으면 연결의 주소다.
+- 루프백에서 프록시 없이 온 요청은 `local`(이 PC).
+- 사용자를 가르는 것(tenancy)은 키가 있거나 `--anonymous`일 때만 켜진다. 둘 다 없으면 오늘처럼 모두 받고 `req.tenant`는 None이다(아무 키나 무시됨).
+- 믿지 않는 연결이 `X-Forwarded-For`를 보내면(프록시 주소를 잘못 적음: 모든 사용자가 프록시 하나가 됨) 콘솔에 한 번 적는다(그 연결의 주소만).
+- 공식 openai 라이브러리 3.51.0은 키 없이 보내지 못한다(잰 것: `api_key=""`는 요청 전에 `OpenAIError`, `"none"`은 그대로 `Bearer none`을 보내 401). 빈 머리글 `default_headers={"Authorization": ""}`(api_key는 아무 값)이면 키 없는 요청이 되어 200이다. `--anonymous`의 401 메시지가 이것을 알려 준다.
+
+**뒤 단계의 이음매.** 요청 객체마다 셋이 붙는다(`serve_net.tag`, `app.request()` 바로 뒤, `A.submit` 전):
+- `req.tenant`: 위의 이름, tenancy가 꺼지면 None.
+- `req.priority`: int, 이 단계에서는 모두 0(`Users.priority_of`: 할당량 단계가 채운다).
+- `req.scope`: 캐시의 범위. `Users.per_tenant`가 켜지면 사용자 이름, 아니면 None(오늘처럼 공유; `Users.scope_of`: 캐시 단계가 읽는다).
+- 요청 객체가 없는 GET과 거절에도 `serve_net.who_of(handler)`로 같은 Who를 본다(할당량 단계의 `GET /v1/usage`, `x-ratelimit-*`). 요청 기록의 줄에는 tenancy가 켜졌을 때만 `"tenant"`가 붙는다.
+- `/metrics`에는 사용자를 라벨로 넣지 않는다(시리즈가 끝없이 늘고 IP가 남는다).
+
+**ZDR (기본, 옵션 없이도).** 서버가 쓰는 줄과 파일을 모두 보았다: 콘솔(`serve.py`, `serve_admin.py`, `serve_ops.py`, `supervise.py`), `logs\supervise.log`, 요청 기록, 상태 파일, `/metrics`, 응답 머리글. 고친 것:
+- 요청 기록의 거절 줄(400·411·413 등)이 오류 메시지를 `error`에 적었다. 메시지는 요청을 옮겨 적는다: `max_tokens: "<글>"`이면 `invalid literal for int() ... '<글>'`, 템플릿의 오류 글, `--strict-fields`의 값. 이제 `param`(필드 이름)과 `code`만 적는다. 서버가 보내다 실패한 줄(`server_error`)의 `error`는 예외의 형식 이름만이다. 클라이언트가 받는 메시지는 그대로다.
+- 콘솔: 읽히지 않는 도구 호출 블록은 그 이유(모델의 글 조각, 예: `no ':' after the key '<글>'`)를, 선언하지 않은 함수의 호출은 그 이름(모델의 글)을 찍었다. 이제 수만 찍는다.
+- `{e}`를 찍던 곳(나중 모양을 못 만듦, 엔진 스레드 실패, 답을 보내다 실패, 요청 기록·상태 파일 실패, `--queue-timeout` 대기 실패, 기록 실패, 장치를 잃음)은 `serve_contract.why(e)`: 형식 이름만. 첫 줄이 `CUDA`로 시작하는 것(드라이버와 할당기의 말, 요청이 쓸 수 없음)만 그 줄을 남긴다.
+- `traceback.print_exc()`(마지막 줄이 예외 메시지)는 `serve_contract.trace(e)`로: 프레임(파일, 줄, 함수, 코드 한 줄)과 형식, 원인 예외도 같게. socketserver의 `handle_error`(처리 안 된 예외의 traceback 전체)도 같게 했다. 연결 리셋(`ConnectionResetError` 등)은 trace 없이 한 줄이다.
+- 그대로 둔 것: 무시한 필드의 이름(`x-sclmd-ignored`와 콘솔), 키의 이름, 클라이언트 주소, 토큰 수와 시간, 서버가 만든 오류 문장(`the server failed while answering: InjectedFault`), watchdog의 스택(프레임만), supervisor의 명령줄(선택지만; 키는 명령줄에 없다).
+
+**카나리 관문 (`python -m scripts.zdr_check --url ... --search <폴더> ...`).** 요청마다 같은 카나리(14자, 매번 새로)를 넣는다: 시스템·사용자 메시지, 도구의 이름·설명·매개변수, 호출의 인자와 결과, stop, 무시되는 필드(`logit_bias`, `metadata`, `user`, `model`), 머리글(`User-Agent`, `x-request-id`, `Referer`), 경로와 쿼리, 틀린 API 키(두 머리글), 숫자가 아닌 `max_tokens`·`temperature`·`top_p`·`top_k`·`seed`·`n`, strict json_schema, 끝이 모델인 대화, 모르는 role, 이미지, JSON이 아닌 몸통, UTF-8이 아닌 몸통, 너무 긴 프롬프트, 32MB를 넘는 몸통, 덜 온 몸통, 떠난 스트림, `X-Forwarded-For`(주소가 아닌 값 포함), 그리고 `--debug`의 handler 결함과 engine 결함(스트림 포함; 결함을 걸기 전에 `/debug/audit`으로 엔진이 쉬기를 기다려 그 요청이 결함을 맞게 했다). 가짜 엔진에서는 `call <이름>`·`malformed <말>`로 모델의 글에 카나리를 넣어 도구 호출 줄까지 지난다. 그 뒤 7초 기다려(상태 파일은 5초마다) 폴더의 모든 파일(UTF-8과 UTF-16)과 `/metrics`를 찾는다.
+
+| | 요청 | 찾은 곳 | 맞은 것 |
+|---|---|---|---|
+| 가짜 엔진, 10fd0af(같은 가짜 엔진 모듈) | 50 | 콘솔, 요청 기록, 상태 파일, `/metrics` | **8**: 콘솔 3(선언 안 된 함수 이름 1, 읽히지 않는 블록의 이유 2), 요청 기록 5(숫자가 아닌 값의 400 메시지) |
+| 가짜 엔진, N1(공개 설정의 선택지, 키, `--debug`) | 56 | 같음 | 0 |
+| 진짜 엔진, N1, 공개 설정 + `--host 127.0.0.1 --debug --trusted-proxies 127.0.0.1`, supervisor 아래 | 53 (200 28, 400 18, 401 3, 404 2, 413 1, 500 2, 501 1) | 콘솔, `supervise.log`, 요청 기록, 상태 파일, `/metrics`, 멈춘 뒤 다시 | 0 |
+
+진짜 엔진에서 카나리는 26개 답에 돌아왔다(400 메시지가 옮겨 적은 것과 모델이 따라 쓴 것: 서버를 지나갔다는 표시). `--debug`는 루프백 호스트에서만 되므로 공개 설정의 `0.0.0.0` 대신 127.0.0.1에서 쟀다. `CUDA`로 시작하는 메시지를 남기는 길을 보려고 카나리를 `CUDA error q7z1`로 바꿔 가짜 엔진에서 한 번 더 돌렸다: 0. 그 길은 RuntimeError(토치의 것)에만 열려 있다. 서버가 쓴 파일은 넘긴 폴더의 것뿐이다: 진짜 엔진을 모두 돌린 뒤 클론의 `git status --ignored`에는 `__pycache__`와 `engine/build`만 있다.
+
+**한도 (`scripts/serve_net.py`, 기본 꺼짐).**
+- `--max-prompt N`: 템플릿을 지난 프롬프트가 N토큰을 넘으면 400, OpenAI의 꼴(`type invalid_request_error`, `param messages`, `code context_length_exceeded`, `This model's maximum prompt length is N tokens. However, your messages resulted in M tokens. ...`). 켜면 문맥이 넘치는 400도 같은 꼴이다. 모델 카드에 `max_prompt_tokens`.
+- `--max-output N`: `max_tokens`(또는 `max_completion_tokens`)가 N을 넘으면 N으로 줄이고 그 필드 이름을 `x-sclmd-ignored`에 적는다. `--max-tokens`가 N보다 크면 뜨지 않는다. 모델 카드의 `max_output_tokens`는 N.
+- **32,768 + 8,192는 40,960에 들지 않는다.** 서버는 쓰는 통과의 행(32)만큼 문맥을 남긴다(`room = 문맥 - 프롬프트 - 32`). 잰 것: 정확히 32,768토큰인 프롬프트에 `max_tokens` 8192를 주니 답이 8,160토큰에서 `length`로 끝났다(첫 토큰 23.9초, 74.3초, 162.2 tok/s, 숫자 세기). 줄였다고 적지는 않는다(전부터 문맥이 답을 줄이는 것과 같다). 같은 설정에 `--context 40992`면 8,192토큰 전부가 나온다(74.5초, 162.1 tok/s). 풀은 같다: VRAM 13.6GiB, 타일 363 / 2,816, 25/11/5/4/4. 공개 설정은 6.16대로 40960이다(관리자가 정할 것).
+- `--stream-ping S`: 스트림의 머리글 뒤 첫 토큰(또는 끝)이 올 때까지 S초마다 SSE 주석 `: ping`. 그 뒤로는 보내지 않는다. `--queue-timeout`을 켜면 머리글이 시퀀스를 받은 뒤 나가므로 그 기다림 동안은 핑이 없다.
+- `--metrics-local`: `GET /metrics`는 이 PC(루프백, 프록시 없이)에만. 다른 곳(프록시를 거친 이 PC의 요청 포함)에는 모르는 경로의 404다.
+- R1의 보호(`--max-body-mb 32 --idle-timeout 120 --max-connections 256`)는 R1 그대로이고 공개 설정이 켠다.
+
+**공개 설정.**
+- `serve.public.example.toml`(커밋됨): 6.16의 설정(`int8`, `kv4`, `wide-rows = 256`, `keyless`, `context = 40960`, `typical = 8192`, `prefix-gib = 2`, `image = "auto"`, `supervise = true`), 한도(`max-prompt 32768`, `max-output 8192`, `max-tokens 8192`, `stream-ping 15`), R1의 보호, `require-key`, `anonymous`, `trusted-proxies`(자리 표시 `192.168.0.10`: 고칠 것), `metrics-local`, 요청 기록과 상태 파일(메타데이터뿐). 키는 `SCLMD_API_KEY`나 저장소 밖의 `api-key-file`.
+- 이것을 읽으려고 고친 것: `serve.toml`의 `supervise`는 서버가 건너뛰고(전: 모르는 이름이라 뜨지 않음), 값을 받는 스위치(`int8`)는 `true`면 홀로 준 값(5.0)이다(전: 거절). `serve.bat`은 `serve.toml`(또는 `--config`)이 있으면 `python -m scripts.supervise --wanted`로 한 번 묻고, `supervise = true`면 supervisor로 띄운다(전: 명령줄의 `--supervise`만). 없으면 전과 같다.
+- `deploy/Caddyfile.example`(프록시 PC): 주인의 도메인으로 Caddy가 TLS를 받고, `reverse_proxy <GPU PC의 LAN 주소>:8001`. Caddy는 `X-Forwarded-For`를 연결의 주소로 쓴다(인터넷 클라이언트는 Caddy의 trusted_proxies가 아니므로 클라이언트의 머리글은 버린다). `text/event-stream`은 Caddy가 바로 흘려보낸다(`flush_interval -1`은 쓰지 않음: 떠난 클라이언트의 요청도 서버에서 끝나지 않게 둔다는 뜻이라). 서버 답의 시간 제한은 없음(32k 프롬프트 22.5초에 8,192토큰 답), 위쪽 연결의 keepalive 60초(서버의 120초보다 짧게: 서버가 닫는 연결에 요청을 싣지 않게), 서버가 다시 뜨는 동안 거절된 연결만 15초까지 다시 시도(`lb_try_duration`), 몸통 32MiB, `/metrics`·`/debug`는 404, 접근 기록 없음.
+- `deploy/firewall.example.ps1`(GPU PC, 관리자 PowerShell): 8001은 프록시 PC에서만 허용하고, 그 밖의 모든 주소는 막는 규칙(차단이 허용보다 이긴다). python.exe가 처음 0.0.0.0을 열 때 Windows가 묻고 만드는 "모든 포트 허용" 규칙은 좁은 허용 규칙으로 좁혀지지 않으므로, 그 규칙을 찾아 끄는 줄도 둔다. 루프백은 Windows가 거르지 않으므로 이 PC는 제 서버에 그대로 닿는다.
+
+**잰 것 (진짜 엔진, 이 클론의 빌드; 모든 서버가 같은 DLL을 읽은 것을 프로세스의 모듈 목록으로 확인).**
+- 같은 토큰(R4-land `same_tokens.py`, 48개: 탐욕, seed 준 temperature 1, 생각; 스트림과 아닌 것): 선택지 없이 10fd0af와 48/48. 주인의 엔진 선택지(`--int8 --kv4 --wide-rows 256 --keyless --context 40960 --typical 8192 --prefix-gib 2 --max-tokens 8192`)로 10fd0af와 N1(새 선택지 끔) 48/48, N1(새 선택지 모두 켬, 키) 48/48. 시작 줄도 같다(켠 쪽은 `[serve] users and limits: ...` 한 줄이 더 있다).
+- 공개 설정을 supervisor로(`--host 127.0.0.1`, 포트 8073, `SCLMD_IMAGES`는 이 실험 폴더): 첫 시작은 부호에서 13.6초에 ok, 이미지 11.71GB를 서비스하며 40.2초에 썼다(R3의 10~12초보다 느림: 디스크가 바빴던 것으로 보임, 재지 않음). 둘째·셋째 시작은 이미지에서(4.12초 읽기) 6.5·6.3초에 ok. VRAM 13.6GiB, 키·값 2.04GiB, 타일 sliding 363 / full 2,816, 한꺼번에 200/500/1,000/2,000/8,000토큰 25/11/5/4/4(선임이 잰 것과 같다).
+- `serve_bench --clients 1,4,8 --check` 26/26 같은 글. 첫 턴 / 둘째 턴 tok/s: 1명 110.8 / 149.3, 4명 352.8 / 343.8, 8명 580.9 / 549.2. 선택지를 하나도 주지 않은 N1에서도 26/26(119.8 / 149.2, 307.2 / 372.1, 450.4 / 488.1; 한 번씩 잼).
+- 정확히 32,768토큰인 프롬프트의 스트림(http.client): 머리글 0.07초, `: ping` 15.18초, 첫 토큰 23.99초, 핑은 모두 첫 토큰 전. 공식 openai 클라이언트로 다른 질문의 32,768토큰 스트림: 첫 토큰 24.1초, 글이 온다(핑은 건너뜀). 32,769토큰은 0.04초에 400 `context_length_exceeded`. `max_tokens` 20000은 200에 `x-sclmd-ignored: max_tokens`, 8192는 아무것도 적지 않음. 프록시(127.0.0.1)를 거친 키 없는 요청 200, 모르는 키 401, `/metrics`는 이 PC에서 200, 프록시를 거치면 404.
+- 공식 openai 클라이언트 3.51.0(가짜 엔진): R1·R2의 28개 ALL OK(선택지 없이, 그리고 공개 설정의 선택지와 키로), `--net` 15개 ALL OK(맞는 키, 빈 Authorization의 익명, 모르는 키 둘의 401, `--max-prompt`의 400, `--max-output`의 이름, 모델 카드, 첫 토큰을 3.5초 늦춘 스트림에서 핑 3개를 라이브러리가 건너뜀·스트림 도우미·익명 도우미, `/metrics` 둘), `--rate-limit` 2개 ALL OK(키와 `--anonymous`를 켠 채로 R4의 429와 Retry-After).
+- 시험: `tests/test_serve_net.py` 20개(사용자 표, `X-Forwarded-For`의 끝 경우들(zone이 붙은 IPv6, 주소가 아닌 값 여덟 가지: 예외 없이 프록시 자신), 이음매, 401, 한도, 핑, `/metrics`, 요청 기록에 메시지 없음, trace·why, handle_error, 도구 호출 줄, `serve.toml`의 `supervise`·`int8 = true`, 공개 예시 전체를 서버의 파서로), 그리고 R4의 시험 하나를 고쳤다(거절 줄에 메시지가 없음을 본다). GPU 잠금 안에서 두 조각으로 모든 시험: 서버 쪽 228개 통과·1개 건너뜀(openai 패키지가 venv에 없음), 엔진 쪽 246개 통과. 엔진과 배처는 손대지 않았으므로 `bits_check`·`speed_check`·`prefill_check`는 돌리지 않았다(대신 위의 같은 토큰).
+- `serve.bat`(CRLF로 받은 새 클론에 패치를 얹어): `serve.toml`이 없으면 `serve.py`, `supervise = true`면 `supervise.py`, `false`면 `serve.py`, `--config`가 가리키는 파일의 `supervise = true`와 명령줄의 `--Supervise`도 `supervise.py`. `supervise = true`로 띄운 가짜 서버(`tests.lifecycle_child`)가 `--crash-only`를 받고 75로 끝난 것이 `supervise.log`에 남았다.
+
+**안 한 것·주의.**
+- **공개 설정은 아직 사용자 사이에서 대화와 앞부분을 나눠 쓴다.** 보관된 대화(`_place`)와 `--prefix-gib`의 앞부분은 누구의 것이든 맞으면 다시 쓴다(진짜 엔진의 관문에서도 시스템 턴 23토큰이 `local`·키·IP 사이에 공유됐다). 6.16이 금하는 시간 차이 누설이다. N3가 `req.scope`로 막아야 한다.
+- 보관된 대화를 RAM으로 옮기는 `Engine.park`는 고정 메모리가 아니다(`--ram-gib` 24, 페이지 파일로 갈 수 있음; 6.16은 RAM 캐시를 page-locked로 둔다). 엔진 코드라 손대지 않았다(N3·관리자). 프로세스가 죽을 때의 덤프(WER)도 재지 않았다.
+- Caddy가 이 PC에 없어 Caddyfile은 돌려 보지 않았다(지시어는 Caddy 문서로 맞춤). 방화벽 스크립트는 PowerShell로 구문만 읽고 주소 셈만 돌려 보았다(규칙은 만들지 않음).
+- 서버는 IPv4(`0.0.0.0`)에서만 듣는다. IPv6 사용자는 프록시를 거쳐 온다(`X-Forwarded-For`의 IPv6는 /64로 읽음).
+- 핑은 첫 토큰까지다. 그 뒤 긴 도구 호출 블록(닫힐 때 한꺼번에 나감)이나 stop 문자열을 기다리는 동안은 조용할 수 있다.
+
+**관리자가 정할 것.** `--context 40960`(32,768토큰 프롬프트의 답은 8,160까지)과 `40992`(8,192가 다 듦) 중 무엇. 키 없는 openai 라이브러리 사용자에게 알릴 방법(빈 Authorization 머리글; 키 값으로 익명을 뜻하는 약속은 두지 않았다: 6.16은 모르는 키를 401로). `require-key`(지금 켬: 키가 없으면 뜨지 않음). 요청 기록을 켤지(사용자의 IP가 남는다: 6.16은 메타데이터로 허용). `trusted-proxies`의 자리 표시(틀리면 모든 사용자가 프록시 하나로 묶이고 콘솔에 한 번 적힌다).
+
 ## 7. 벤치마크 (2026-11-14) [실측, 도는 중]
 
 관리자 지시: 모델 카드의 벤치마크와 그 외 주요 벤치마크. 원본을 이 PC에서 같은 방식으로 돌릴 수는 없으므로(60GB, 글을 못 씀), 점수는 모델 카드의 값과 나란히 본다. 단, 카드의 설정(프롬프트, 답 뽑는 법, 시도 횟수)이 공개돼 있지 않아서 **카드와의 차이가 전부 양자화 탓은 아니다**. 양자화만의 차이는 7.3의 맞대기로 본다.
