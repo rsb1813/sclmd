@@ -205,7 +205,10 @@ def test_a_prompt_sure_to_be_over_max_prompt_is_refused_before_the_tokenizer(net
     assert "more than 960 bytes of text, more than 20 tokens can hold" in err["message"]
     status, _, body = call(httpd, "POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "x" * 900}]})
     assert status == 400 and "resulted in 905 tokens" in json.loads(body)["error"]["message"] and seen  # not sure: tokenized
-    assert N.text_bytes(big) == 6 + 500 + 4 + 4 + 600  # roles and part types count too: a turn's own template tokens more than cover them
+    assert N.text_bytes(big) == 6 + 500 + 4 + 600  # roles count too (a turn's own template tokens more than cover them), part types not
+    # what the template does not write is not counted: the whitespace it trims, tool-call ids
+    assert N.text_bytes([{"role": "user", "content": " " * 5000 + "hi\t"}]) == 4 + 2
+    assert N.text_bytes({"id": "x" * 5000, "tool_call_id": "y" * 5000, "function": {"name": "f", "arguments": "{}"}}) == 3
     assert not N.sure_too_long(big, 0) and not N.sure_too_long(big, 24) and N.sure_too_long(big, 23)
     assert N.text_bytes({"a": ["xy", {"b": "€"}], "n": 5}) == 5
 
@@ -268,15 +271,25 @@ def test_metrics_from_another_machine_is_refused(net, monkeypatch):
 def test_a_tunnel_on_this_pc_is_not_this_pc(net, capsys):
     """A proxy or tunnel on this PC that is not in --trusted-proxies: its loopback connections carry X-Forwarded-For.
     They are the keyless user ip:127.0.0.1, not this PC: no /metrics, no counts on GET /, and the console is told."""
-    httpd, app, inbox = net("--metrics-local", "--anonymous", "--trusted-proxies", "192.168.0.10", keys=KEYS)
+    httpd, app, inbox = net("--metrics-local", "--anonymous", "--trusted-proxies", "192.168.0.10", "--quotas", "--priorities", keys=KEYS)
     tunnel = {"X-Forwarded-For": "198.51.100.7"}
+    app.admin.users.per_tenant = True  # --prompt-cache's switch (set at install, before any request)
     status, _, body = call(httpd, "GET", "/metrics", headers=tunnel)
     assert status == 404 and b"sclmd_" not in body
     about = json.loads(call(httpd, "GET", "/", headers=tunnel)[2])
-    assert about["model"] == S.MODEL and "requests" not in about and "conversations_kept" not in about
-    req, _ = served(httpd, inbox, {"messages": HI}, tunnel)
-    assert req.tenant == "ip:127.0.0.1"
-    assert "is not in --trusted-proxies" in capsys.readouterr().out
+    assert about["model"] == S.MODEL and "requests" not in about and "conversations_kept" not in about and "prompt_cache" not in about
+    req, out = served(httpd, inbox, {"messages": HI}, tunnel)
+    assert req.tenant == "ip:127.0.0.1" and not req.local and req.priority > 0  # quotas: not exempt, not this PC's class
+    assert "x-ratelimit-limit-tokens" in out["headers"]
+    said = capsys.readouterr().out
+    assert "is not in --trusted-proxies" in said and "not cached" in said
+    # every user behind it would share one cache: each such request has a scope of its own (nothing found by another)
+    again, _ = served(httpd, inbox, {"messages": HI}, tunnel)
+    assert req.scope.startswith("unsure:") and again.scope.startswith("unsure:") and req.scope != again.scope
+    keyed, _ = served(httpd, inbox, {"messages": HI}, {**tunnel, "Authorization": "Bearer sk-alice-0123456789"})
+    assert keyed.scope == keyed.tenant == "key:alice"  # a key is the user wherever it comes from
+    mine, out = served(httpd, inbox, {"messages": HI})
+    assert mine.tenant == mine.scope == "local" and mine.priority == 0 and "x-ratelimit-limit-tokens" not in out["headers"]
     assert call(httpd, "GET", "/metrics")[0] == 200  # this PC itself
     assert "requests" in json.loads(call(httpd, "GET", "/")[2])
     httpd, _, _ = net()  # without --metrics-local: GET / as before, counts for everyone

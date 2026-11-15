@@ -41,6 +41,7 @@ IMPLICIT_S = 15 * 60
 TTLS = {None: IMPLICIT_S, "5m": IMPLICIT_S, "15m": IMPLICIT_S, "1h": 60 * 60}  # "5m" (Anthropic's default) is kept as 15m
 LONG_S = TTLS["1h"]
 LEAST = 1024  # a breakpoint's prefix is cached from this many tokens
+TURN_NEAR = 64  # --cache-turns saves no state within this many tokens past one the request read from or its user holds
 MOST = 4  # breakpoints a request
 PIECE = 16 << 20  # AES-GCM's pieces
 MAGIC = b"SCLMDKV1"
@@ -154,17 +155,14 @@ class Names:
 
 class Entry:
     """A state at a token prefix in page-locked RAM: put on a new sequence as often as asked (Engine.unpark), the copy
-    stays. kind: "prefix" (the shared part), "turn" (--cache-turns), "mark" (cache_control)."""
+    stays. kind: "prefix" (the shared part), "turn" (--cache-turns), "mark" (cache_control). It keeps the prefix's
+    length and its name (the HMAC of the scope and the tokens), never the tokens: those are a prompt's content, and
+    only the keys and values are in page-locked memory (ZDR, 6.16). A request's own tokens are matched by the name."""
 
-    __slots__ = ("digest", "scope", "tokens", "state", "used", "ttl", "kind")
+    __slots__ = ("digest", "scope", "n", "state", "used", "ttl", "kind")
 
-    def __init__(self, digest, scope, tokens, state, ttl, kind, used):
-        self.digest, self.scope, self.state, self.ttl, self.kind, self.used = digest, scope, state, ttl, kind, used
-        self.tokens = tokens if isinstance(tokens, array.array) else array.array("i", tokens)
-
-    @property
-    def n(self) -> int:
-        return len(self.tokens)
+    def __init__(self, digest, scope, n, state, ttl, kind, used):
+        self.digest, self.scope, self.n, self.state, self.ttl, self.kind, self.used = digest, scope, int(n), state, ttl, kind, used
 
 
 class Store:
@@ -205,15 +203,16 @@ class Store:
             ns = [n for n in self.scopes.get(scope, {}) if longer_than < n < len(full)]
             if not ns:
                 return None
-            names = self.names.of(scope, full, ns)
+            names = self.names.of(scope, full, ns)  # one pass over the request's own tokens, a name at each length held
             for n in sorted(ns, reverse=True):
                 e = self.held.get(names[n])
-                if e is not None and e.scope == scope and e.tokens == array.array("i", full[:n]):
+                if e is not None and e.scope == scope and e.n == n:
                     return e
             return None
 
     def find(self, full: list, longer_than: int, scope=None):
-        """Prefixes.find, in the scope: -> (tokens, state) or None; the entry counts as used now."""
+        """Prefixes.find, in the scope: -> (tokens, state) or None; the entry counts as used now. The tokens are the
+        request's own first n (the name says they are the entry's)."""
         with self.lock:
             e = self.longest(scope, full, longer_than)
             if e is None:
@@ -221,12 +220,12 @@ class Store:
             e.used = self.clock()
             if self.on_hit is not None:
                 self.on_hit(e)
-            return list(e.tokens), e.state
+            return list(full[: e.n]), e.state
 
     def get(self, scope, tokens):
         with self.lock:
             e = self.held.get(self.names.one(scope, tokens))
-            return e if e is not None and e.scope == scope and e.tokens == array.array("i", tokens) else None
+            return e if e is not None and e.scope == scope and e.n == len(tokens) else None
 
     def wants(self, tokens: list, scope=None) -> bool:
         if self.ram <= 0 or len(tokens) < self.least:
@@ -242,7 +241,7 @@ class Store:
             if nbytes(state) > self.ram:
                 self.too_big.add(name)
                 return None
-            e = Entry(name, scope, tokens, state, ttl, kind, self.clock())
+            e = Entry(name, scope, len(tokens), state, ttl, kind, self.clock())
             self._add(e)
             self.stored += 1
             self.fit(parked or [])
@@ -298,7 +297,7 @@ def _bytes_of(t):
 
 
 class Disk:
-    """The 1 h cache on disk: (name -> its scope, tokens, bytes, last use, time to live) in this process's memory; in the
+    """The 1 h cache on disk: (name -> its scope, length, bytes, last use, time to live) in this process's memory; in the
     folder only the files <name>.kv. A file: MAGIC, an 8-byte nonce prefix, the count of pieces, then each piece's length
     and its AES-GCM text; piece 0 is the layout (length, high, the tiles' places and the tensors' shapes), the others
     the tensors' bytes. A piece's nonce is the prefix and its number; its associated data the name, its number and the
@@ -635,6 +634,10 @@ def points(app, body: dict, messages: list, tools, think: bool, full: list, stri
                 raise _refused(400, f"{name}: at most {MOST} cache_control breakpoints a request (--strict-fields)", name)
             names.append(name)
             continue
+        extra = sorted(str(k) for k in cc if k not in ("type", "ttl"))  # served without them, and they are named (R1)
+        if extra and strict:
+            raise _refused(400, f"{name}.{extra[0]}: not served (--strict-fields)", f"{name}.{extra[0]}")
+        names += [f"{name}.{k}" for k in extra]
         served += 1
         cut = dict(messages[i])
         content = raw[i].get("content")
@@ -680,6 +683,7 @@ class Cache:
         self.coming = set()  # names read from disk and not yet taken in
         self.swept = 0.0
         self.saves = self.save_bytes = self.skipped = self.unlocked = self.from_disk = self.expired_kept = self.expired_parked = 0
+        self.near = 0  # --cache-turns' points not saved: a few tokens past a state already there (TURN_NEAR)
         if self.disk is not None:  # a hit in RAM on an hour's entry is a use of its file too
             self.store.on_hit = lambda e: self.disk.touch(e.digest) if e.ttl >= LONG_S else None
         self.save_s = 0.0
@@ -707,7 +711,7 @@ class Cache:
                 return
             with self.store.lock:
                 self.coming.add(name)
-            self.arrivals.put(Entry(name, scope, full[:n], state, LONG_S, "mark", self.clock()))
+            self.arrivals.put(Entry(name, scope, n, state, LONG_S, "mark", self.clock()))
             self.from_disk += 1
             print(f"[serve] cache: a state of {n:,} tokens, {state['bytes'] / GIB:.2f} GiB, read from disk in {time.perf_counter() - t0:.2f} s", flush=True)
 
@@ -777,6 +781,11 @@ class Cache:
                 # this boundary, give or take the few tokens a reply's text is written again with; a copy at every turn
                 # would be 0.3-0.9 GiB a turn
                 continue
+            if kind == "turn" and (0 <= n - req.reused <= TURN_NEAR or store.longest(scope, full[:n], n - TURN_NEAR - 1) is not None):
+                # nor a state a few tokens past one this user holds already (a marked part's end and its message's
+                # boundary, 2 tokens apart, measured): 0.3-0.9 GiB of page-locked RAM for a few tokens of reading
+                self.near += 1
+                continue
             if server.eng.highs[req.job.seq] > n:  # the sequence has written past it (a reply's ring): it cannot be saved
                 self.skipped += 1
                 continue
@@ -834,7 +843,7 @@ class Cache:
     def about(self) -> dict:
         s = self.store
         out = {"entries": len(s.held), "gib": round(s.bytes() / GIB, 3), "budget_gib": round(s.ram / GIB, 2), "saved": self.saves,
-               "saved_gib": round(self.save_bytes / GIB, 2), "save_s": round(self.save_s, 3), "not_saved": self.skipped, "not_locked": self.unlocked, "hits": s.hits,
+               "saved_gib": round(self.save_bytes / GIB, 2), "save_s": round(self.save_s, 3), "not_saved": self.skipped, "not_locked": self.unlocked, "near": self.near, "hits": s.hits,
                "evicted": s.evicted, "expired": s.expired, "expired_kept": self.expired_kept, "expired_parked": self.expired_parked}
         d = self.disk
         if d is not None:

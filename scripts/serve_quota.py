@@ -11,8 +11,10 @@
 #   all requests without a key together: 429 with Retry-After (until enough of the day has gone by), OpenAI's
 #   rate_limit_exceeded. A tenant already at a limit is refused before its body is read; one whose prompt would pass
 #   it, after the prompt is known.
-# - counting: a request is counted when it is taken in, with its whole prompt, so that requests that come at once
-#   cannot all pass the daily check; when its HTTP thread is done, with what it cost (the cached part at 0.1, its
+# - counting: a request is counted when it is taken in, with its whole prompt, and its reply is held at its max_tokens
+#   for the daily check (Quota.held) until it is settled, so that requests that come at once cannot all pass the daily
+#   check, by their prompts or by their replies (the hourly class and the headers count only what was counted, not
+#   what is held); when its HTTP thread is done, with what it cost (the cached part at 0.1, its
 #   reply so far), or with nothing when it never reached the engine (a 503 of --queue-timeout, a client that left while
 #   it waited). A 429, 401 or 400 costs nothing. Minute buckets by the wall clock: a minute counts while any of it is
 #   inside the window.
@@ -99,6 +101,8 @@ class Quota:
         self.used = {}  # tenant -> {bucket: [tokens, requests]}
         self.keyless = {}  # bucket -> tokens of every ip: tenant
         self._over = {}  # tenant -> (until, over the hour's quota): worked out at most once a second
+        self.held = {}  # tenant -> reply tokens its requests under way may still write (their max_tokens): the daily check counts them
+        self.held_keyless = 0.0  # ... of every ip: tenant together (--keyless-day)
         self.n = collections.Counter()  # refusals by kind; requests taken in by class
         self.dirty, self.saved, self.save_failed = False, 0, 0
 
@@ -171,28 +175,42 @@ class Quota:
             self._over[tenant] = (now + 1.0, over)
             return over
 
-    def refusal(self, tenant, prompt: float, now: float | None = None) -> Refusal | None:
-        """A request of `prompt` tokens is refused when the tenant's day would pass a daily limit with it (its requests
-        or tokens), or when it has no key and all such requests' day would pass --keyless-day."""
+    def refusal(self, tenant, prompt: float, now: float | None = None, reply: float = 0.0, held: bool = True) -> Refusal | None:
+        """A request of `prompt` tokens that may write `reply` more (its max_tokens) is refused when the tenant's day
+        would pass a daily limit with it (its requests or tokens), or when it has no key and all such requests' day would
+        pass --keyless-day. held: the replies of the tenant's requests under way count at their max_tokens until they are
+        settled, so that requests at once cannot pass a day's tokens by their replies (False: the day's counters alone,
+        for the check before a body is read)."""
         lim = self.limits_of(tenant)
         if lim is None:
             return None
         now = self.clock() if now is None else now
+        asked = prompt + reply
         with self.lock:
             b = self.used.get(tenant, {})
             tokens, requests = self._sum(b, now, DAY)
+            mine = self.held.get(tenant, 0.0) if held else 0.0
             if lim.rpd and requests + 1 > lim.rpd:
                 return Refusal("requests_per_day", tenant, lim.rpd, requests, 1, self._retry(b, now, DAY, lambda t, r: r + 1 <= lim.rpd))
-            if lim.tpd and tokens + prompt > lim.tpd:
-                wait = DAY if prompt > lim.tpd else self._retry(b, now, DAY, lambda t, r: t + prompt <= lim.tpd)
-                return Refusal("tokens_per_day", tenant, lim.tpd, tokens, prompt, wait)
+            if lim.tpd and tokens + mine + asked > lim.tpd:
+                wait = DAY if asked > lim.tpd else self._wait(b, now, mine, lambda t, r: t + mine + asked <= lim.tpd)
+                return Refusal("tokens_per_day", tenant, lim.tpd, tokens + mine, asked, wait)
             if tenant.startswith("ip:") and self.keyless_day:
                 all_ = sum(v for m, v in self.keyless.items() if m >= self._first(now, DAY))
-                if all_ + prompt > self.keyless_day:
+                every = self.held_keyless if held else 0.0
+                if all_ + every + asked > self.keyless_day:
                     kb = {m: (v, 0) for m, v in self.keyless.items()}
-                    wait = DAY if prompt > self.keyless_day else self._retry(kb, now, DAY, lambda t, r: t + prompt <= self.keyless_day)
-                    return Refusal("keyless_tokens_per_day", tenant, self.keyless_day, all_, prompt, wait)
+                    wait = DAY if asked > self.keyless_day else self._wait(kb, now, every, lambda t, r: t + every + asked <= self.keyless_day)
+                    return Refusal("keyless_tokens_per_day", tenant, self.keyless_day, all_ + every, asked, wait)
         return None
+
+    HELD_RETRY = 60.0  # seconds: Retry-After when only the replies under way are in the way (they are settled as they end)
+
+    def _wait(self, b: dict, now: float, held: float, fits) -> float:
+        """Retry-After for a day's tokens: until buckets leave the day enough; when they never would but the replies
+        under way hold some of it, HELD_RETRY (those settle to what they wrote, mostly far less than their max_tokens)."""
+        wait = self._retry(b, now, DAY, fits)
+        return self.HELD_RETRY if held and wait >= DAY else wait
 
     def taken(self, req) -> None:
         """The request is taken in: its class for the rest of its life (req.over_quota: its tenant's hour, before it, was
@@ -206,18 +224,32 @@ class Quota:
         self.n["class_over_quota" if req.over_quota else "class_in_quota"] += 1
         now = self.clock()
         m = int(now // self.bucket)
-        req._quota = (tenant, m, float(len(req.full)))
+        reply = float(max(0, int(getattr(req, "max_new", 0) or 0)))  # held for the daily check until settled
+        req._quota = (tenant, m, float(len(req.full)), reply)
         with self.lock:
             self._add(tenant, m, float(len(req.full)), 1)
+            self._hold(tenant, reply)
+
+    def _hold(self, tenant: str, reply: float) -> None:
+        """(under self.lock) reply tokens held (+) or let go (-) for the daily check."""
+        left = self.held.get(tenant, 0.0) + reply
+        if left > 0.5:
+            self.held[tenant] = left
+        else:
+            self.held.pop(tenant, None)
+        if tenant.startswith("ip:"):
+            self.held_keyless = max(0.0, self.held_keyless + reply)
 
     def settle(self, req, event) -> None:
         """Its HTTP thread is done with it: what it cost goes where its admission was counted (nothing, when it never
-        reached the engine)."""
+        reached the engine), and the reply it held for the daily check is let go."""
         q = getattr(req, "_quota", None)
         if q is None:
             return
         req._quota = None
-        tenant, m, counted = q
+        tenant, m, counted, reply = q
+        with self.lock:
+            self._hold(tenant, -reply)
         job = getattr(req, "job", None)
         if job is None and (event is None or event[0] != "done"):  # it never reached the engine (a stand-in's answer did)
             tokens, requests = -counted, -1
@@ -296,7 +328,8 @@ class Quota:
     # the file
 
     def prune(self, now: float | None = None) -> None:
-        """Buckets that have left the day go, and the tenants left with none."""
+        """Buckets that have left the day go, and the tenants left with none; and every worked-out 'over' whose second
+        has passed (a tenant asked about but never counted, one refused after its body was read, would stay for ever)."""
         now = self.clock() if now is None else now
         with self.lock:
             first = self._first(now, DAY)
@@ -307,6 +340,8 @@ class Quota:
                 if not b:
                     del self.used[tenant]
                     self._over.pop(tenant, None)
+            for tenant in [t for t, (until, _) in self._over.items() if until <= now]:
+                del self._over[tenant]
             for m in [m for m in self.keyless if m < first]:
                 del self.keyless[m]
 
@@ -416,7 +451,7 @@ def admit(adm, req) -> Refusal | None:
     quota = adm.quota
     if quota is None:
         return None
-    refusal = quota.refusal(getattr(req, "tenant", None), float(len(req.full)))
+    refusal = quota.refusal(getattr(req, "tenant", None), float(len(req.full)), reply=float(getattr(req, "max_new", 0) or 0))
     if refusal is not None:
         quota.n[refusal.kind] += 1
     return refusal
@@ -427,7 +462,7 @@ def refused_early(adm, handler) -> bool:
     then read and thrown away, as for R4's 401). True: answered."""
     quota = adm.quota
     w = N.who_of(handler)
-    refusal = quota.refusal(w.tenant, 1.0) if quota is not None else None
+    refusal = quota.refusal(w.tenant, 1.0, held=False) if quota is not None else None  # the day's counters: replies under way are not known to stay
     if refusal is None:
         return False
     quota.n[refusal.kind] += 1

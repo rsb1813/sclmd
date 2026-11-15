@@ -182,6 +182,9 @@ def test_a_keys_own_limits_follow_it_and_r4s_lines_read_as_before():
     assert got == [("alice", b"sk-alice-0123456789"), ("bob", b"sk-bob"), ("file3", b"sk-x"), ("carol", b"sk with words")]
     assert limits == {"alice": {"tph": 1000000, "rph": 1200}, "bob": {"tpd": 0}, "file3": {"tph": 5}}
     assert A.parse_keys("a:k1 tph=1,b:k2", "key", {}) == [("a", b"k1"), ("b", b"k2")]  # SCLMD_API_KEY's commas
+    # without --quotas (no limits to fill) the whole entry is the key, as before N2: what authenticates does not change
+    assert A.parse_keys("alice: sk-alice-0123456789 tph=1000000\nsk-x tph=5", "file") == [("alice", b"sk-alice-0123456789 tph=1000000"),
+                                                                                            ("file2", b"sk-x tph=5")]
     q = Q.Quota(per_key={"alice": {"tph": 1000000, "rph": 1200}, "bob": {"tpd": 0}})
     assert vars_of(q.limits_of("key:alice")) == (1000000, 1200, 24000000, 28800)
     assert vars_of(q.limits_of("key:bob")) == (500000, 600, 0, 14400)  # tpd 0: no daily token limit
@@ -200,6 +203,10 @@ def test_the_key_files_limits_reach_the_server(tmp_path, monkeypatch, capsys):
     cli = options("--quotas", "--api-key-file", str(f))
     keys = A.start(cli)
     assert keys == [("alice", b"sk-alice-0123456789")] and cli.key_limits == {"alice": {"tph": 7, "rph": 9}}
+    assert "has a space in it" not in capsys.readouterr().out
+    cli = options("--api-key-file", str(f))  # no --quotas: R4's reading, the whole line is the key
+    assert A.start(cli) == [("alice", b"sk-alice-0123456789 tph=7 rph=9")] and cli.key_limits == {}
+    assert "has a space in it" not in capsys.readouterr().out  # that warning is --quotas' only (a miswritten limit)
     with pytest.raises(SystemExit):
         A.start(options("--quotas"))  # nobody to count: no key and no --anonymous
 
@@ -295,15 +302,18 @@ def test_usage_tells_the_caller_its_own(net):
 def test_the_daily_limit_is_429_with_retry_after_and_costs_nothing(net, tmp_path):
     log = tmp_path / "requests.jsonl"
     httpd, app, inbox = net(*PUBLIC, "--request-log", str(log), limits={"alice": {"tpd": 100, "rpd": 3}})
-    req, out = served(httpd, inbox, {"messages": [{"role": "user", "content": "x" * 60}]}, ALICE)  # 60 + of the day's 100
+    req, out = served(httpd, inbox, {"messages": [{"role": "user", "content": "x" * 60}], "max_tokens": 20}, ALICE)  # 65 + 20 held of the day's 100
     assert out["status"] == 200
     status, h, body = call(httpd, "POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "y" * 60}]}, ALICE)
     err = json.loads(body)["error"]
     assert status == 429 and err["code"] == "rate_limit_exceeded" and err["type"] == "tokens" and "tokens per day" in err["message"]
     assert Q.DAY - 120 <= int(h["retry-after"]) <= Q.DAY + 60 and "x-ratelimit-limit-tokens" in h
     assert not inbox.reqs  # never reached the engine
-    served(httpd, inbox, {"messages": [{"role": "user", "content": "z"}]}, ALICE)  # a short one still fits
-    served(httpd, inbox, {"messages": [{"role": "user", "content": "z"}]}, ALICE)
+    status, _, body = call(httpd, "POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "z"}]}, ALICE)
+    assert status == 429 and "Requested 70" in json.loads(body)["error"]["message"]  # its reply counts at its max_tokens (64)
+    short = {"messages": [{"role": "user", "content": "z"}], "max_tokens": 4}
+    served(httpd, inbox, short, ALICE)  # a short one that asks for a short reply still fits
+    served(httpd, inbox, short, ALICE)
     assert app.admin.quota.usage_of("key:alice")["day"]["requests"] == 3
     # at the limit: refused before the body is read (a body announced and never sent does not hold the thread)
     s = socket.create_connection(("127.0.0.1", httpd.server_address[1]), timeout=10)
@@ -319,13 +329,13 @@ def test_the_daily_limit_is_429_with_retry_after_and_costs_nothing(net, tmp_path
     time.sleep(0.3)
     lines = [json.loads(x) for x in log.read_text(encoding="utf-8").splitlines()]
     refused = [x for x in lines if x.get("finish") == "daily_limit"]
-    assert len(refused) == 2 and {x["limit"] for x in refused} == {"tokens_per_day", "requests_per_day"}
+    assert len(refused) == 3 and {x["limit"] for x in refused} == {"tokens_per_day", "requests_per_day"}
     assert all("message" not in x and "error" not in x for x in refused)  # ZDR: which limit, never a message
     assert all(x.get("priority") is not None for x in lines if x.get("status") == 200)
 
 
 def test_max_waiting_with_priorities_counts_only_those_a_request_would_wait_behind(net):
-    httpd, app, inbox = net(*PUBLIC, "--max-waiting", "2", limits={"bob": {"tph": 1}})
+    httpd, app, inbox = net(*PUBLIC, "--max-waiting", "2", limits={"bob": {"tph": 1, "tpd": 0}})  # (tpd 0: no day to pass)
     served(httpd, inbox, hdrs=BOB)  # bob is over his quota now
     held = [chat_async(httpd, {"messages": HI}, BOB) for _ in range(2)]
     while len(inbox.reqs) < 2:
@@ -345,7 +355,7 @@ def test_max_waiting_with_priorities_counts_only_those_a_request_would_wait_behi
 
 
 def test_the_seam_gives_the_class_when_a_request_comes(net):
-    httpd, app, inbox = net(*PUBLIC, limits={"bob": {"tph": 1}})
+    httpd, app, inbox = net(*PUBLIC, limits={"bob": {"tph": 1, "tpd": 0}})
     req, _ = served(httpd, inbox, hdrs=ALICE)
     assert req.priority == 1 and not req.local  # in quota
     served(httpd, inbox, hdrs=BOB)
@@ -375,6 +385,56 @@ def test_a_requests_class_is_its_tenants_hour_before_it_and_stays():
     rs = [spend(q2, "key:bob", 1) for _ in range(3)]
     assert [r.over_quota for r in rs] == [False, False, True]  # the 2nd of 2 is in quota, the 3rd over
     assert q2.n["class_in_quota"] == 2 and q2.n["class_over_quota"] == 1
+
+
+def test_replies_under_way_are_held_for_the_daily_check():
+    """Requests that come at once cannot pass a day's tokens by their replies: each holds its max_tokens until it is
+    settled (verify-N2-quota P1: 12 at once against tpd 100 ended the day at 161)."""
+    clock = Clock()
+    q = Q.Quota(key=(1000, 100), daily=0.1, clock=clock)  # the day: 100 tokens
+    under_way = []
+    for _ in range(12):
+        r = req_of("key:alice", 5)
+        r.max_new = 20
+        if q.refusal("key:alice", 5, reply=20) is None:
+            q.taken(r)
+            under_way.append(r)
+    assert len(under_way) == 4 and q.held["key:alice"] == 80  # 4 x (5 + 20) = 100
+    worst = 0.0
+    for r in under_way:  # each writes its whole max_tokens
+        r.job = SimpleNamespace(out=[1] * 20, seq=0)
+        q.settle(r, done(5, 0, 20))
+        worst = max(worst, q.usage_of("key:alice")["day"]["tokens"])
+    assert worst == 100 and "key:alice" not in q.held  # never past the day
+    r = q.refusal("key:alice", 1, reply=0)
+    assert r.kind == "tokens_per_day" and r.retry_s > Q.HOUR  # the day is full: the counters' wait, not HELD_RETRY
+    q2 = Q.Quota(key=(1000, 100), daily=0.1, clock=clock)
+    a = req_of("key:bob", 5)
+    a.max_new = 90
+    q2.taken(a)
+    r = q2.refusal("key:bob", 5, reply=10)  # only the reply under way is in the way
+    assert r is not None and r.retry_s == q2.HELD_RETRY and r.used == 95
+    assert q2.refusal("key:bob", 5, reply=10, held=False) is None  # the check before a body is read: the counters alone
+    q3 = Q.Quota(ip=(10**9, 10**6), keyless_day=100, clock=clock)  # every keyless tenant's replies, together
+    b = req_of("ip:203.0.113.7", 10)
+    b.max_new = 80
+    q3.taken(b)
+    assert q3.held_keyless == 80 and q3.refusal("ip:198.51.100.1", 5, reply=10).kind == "keyless_tokens_per_day"
+    q3.settle(b, None)
+    assert q3.held_keyless == 0 and q3.refusal("ip:198.51.100.1", 5, reply=10) is None
+
+
+def test_prune_drops_worked_out_over_entries_of_tenants_never_counted():
+    """verify-N2-quota P2: a tenant asked about (the priority seam) but never counted (refused after its body was read)
+    left its _over entry for ever."""
+    clock = Clock()
+    q = Q.Quota(clock=clock)
+    for i in range(500):
+        q.over(f"ip:198.51.100.{i % 250}") if i < 250 else q.over(f"ip:2001:db8:{i}::/64")
+    assert len(q._over) == 500 and not q.used
+    clock.t += 2
+    q.prune()
+    assert not q._over
 
 
 def test_the_counters_are_pruned_without_a_file_too():

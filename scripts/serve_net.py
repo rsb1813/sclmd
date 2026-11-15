@@ -26,6 +26,7 @@
 # it is cut to it and named in x-sclmd-ignored), --stream-ping (": ping" every S seconds until the first token),
 # --metrics-local (GET /metrics only from this PC). Nothing here imports torch.
 import ipaddress
+import itertools
 import threading
 
 LOCAL = "local"
@@ -38,10 +39,11 @@ class Who:
     (loopback, no proxy); proxied: the address came from X-Forwarded-For; refusal: None, "unknown_key" (a key the
     server does not have) or "key_needed" (keys are set, no key given, and no --anonymous)."""
 
-    __slots__ = ("tenant", "key", "address", "local", "proxied", "refusal")
+    __slots__ = ("tenant", "key", "address", "local", "proxied", "refusal", "unsure")
 
     def __init__(self, tenant=None, key=None, address=None, local=False, proxied=False, refusal=None):
         self.tenant, self.key, self.address, self.local, self.proxied, self.refusal = tenant, key, address, local, proxied, refusal
+        self.unsure = False  # Users.who: a keyless address from a forwarded connection that is not a trusted proxy's
 
     def __repr__(self) -> str:
         return f"Who(tenant={self.tenant!r}, key={self.key!r}, local={self.local}, proxied={self.proxied}, refusal={self.refusal!r})"
@@ -168,6 +170,7 @@ class Users:
         self.per_tenant = False  # prompt caches apart for each tenant (the cache stage turns it on)
         self._told = False
         self._lock = threading.Lock()
+        self._once = itertools.count(1)  # scopes of one request each (scope_of: an unsure address)
 
     @property
     def on(self) -> bool:
@@ -180,13 +183,18 @@ class Users:
         except Exception as e:  # noqa: BLE001  (should not happen: the request is then read without its headers, so as keyless)
             print(f"[serve] who a request is could not be read ({type(e).__name__}): it is taken as one without a key", flush=True)
             w = who(peer, {}, self.keys, self.anonymous, (), self.name_of)
-        if (self.on and not self._told and handler.headers.get("X-Forwarded-For") is not None and not w.local
-                and not _trusted(address(peer), self.proxies)):
-            with self._lock:  # once a process: a proxy that is not in --trusted-proxies (every user would be the proxy)
-                told, self._told = self._told, True
-            if not told:
-                print(f"[serve] a connection from {peer} carries X-Forwarded-For, and {peer} is not in --trusted-proxies: the header is "
-                      "not read (the connection's address is the user). Told once", flush=True)
+        through = (handler.headers.get("X-Forwarded-For") is not None or handler.headers.get("Forwarded") is not None) and not _trusted(address(peer), self.proxies)
+        if through and self.on and not w.local:
+            # the address may be a proxy's, standing for many users (a wrong --trusted-proxies, a tunnel here)
+            w.unsure = w.key is None and w.refusal is None
+            if not self._told:
+                with self._lock:  # once a process: a proxy that is not in --trusted-proxies (every user would be the proxy)
+                    told, self._told = self._told, True
+                if not told:
+                    print(f"[serve] a connection from {peer} carries X-Forwarded-For, and {peer} is not in --trusted-proxies: the header is "
+                          "not read (the connection's address is the user)"
+                          + ("; such requests without a key are not cached (all of them would share one cache)" if self.per_tenant else "")
+                          + ". Told once", flush=True)
         return w
 
     # the later stages' seams: the quota stage replaces priority_of, the cache stage sets per_tenant (or scope_of)
@@ -195,7 +203,14 @@ class Users:
         return 0
 
     def scope_of(self, req, w: Who):
-        return w.tenant if self.per_tenant else None
+        """The cache scope: the tenant (per_tenant), None (shared, tenancy off). An unsure keyless address (a forwarded
+        connection from a proxy not in --trusted-proxies) gets a scope of its own request: nothing it saves is ever found
+        by another request, so users behind one misconfigured proxy never share a cache (6.16's timing channel)."""
+        if not self.per_tenant:
+            return None
+        if getattr(w, "unsure", False):
+            return f"unsure:{next(self._once)}"
+        return w.tenant
 
 
 def who_of(handler) -> Who:
@@ -235,18 +250,22 @@ def context_exceeded(most: int, got: int, what: str = "prompt", sure: bool = Fal
 TOKEN_BYTES = 48  # the most UTF-8 bytes of text one Gemma 4 token stands for (measured over all 262,144; added tokens 16 at most)
 
 
+UNWRITTEN = frozenset(("id", "tool_call_id", "type"))  # fields of a message the template does not write as text (not counted)
+
+
 def text_bytes(x, stop: int = 0) -> int:
-    """The UTF-8 bytes of every string in x (messages after sclmd/tools.py's messages_of: dicts and lists), keys left
-    out. stop > 0: counting ends once the count passes it."""
+    """The UTF-8 bytes of the text in x (messages after sclmd/tools.py's messages_of: dicts and lists): every string
+    without its leading and trailing whitespace (the template trims a message's), keys and UNWRITTEN fields left out.
+    stop > 0: counting ends once the count passes it."""
     n, todo = 0, [x]
     while todo:
         y = todo.pop()
         if isinstance(y, str):
-            n += len(y.encode("utf-8", "surrogatepass"))
+            n += len(y.strip().encode("utf-8", "surrogatepass"))
             if stop and n > stop:
                 return n
         elif isinstance(y, dict):
-            todo.extend(y.values())
+            todo.extend(v for k, v in y.items() if k not in UNWRITTEN)
         elif isinstance(y, (list, tuple)):
             todo.extend(y)
     return n

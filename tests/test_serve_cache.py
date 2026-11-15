@@ -65,6 +65,29 @@ def test_the_store_finds_only_the_scopes_own_and_the_longest():
     assert store.find(a, 0, "key:b") is None and store.find(a, 0, None)[0] == a[:40]  # None's own (the same 40 tokens)
     assert store.find(a[:70], 0, "key:a")[0] == a[:40]  # shorter than full only
     assert not store.wants(a[:70], "key:a") and store.wants(a[:70], "key:b") and not store.wants(a[:5], "key:a")
+    # an entry keeps its name and length, never the prompt's tokens (ZDR: they would sit in pageable RAM)
+    for e in store.held.values():
+        assert not any(isinstance(getattr(e, s), (list, tuple, array.array)) for s in K.Entry.__slots__ if s != "state")
+    assert store.get("key:a", a[:70]).n == 70 and store.get("key:a", a[:69]) is None and store.get("key:b", a[:70]) is None
+
+
+def test_cache_turns_saves_no_state_a_few_tokens_past_one_already_there():
+    """verify-N3-cache: a document sent as a marked part, then as its own message, got a second 0.4-0.9 GiB state two
+    tokens past the first. --cache-turns now skips a point within TURN_NEAR past what the request read or its user holds."""
+    from types import SimpleNamespace
+
+    def arm(cache, n, reused):
+        job = SimpleNamespace(seq=0, pause=None)
+        req = SimpleNamespace(full=list(range(10, 10 + n + 50)), scope="key:a", job=job, cut=0, points=[(n, K.IMPLICIT_S, "turn")],
+                              reused=reused, went_on=False)
+        cache.arm(SimpleNamespace(eng=SimpleNamespace(highs={0: 0}), parked=[]), req)
+        return job.pause
+
+    cache = K.Cache(1 << 30, turns=True)
+    assert arm(cache, 2000, 1998) is None and cache.near == 1  # read from a state 2 tokens before it
+    cache.store.put(list(range(10, 10 + 1990)), state_of(1, 1), "key:a")
+    assert arm(cache, 2000, 0) is None and cache.near == 2  # this user holds one 10 tokens before it
+    assert arm(cache, 3000, 0) == 3000 and cache.near == 2  # far from both: saved as the prompt is read
 
 
 def test_the_budget_is_one_for_parked_conversations_and_entries_and_the_oldest_goes():
@@ -259,6 +282,13 @@ def test_a_parts_mark_is_where_the_part_ends_whatever_follows(tok):
     req = app.request(body)
     whole = ids(tok, body["messages"][:1], False)
     assert req.points == [(len(whole), 3600, "mark")] and req.full[: len(whole)] == whole
+    # a field of cache_control that is not served: the mark is served, the field named (R1); --strict-fields refuses
+    body["messages"][0]["cache_control"] = {"type": "ephemeral", "ttl": "1h", "extra": 1}
+    req = app.request(body)
+    assert req.points == [(len(whole), 3600, "mark")] and req.ignored == ["messages[0].cache_control.extra"]
+    with pytest.raises(C.Refused) as e:
+        app_of(tok, True, fields="strict").request(body)
+    assert e.value.args[2] == "messages[0].cache_control.extra"
 
 
 @needs_tok

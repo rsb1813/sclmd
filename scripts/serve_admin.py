@@ -96,9 +96,10 @@ _LIMIT = re.compile(r"^(tph|rph|tpd|rpd)=(\d+)$")  # a key's own quota after it 
 
 
 def parse_keys(text: str, source: str, limits: dict | None = None) -> list:
-    """name:key or key entries, by commas or lines ('#' starts a comment line) -> [(name, key bytes)]. Words after the
-    key that are all tph=N, rph=N, tpd=N or rpd=N are the key's own quota (into `limits`, by name; --quotas); an entry
-    with any other words after the key is the key as a whole, as before."""
+    """name:key or key entries, by commas or lines ('#' starts a comment line) -> [(name, key bytes)]. With `limits`
+    (--quotas), words after the key that are all tph=N, rph=N, tpd=N or rpd=N are the key's own quota (into `limits`,
+    by name); an entry with any other words after the key is the key as a whole. Without it (no --quotas) every entry
+    is the key as a whole, as before: the string that authenticates does not change without the option."""
     keys = []
     for part in re.split(r"[,\r\n]", text or ""):
         part = part.strip()
@@ -107,17 +108,16 @@ def parse_keys(text: str, source: str, limits: dict | None = None) -> list:
         m = _NAMED.match(part)
         name, key = (m.group(1), m.group(2).strip()) if m else (f"{source}{len(keys) + 1}", part)
         words = key.split()
-        if len(words) > 1 and all(_LIMIT.match(w) for w in words[1:]):
+        if limits is not None and len(words) > 1 and all(_LIMIT.match(w) for w in words[1:]):
             key = words[0]
-            if limits is not None:
-                limits[name] = {_LIMIT.match(w).group(1): int(_LIMIT.match(w).group(2)) for w in words[1:]}
+            limits[name] = {_LIMIT.match(w).group(1): int(_LIMIT.match(w).group(2)) for w in words[1:]}
         keys.append((name, key.encode()))
     return keys
 
 
 def load_keys(cli) -> list:
-    """The API keys; a key's own quota goes to cli.key_limits (name -> {tph, rph, tpd, rpd})."""
-    limits = {}
+    """The API keys; with --quotas a key's own quota goes to cli.key_limits (name -> {tph, rph, tpd, rpd})."""
+    limits = {} if getattr(cli, "quotas", False) else None
     keys = parse_keys(os.environ.get(ENV_KEY, ""), "key", limits)
     if getattr(cli, "api_key_file", ""):
         try:
@@ -128,7 +128,7 @@ def load_keys(cli) -> list:
     names = [n for n, _ in keys]
     if len(set(names)) != len(names):
         raise SystemExit("two API keys have the same name")
-    cli.key_limits = limits
+    cli.key_limits = limits or {}
     return keys
 
 
@@ -1163,7 +1163,7 @@ def start(cli) -> list:
     for name, key in keys:
         if len(key) < 16:
             print(f"[serve] warning: the API key {name!r} has only {len(key)} characters", flush=True)
-        if len(key.split()) > 1:  # (its own quota written wrongly? tph=, rph=, tpd=, rpd= take whole numbers)
+        if getattr(cli, "quotas", False) and len(key.split()) > 1:  # (its own quota written wrongly? tph=, rph=, tpd=, rpd= take whole numbers)
             print(f"[serve] warning: the API key {name!r} has a space in it", flush=True)
     return keys
 
