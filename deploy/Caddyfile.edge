@@ -73,6 +73,8 @@ ssalmuck-ai.duckdns.org {
 	@pages path /keys /guide /trust /terms /privacy
 	@slash path_regexp slash ^/(keys|guide|trust|terms|privacy)/$
 	@assets path /assets/*
+	# Google Search Console's ownership file (the OAuth consent screen's home page check): /srv/ssalmuck-ai/verify/
+	@gverify path_regexp gverify ^/google[0-9a-f]{8,32}\.html$
 
 	handle @api {
 		request_body {
@@ -112,6 +114,11 @@ ssalmuck-ai.duckdns.org {
 		import sclmd_page
 		header Cache-Control "public, max-age=3600"
 		encode zstd gzip
+		file_server
+	}
+
+	handle @gverify {
+		root * /srv/ssalmuck-ai/verify
 		file_server
 	}
 
