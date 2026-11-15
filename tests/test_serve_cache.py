@@ -89,6 +89,10 @@ def test_cache_turns_saves_no_state_a_few_tokens_past_one_already_there():
     cache.store.put(list(range(10, 10 + 1990)), state_of(1, 1), "key:a")
     assert arm(cache, 2000, 0) is None and cache.near == 2  # this user holds one 10 tokens before it
     assert arm(cache, 3000, 0) == 3000 and cache.near == 2  # far from both: saved as the prompt is read
+    job = SimpleNamespace(seq=0, pause=None)  # a scope of one request (an unsure address): nothing is saved, nobody could find it
+    req = SimpleNamespace(full=list(range(10, 4000)), scope="unsure:7", job=job, cut=0, points=[(3000, K.LONG_S, "mark")], reused=0, went_on=False)
+    cache.arm(SimpleNamespace(eng=SimpleNamespace(highs={0: 0}), parked=[]), req)
+    assert job.pause is None
 
 
 def test_the_budget_is_one_for_parked_conversations_and_entries_and_the_oldest_goes():

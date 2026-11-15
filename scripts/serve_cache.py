@@ -759,6 +759,8 @@ class Cache:
                 want[n] = (ttl, kind)
         if not want or store.ram <= 0:
             return
+        if isinstance(scope, str) and scope.startswith("unsure:"):  # a scope of one request (serve_net.Users.scope_of): never found again
+            return
         names = self.names.of(scope, full, list(want))
         later = []
         for n in sorted(want):
