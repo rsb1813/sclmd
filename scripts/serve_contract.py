@@ -17,8 +17,9 @@
 # - usage.completion_tokens_details.reasoning_tokens: the reply's tokens from <|channel> to <channel|>.
 # - ZDR (design.md 6.16, 6.17): nothing of a prompt or a reply reaches a log. An error the server logs is written by
 #   why() and trace(): the exception's type and where it was raised, never its message (a ValueError of int() carries
-#   the value it could not read, a template's error the text it could not write). The client's own error answers are
-#   as before.
+#   the value it could not read, a template's error the text it could not write). quiet_hooks() does the same for an
+#   exception no except clause catches (one that escapes a thread, the main program or a __del__). The client's own
+#   error answers are as before.
 import socket
 import sys
 import threading
@@ -71,6 +72,31 @@ def trace(e: BaseException, file=None) -> None:
         print("\n".join(lines), file=out, flush=True)
     except (OSError, ValueError):
         pass
+
+
+def quiet_hooks() -> None:
+    """ZDR for what no except clause catches: an exception that escapes the main program, a thread, or a __del__ (or a
+    callback Python cannot raise from) is printed as trace() prints it, the frames and the type, never the message.
+    Python's default hooks print the message, which may carry a piece of a prompt or a reply."""
+    def main_hook(kind, value, tb):
+        trace(value.with_traceback(tb) if value is not None else kind())
+
+    def thread_hook(args):
+        if args.exc_type is SystemExit:  # as Python's own hook: a thread that exits is not an error
+            return
+        name = args.thread.name if args.thread is not None else "?"
+        print(f"Exception in thread {name}:", file=sys.stderr, flush=True)
+        value = args.exc_value if args.exc_value is not None else args.exc_type()
+        trace(value.with_traceback(args.exc_traceback))
+
+    def unraisable_hook(u):  # u.err_msg and u.object are not printed: Python's text for them may hold an object's repr
+        print("Exception ignored (raised where it could not go on, such as a __del__):", file=sys.stderr, flush=True)
+        value = u.exc_value if u.exc_value is not None else u.exc_type()
+        trace(value.with_traceback(u.exc_traceback))
+
+    sys.excepthook = main_hook
+    threading.excepthook = thread_hook
+    sys.unraisablehook = unraisable_hook
 
 
 def _number(v):

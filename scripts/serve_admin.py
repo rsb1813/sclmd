@@ -774,7 +774,11 @@ def _allowed(adm, handler, path: str) -> bool:
 
 
 def _local(handler) -> bool:
-    return loopback(handler.client_address[0]) if handler.client_address else False
+    """This PC: a loopback connection that carries no X-Forwarded-For or Forwarded (one that does came through a proxy
+    or tunnel on this PC, serve_net.origin)."""
+    if not handler.client_address:
+        return False
+    return N.origin(handler.client_address[0], handler.headers, ())[1]
 
 
 def get(handler) -> bool:

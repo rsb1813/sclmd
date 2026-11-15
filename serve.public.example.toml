@@ -13,7 +13,7 @@ int8 = true                      # integer products (lossy option; no loss measu
 kv4 = true                       # the sliding layers' keys and values at 4 bits (lossy option, KL +0.009)
 wide-rows = 256                  # several prompts read in passes of up to 256 rows
 keyless = true                   # long conversations: the full-attention layers keep values only (21 KB a token)
-context = 40960                  # one conversation: a prompt of 32,768 tokens and its reply
+context = 40992                  # one conversation: a prompt of 32,768 tokens and a reply of 8,192 (the pass's 32 rows are kept free; 40960 cuts it at 8,160)
 typical = 8192                   # the pool's split: conversations at once of 2,000 tokens 4, of 32k 1
 prefix-gib = 2                   # shared prompt prefixes in page-locked RAM
 image = "auto"                   # starts in about 6 s from an engine image (data\images, 11.7 GB, written once a build)
@@ -32,7 +32,7 @@ require-key = true               # does not start without an API key (SCLMD_API_
 # api-key-file = "C:/Users/me/sclmd-keys.txt"    # EDIT: "name: key" a line, OUTSIDE the repository
 anonymous = true                 # a request without a key is served as its address (IPv4, or IPv6's /64)
 trusted-proxies = "192.168.0.10" # EDIT: the proxy PC's LAN address: its X-Forwarded-For alone is read
-metrics-local = true             # GET /metrics from this PC only
+metrics-local = true             # GET /metrics, and GET /'s counts, from this PC only
 
 # what is written: metadata only (ZDR: no prompt or reply)
 request-log = "logs/serve_requests.jsonl"

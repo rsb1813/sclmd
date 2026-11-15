@@ -11,7 +11,8 @@
 #   as R4: 401). The address is the connection's; for a connection from --trusted-proxies (the proxy PC), the first
 #   address of X-Forwarded-For from the right that is not a trusted proxy (every X-Forwarded-For header, in order);
 # - a loopback connection that came through no proxy -> "local" (this PC). An address read from X-Forwarded-For is
-#   never "local", whatever it says.
+#   never "local", whatever it says, and neither is a loopback connection that carries X-Forwarded-For or Forwarded
+#   (a proxy or tunnel on this PC that is not in --trusted-proxies): it is "ip:127.0.0.1".
 # Tenancy is on when the server has API keys or --anonymous; off (None) otherwise, as before N1.
 #
 # The seams of the stages after N1 (quotas and priority; prompt caches): every request object gets
@@ -111,19 +112,21 @@ def origin(peer, headers, proxies=()) -> tuple:
     address. From a trusted proxy with X-Forwarded-For: its addresses from the right, the first that is not a trusted
     proxy; when every one is (the proxy PC itself), the leftmost; when one cannot be read (not an address), the proxy's
     own: a header that a trusted proxy wrote wrongly does not give an address it did not see. From anywhere else
-    X-Forwarded-For is not read. this PC: a loopback connection whose address came from no header."""
+    X-Forwarded-For is not read. this PC: a loopback connection that carries neither X-Forwarded-For nor Forwarded. A
+    loopback connection with one of them came through a proxy or tunnel on this PC (one not in --trusted-proxies): it
+    is its loopback address as a keyless user, not this PC, so a tunnel here does not make every internet user local."""
     ip = address(peer)
-    if _trusted(ip, proxies):
-        chain = forwarded(headers)
-        if chain:
-            for raw in reversed(chain):
-                hop = address(raw)
-                if hop is None:
-                    return ip, False, False
-                if not _trusted(hop, proxies):
-                    return hop, False, True
-            return address(chain[0]), False, True
-    return ip, bool(ip is not None and ip.is_loopback), False
+    chain = forwarded(headers)
+    if _trusted(ip, proxies) and chain:
+        for raw in reversed(chain):
+            hop = address(raw)
+            if hop is None:
+                return ip, False, False
+            if not _trusted(hop, proxies):
+                return hop, False, True
+        return address(chain[0]), False, True
+    through = bool(chain) or bool(headers.get("Forwarded"))
+    return ip, bool(ip is not None and ip.is_loopback and not through), False
 
 
 def presented(headers) -> bytes | None:
@@ -220,10 +223,41 @@ def metrics_refused(handler) -> bool:
     return bool(users is not None and users.metrics_local and not who_of(handler).local)
 
 
-def context_exceeded(most: int, got: int, what: str = "prompt") -> tuple:
-    """OpenAI's answer to a prompt that is too long: (400, message, param, code) for Refused."""
-    return (400, f"This model's maximum {what} length is {most} tokens. However, your messages resulted in {got} tokens. "
+def context_exceeded(most: int, got: int, what: str = "prompt", sure: bool = False) -> tuple:
+    """OpenAI's answer to a prompt that is too long: (400, message, param, code) for Refused. sure: refused before the
+    tokenizer, by sure_too_long (got is then unknown)."""
+    over = (f"your messages have more than {most * TOKEN_BYTES:,} bytes of text, more than {most} tokens can hold" if sure
+            else f"your messages resulted in {got} tokens")
+    return (400, f"This model's maximum {what} length is {most} tokens. However, {over}. "
                  "Please reduce the length of the messages.", "messages", "context_length_exceeded")
+
+
+TOKEN_BYTES = 48  # the most UTF-8 bytes of text one Gemma 4 token stands for (measured over all 262,144; added tokens 16 at most)
+
+
+def text_bytes(x, stop: int = 0) -> int:
+    """The UTF-8 bytes of every string in x (messages after sclmd/tools.py's messages_of: dicts and lists), keys left
+    out. stop > 0: counting ends once the count passes it."""
+    n, todo = 0, [x]
+    while todo:
+        y = todo.pop()
+        if isinstance(y, str):
+            n += len(y.encode("utf-8", "surrogatepass"))
+            if stop and n > stop:
+                return n
+        elif isinstance(y, dict):
+            todo.extend(y.values())
+        elif isinstance(y, (list, tuple)):
+            todo.extend(y)
+    return n
+
+
+def sure_too_long(messages, most: int) -> bool:
+    """--max-prompt before the template and the tokenizer: messages with more text than `most` tokens can hold (each
+    token at most TOKEN_BYTES bytes) are over it whatever they tokenize to (False: not sure, tokenize). The template
+    only adds tokens, so no prompt within the limit is refused. A big body is refused at once instead of holding the
+    prompt lock for its whole tokenization (37 s for 29.6 MiB, measured, every other request waiting)."""
+    return bool(most) and text_bytes(messages, stop=most * TOKEN_BYTES) > most * TOKEN_BYTES
 
 
 # start-up

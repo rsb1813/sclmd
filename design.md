@@ -847,13 +847,13 @@ R1 열은 마지막 코드로 잰 것이다(그 전 코드로 한 번 더: 80.3%
 
 ### 6.17 인터넷 서버의 바탕 (N1: 사용자, ZDR, 한도, 프록시) [실측, 무손실]
 
-6.16의 첫 단계다. 엔진·스케줄러·커널은 그대로이고 서버의 HTTP 쪽만 고쳤다: 새 모듈 `scripts/serve_net.py`(사용자, 이음매, 한도), `scripts/zdr_check.py`(카나리 관문), `serve.public.example.toml`, `deploy/Caddyfile.example`, `deploy/firewall.example.ps1`, 그리고 `serve.py`·`serve_admin.py`·`serve_contract.py`·`serve_ops.py`·`supervise.py`·`serve_canned.py`·`openai_client_check.py`·`serve.bat`에 몇 줄. 새 동작은 모두 선택지이고 **기본은 꺼져 있다**. 6.16대로 기본에서 달라지는 것은 ZDR 로그 고침뿐이다(아래). 클라이언트가 받는 바이트는 같다: 가짜 엔진에서 10fd0af와 같은 요청 165개(R4-land의 `ab_wire.py`) 중 164개가 바이트 단위로 같고, 다른 하나는 `GET /metrics`다(숫자를 빼면 87줄이 같다: uptime 같은 값). 진짜 엔진에서도 같은 토큰이다(아래).
+6.16의 첫 단계다. 엔진·스케줄러·커널은 그대로이고 서버의 HTTP 쪽만 고쳤다: 새 모듈 `scripts/serve_net.py`(사용자, 이음매, 한도), `scripts/zdr_check.py`(카나리 관문), `serve.public.example.toml`, `deploy/Caddyfile.example`, `deploy/firewall.example.ps1`, 그리고 `serve.py`·`serve_admin.py`·`serve_contract.py`·`serve_ops.py`·`supervise.py`·`serve_canned.py`·`openai_client_check.py`·`serve.bat`에 몇 줄. 새 동작은 모두 선택지이고 **기본은 꺼져 있다**. 6.16대로 기본에서 달라지는 것은 ZDR 로그 고침뿐이다(아래). 클라이언트가 받는 바이트는 같다: 가짜 엔진에서 10fd0af와 같은 요청 165개(R4-land의 `ab_wire.py`) 중 164개가 바이트 단위로 같고, 다른 하나는 `GET /metrics`다(숫자를 빼면 같다: 81~87줄, 요청 이력에 따라). 진짜 엔진에서도 같은 토큰이다(아래).
 
 **사용자 (`serve_net.who`: 연결의 주소, 머리글, 키, 선택지만 보는 함수 하나; 몸통은 읽지 않는다).**
 - 키(`Authorization: Bearer`, `x-api-key`)가 서버의 키면 `key:<이름>`. 서버에 없는 키는 401이다(IP로 넘기지 않음; 이 PC에서 온 것도).
 - 키가 없으면 IP: IPv4는 주소(`ip:203.0.113.7`), IPv6는 /64(`ip:2001:db8:1:2::/64`). `::ffff:a.b.c.d`는 IPv4로 읽는다. 키가 있어도 받는 것은 `--anonymous`다(없으면 R4대로 401, 메시지도 R4 그대로).
 - `X-Forwarded-For`는 연결이 `--trusted-proxies`(프록시 PC의 주소나 망)에서 왔을 때만 읽는다. 모든 머리글을 차례로 이어 오른쪽부터, 믿는 프록시를 건너뛴 첫 주소가 사용자다. 그 머리글에서 나온 주소는 무엇이든 "이 PC"가 아니다(클라이언트가 `127.0.0.1`을 써도 `ip:127.0.0.1`). 믿는 프록시가 읽을 수 없는 값을 적었으면(주소가 아님) 프록시 자신의 주소, 모두 믿는 프록시면 맨 왼쪽, 머리글이 비었으면 연결의 주소다.
-- 루프백에서 프록시 없이 온 요청은 `local`(이 PC).
+- 루프백에서 프록시 없이 온 요청은 `local`(이 PC). 루프백 연결이라도 `X-Forwarded-For`나 `Forwarded`를 달고 오면(이 PC에서 도는, `--trusted-proxies`에 없는 프록시나 터널: cloudflared, ngrok) 이 PC가 아니라 키 없는 사용자 `ip:127.0.0.1`이다. 그렇지 않으면 그런 터널 하나로 인터넷의 모든 사용자가 이 PC가 된다(할당량 밖, 맨 앞, `/metrics`).
 - 사용자를 가르는 것(tenancy)은 키가 있거나 `--anonymous`일 때만 켜진다. 둘 다 없으면 오늘처럼 모두 받고 `req.tenant`는 None이다(아무 키나 무시됨).
 - 믿지 않는 연결이 `X-Forwarded-For`를 보내면(프록시 주소를 잘못 적음: 모든 사용자가 프록시 하나가 됨) 콘솔에 한 번 적는다(그 연결의 주소만).
 - 공식 openai 라이브러리 3.51.0은 키 없이 보내지 못한다(잰 것: `api_key=""`는 요청 전에 `OpenAIError`, `"none"`은 그대로 `Bearer none`을 보내 401). 빈 머리글 `default_headers={"Authorization": ""}`(api_key는 아무 값)이면 키 없는 요청이 되어 200이다. `--anonymous`의 401 메시지가 이것을 알려 준다.
@@ -883,15 +883,15 @@ R1 열은 마지막 코드로 잰 것이다(그 전 코드로 한 번 더: 80.3%
 진짜 엔진에서 카나리는 26개 답에 돌아왔다(400 메시지가 옮겨 적은 것과 모델이 따라 쓴 것: 서버를 지나갔다는 표시). `--debug`는 루프백 호스트에서만 되므로 공개 설정의 `0.0.0.0` 대신 127.0.0.1에서 쟀다. `CUDA`로 시작하는 메시지를 남기는 길을 보려고 카나리를 `CUDA error q7z1`로 바꿔 가짜 엔진에서 한 번 더 돌렸다: 0. 그 길은 RuntimeError(토치의 것)에만 열려 있다. 서버가 쓴 파일은 넘긴 폴더의 것뿐이다: 진짜 엔진을 모두 돌린 뒤 클론의 `git status --ignored`에는 `__pycache__`와 `engine/build`만 있다.
 
 **한도 (`scripts/serve_net.py`, 기본 꺼짐).**
-- `--max-prompt N`: 템플릿을 지난 프롬프트가 N토큰을 넘으면 400, OpenAI의 꼴(`type invalid_request_error`, `param messages`, `code context_length_exceeded`, `This model's maximum prompt length is N tokens. However, your messages resulted in M tokens. ...`). 켜면 문맥이 넘치는 400도 같은 꼴이다. 모델 카드에 `max_prompt_tokens`.
+- `--max-prompt N`: 템플릿을 지난 프롬프트가 N토큰을 넘으면 400, OpenAI의 꼴(`type invalid_request_error`, `param messages`, `code context_length_exceeded`, `This model's maximum prompt length is N tokens. However, your messages resulted in M tokens. ...`). 켜면 문맥이 넘치는 400도 같은 꼴이다. 모델 카드에 `max_prompt_tokens`. 메시지의 글이 N × 48바이트(Gemma 4 토큰 하나가 나타내는 가장 긴 글, 262,144개 모두 잼)를 넘으면 템플릿과 토크나이저 전에 같은 400이다(`more than ... bytes of text`): 템플릿은 토큰을 더할 뿐이라 한도 안의 프롬프트는 거절되지 않는다. 전에는 29.6MiB 몸통 하나가 프롬프트 잠금을 쥔 채 37초 동안 토큰으로 바뀌었고, 그동안 다른 요청은 모두 기다렸다(검증이 잼).
 - `--max-output N`: `max_tokens`(또는 `max_completion_tokens`)가 N을 넘으면 N으로 줄이고 그 필드 이름을 `x-sclmd-ignored`에 적는다. `--max-tokens`가 N보다 크면 뜨지 않는다. 모델 카드의 `max_output_tokens`는 N.
-- **32,768 + 8,192는 40,960에 들지 않는다.** 서버는 쓰는 통과의 행(32)만큼 문맥을 남긴다(`room = 문맥 - 프롬프트 - 32`). 잰 것: 정확히 32,768토큰인 프롬프트에 `max_tokens` 8192를 주니 답이 8,160토큰에서 `length`로 끝났다(첫 토큰 23.9초, 74.3초, 162.2 tok/s, 숫자 세기). 줄였다고 적지는 않는다(전부터 문맥이 답을 줄이는 것과 같다). 같은 설정에 `--context 40992`면 8,192토큰 전부가 나온다(74.5초, 162.1 tok/s). 풀은 같다: VRAM 13.6GiB, 타일 363 / 2,816, 25/11/5/4/4. 공개 설정은 6.16대로 40960이다(관리자가 정할 것).
+- **32,768 + 8,192는 40,960에 들지 않는다.** 서버는 쓰는 통과의 행(32)만큼 문맥을 남긴다(`room = 문맥 - 프롬프트 - 32`). 잰 것: 정확히 32,768토큰인 프롬프트에 `max_tokens` 8192를 주니 답이 8,160토큰에서 `length`로 끝났다(첫 토큰 23.9초, 74.3초, 162.2 tok/s, 숫자 세기). 줄였다고 적지는 않는다(전부터 문맥이 답을 줄이는 것과 같다). 같은 설정에 `--context 40992`면 8,192토큰 전부가 나온다(74.5초, 162.1 tok/s). 풀은 같다: VRAM 13.6GiB, 타일 363 / 2,816, 25/11/5/4/4. 공개 설정은 40992다(6.16의 32,768 + 8,192가 다 든다).
 - `--stream-ping S`: 스트림의 머리글 뒤 첫 토큰(또는 끝)이 올 때까지 S초마다 SSE 주석 `: ping`. 그 뒤로는 보내지 않는다. `--queue-timeout`을 켜면 머리글이 시퀀스를 받은 뒤 나가므로 그 기다림 동안은 핑이 없다.
-- `--metrics-local`: `GET /metrics`는 이 PC(루프백, 프록시 없이)에만. 다른 곳(프록시를 거친 이 PC의 요청 포함)에는 모르는 경로의 404다.
+- `--metrics-local`: `GET /metrics`는 이 PC(루프백, 프록시 없이)에만. 다른 곳(프록시를 거친 이 PC의 요청 포함)에는 모르는 경로의 404다. `GET /`도 다른 곳에는 서버 전체의 숫자(요청, 토큰, 보관된 대화, 앞부분을 쥐고 맞힌 수: 남의 캐시 적중을 알려 줌) 없이 이름·모델·끝점·한도만 준다.
 - R1의 보호(`--max-body-mb 32 --idle-timeout 120 --max-connections 256`)는 R1 그대로이고 공개 설정이 켠다.
 
 **공개 설정.**
-- `serve.public.example.toml`(커밋됨): 6.16의 설정(`int8`, `kv4`, `wide-rows = 256`, `keyless`, `context = 40960`, `typical = 8192`, `prefix-gib = 2`, `image = "auto"`, `supervise = true`), 한도(`max-prompt 32768`, `max-output 8192`, `max-tokens 8192`, `stream-ping 15`), R1의 보호, `require-key`, `anonymous`, `trusted-proxies`(자리 표시 `192.168.0.10`: 고칠 것), `metrics-local`, 요청 기록과 상태 파일(메타데이터뿐). 키는 `SCLMD_API_KEY`나 저장소 밖의 `api-key-file`.
+- `serve.public.example.toml`(커밋됨): 6.16의 설정(`int8`, `kv4`, `wide-rows = 256`, `keyless`, `context = 40992`, `typical = 8192`, `prefix-gib = 2`, `image = "auto"`, `supervise = true`), 한도(`max-prompt 32768`, `max-output 8192`, `max-tokens 8192`, `stream-ping 15`), R1의 보호, `require-key`, `anonymous`, `trusted-proxies`(자리 표시 `192.168.0.10`: 고칠 것), `metrics-local`, 요청 기록과 상태 파일(메타데이터뿐). 키는 `SCLMD_API_KEY`나 저장소 밖의 `api-key-file`.
 - 이것을 읽으려고 고친 것: `serve.toml`의 `supervise`는 서버가 건너뛰고(전: 모르는 이름이라 뜨지 않음), 값을 받는 스위치(`int8`)는 `true`면 홀로 준 값(5.0)이다(전: 거절). `serve.bat`은 `serve.toml`(또는 `--config`)이 있으면 `python -m scripts.supervise --wanted`로 한 번 묻고, `supervise = true`면 supervisor로 띄운다(전: 명령줄의 `--supervise`만). 없으면 전과 같다.
 - `deploy/Caddyfile.example`(프록시 PC): 주인의 도메인으로 Caddy가 TLS를 받고, `reverse_proxy <GPU PC의 LAN 주소>:8001`. Caddy는 `X-Forwarded-For`를 연결의 주소로 쓴다(인터넷 클라이언트는 Caddy의 trusted_proxies가 아니므로 클라이언트의 머리글은 버린다). `text/event-stream`은 Caddy가 바로 흘려보낸다(`flush_interval -1`은 쓰지 않음: 떠난 클라이언트의 요청도 서버에서 끝나지 않게 둔다는 뜻이라). 서버 답의 시간 제한은 없음(32k 프롬프트 22.5초에 8,192토큰 답), 위쪽 연결의 keepalive 60초(서버의 120초보다 짧게: 서버가 닫는 연결에 요청을 싣지 않게), 서버가 다시 뜨는 동안 거절된 연결만 15초까지 다시 시도(`lb_try_duration`), 몸통 32MiB, `/metrics`·`/debug`는 404, 접근 기록 없음.
 - `deploy/firewall.example.ps1`(GPU PC, 관리자 PowerShell): 8001은 프록시 PC에서만 허용하고, 그 밖의 모든 주소는 막는 규칙(차단이 허용보다 이긴다). python.exe가 처음 0.0.0.0을 열 때 Windows가 묻고 만드는 "모든 포트 허용" 규칙은 좁은 허용 규칙으로 좁혀지지 않으므로, 그 규칙을 찾아 끄는 줄도 둔다. 루프백은 Windows가 거르지 않으므로 이 PC는 제 서버에 그대로 닿는다.
@@ -912,7 +912,15 @@ R1 열은 마지막 코드로 잰 것이다(그 전 코드로 한 번 더: 80.3%
 - 서버는 IPv4(`0.0.0.0`)에서만 듣는다. IPv6 사용자는 프록시를 거쳐 온다(`X-Forwarded-For`의 IPv6는 /64로 읽음).
 - 핑은 첫 토큰까지다. 그 뒤 긴 도구 호출 블록(닫힐 때 한꺼번에 나감)이나 stop 문자열을 기다리는 동안은 조용할 수 있다.
 
-**관리자가 정할 것.** `--context 40960`(32,768토큰 프롬프트의 답은 8,160까지)과 `40992`(8,192가 다 듦) 중 무엇. 키 없는 openai 라이브러리 사용자에게 알릴 방법(빈 Authorization 머리글; 키 값으로 익명을 뜻하는 약속은 두지 않았다: 6.16은 모르는 키를 401로). `require-key`(지금 켬: 키가 없으면 뜨지 않음). 요청 기록을 켤지(사용자의 IP가 남는다: 6.16은 메타데이터로 허용). `trusted-proxies`의 자리 표시(틀리면 모든 사용자가 프록시 하나로 묶이고 콘솔에 한 번 적힌다).
+**관리자가 정할 것.** 키 없는 openai 라이브러리 사용자에게 알릴 방법(빈 Authorization 머리글; 키 값으로 익명을 뜻하는 약속은 두지 않았다: 6.16은 모르는 키를 401로). `require-key`(지금 켬: 키가 없으면 뜨지 않음). 요청 기록을 켤지(사용자의 IP가 남는다: 6.16은 메타데이터로 허용). `trusted-proxies`의 자리 표시(틀리면 모든 사용자가 프록시 하나로 묶이고 콘솔에 한 번 적힌다).
+
+**검증(verify-N1-base) 뒤 고친 것.** 검증이 숫자를 모두 다시 쟀고(같은 답 70/70, 카나리 0, 32k 스트림의 핑과 첫 토큰), 고칠 것 셋과 문서 거리를 냈다. 고친 것:
+- 루프백 + `X-Forwarded-For`(믿지 않는 연결)가 이 PC로 읽혔다: 이제 `ip:127.0.0.1`이고 콘솔에 한 번 적는다(위 사용자). `--debug`의 `/debug/audit`·`/debug/fault`도 같은 규칙이다.
+- 스레드를 빠져나간 예외는 파이썬 기본 훅이 메시지째 찍었다: `serve.main`이 `serve_contract.quiet_hooks()`로 `sys.excepthook`, `threading.excepthook`, `sys.unraisablehook`을 `trace()`(프레임과 형식만)로 바꾼다.
+- 큰 몸통이 프롬프트 잠금을 쥐는 것: 위 `--max-prompt`의 바이트 한도. 48바이트에 가까운 토큰만으로 된 글이 아니면 거절은 여전히 토큰으로 바꾼 뒤다(1.5MiB면 약 2초 [추정: 37초 / 29.6MiB로 셈]).
+- `GET /`의 숫자(위 `--metrics-local`), 공개 설정의 `context = 40992`.
+- 기본에서 달라지는 것 하나 더(메타데이터): 키만 준 R4식 서버도 tenancy가 켜지므로 요청 기록의 줄에 `"tenant": "key:<이름>"`이 붙고, 믿지 않는 연결의 `X-Forwarded-For`에 콘솔 한 줄이 나온다.
+- 시험: `tests/test_serve_net.py`에 넷(터널은 이 PC가 아님, 토크나이저 전의 바이트 한도, `quiet_hooks`, 그리고 사용자 표의 루프백 줄을 새 규칙으로).
 
 ## 7. 벤치마크 (2026-11-14) [실측, 도는 중]
 

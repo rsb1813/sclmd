@@ -478,10 +478,13 @@ class App:
                 "capabilities": {"streaming": True, "reasoning": True, "tools": True, "prompt_cache": True, "vision": False},
                 "defaults": {"temperature": 1.0, "top_p": 0.95, "top_k": 64, "thinking": self.think, "max_tokens": self.max_tokens}}
 
-    def about(self) -> dict:
-        return {"server": "sclmd serve", "model": MODEL, "system_fingerprint": self.fingerprint, "uptime_s": round(time.time() - self.started),
-                "endpoints": ["GET /", "GET /health", "GET /v1/models", "GET /v1/models/{id}", "POST /v1/chat/completions"],
-                "context_length": self.server.eng.capacity, "max_output_tokens": self.max_tokens, **self.facts, **self.server.about()}
+    def about(self, totals: bool = True) -> dict:
+        """GET /. totals False (--metrics-local, a request from elsewhere than this PC): without the server's facts and
+        counts (requests, tokens, kept conversations, prefixes held and hit), which tell one user about the others."""
+        out = {"server": "sclmd serve", "model": MODEL, "system_fingerprint": self.fingerprint, "uptime_s": round(time.time() - self.started),
+               "endpoints": ["GET /", "GET /health", "GET /v1/models", "GET /v1/models/{id}", "POST /v1/chat/completions"],
+               "context_length": self.server.eng.capacity, "max_output_tokens": self.max_tokens}
+        return {**out, **self.facts, **self.server.about()} if totals else out
 
     def request(self, body: dict) -> Request:
         ignored = C.check_fields(body, self.fields)  # fields that are not served: refused, or named in the answer
@@ -496,6 +499,8 @@ class App:
         ignored = sorted(set(ignored) | set(more) | set(left))
         if messages[-1]["role"] == "assistant":
             raise Refused(400, "the last message is the one to answer: a user's")
+        if N.sure_too_long(messages, getattr(self, "max_prompt", 0)):  # --max-prompt: sure from the text alone, before the lock
+            raise Refused(*N.context_exceeded(self.max_prompt, 0, sure=True))
         think = self.think
         if "thinking" in body:
             t = body["thinking"]
@@ -669,7 +674,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"status": "ok", "model": MODEL, "under_way": about["requests"]["under_way"],
                              "waiting": about["requests"]["waiting"], "kept": about["conversations_kept"]})
         elif path in ("", "/v1"):
-            self._json(200, app.about())
+            self._json(200, app.about(totals=not N.metrics_refused(self)))  # --metrics-local: the counts from this PC only
         else:
             self._error(404, "unknown path: GET / lists the endpoints")
 
@@ -952,6 +957,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    C.quiet_hooks()  # ZDR: an exception that escapes a thread prints its frames and type, not its message
     ap = parser()
     cli = A.parse_args(ap)  # serve.toml's options (--config) under the command line's
     keys = A.start(cli)  # the API keys; a host other than loopback without one: a warning (--require-key: no start)

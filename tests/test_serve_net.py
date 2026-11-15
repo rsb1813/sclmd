@@ -61,10 +61,15 @@ def test_this_pc_is_loopback_through_no_proxy():
     for peer in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
         w = who(peer)
         assert w.tenant == N.LOCAL and w.local
-    w = who("127.0.0.1", ("X-Forwarded-For", "198.51.100.1"))  # 127.0.0.1 is no trusted proxy here: the header is not read
-    assert w.tenant == N.LOCAL
+    # 127.0.0.1 is no trusted proxy here: the header is not read, and a loopback connection that carries it came through
+    # a proxy or tunnel on this PC (cloudflared, ngrok): its loopback address, never this PC
+    for pair in (("X-Forwarded-For", "198.51.100.1"), ("Forwarded", "for=198.51.100.1"), ("X-Forwarded-For", "")):
+        w = who("127.0.0.1", pair)
+        assert (w.tenant, w.local, w.proxied) == (("ip:127.0.0.1", False, False) if pair[1] else (N.LOCAL, True, False)), pair
+    assert not who("::1", ("X-Forwarded-For", "198.51.100.1")).local
     w = who("127.0.0.1", ("X-Forwarded-For", "198.51.100.1"), proxies=N.networks("127.0.0.1"))  # through a proxy on this PC
     assert w.tenant == "ip:198.51.100.1" and not w.local and w.proxied
+    assert who("127.0.0.1", proxies=N.networks("127.0.0.1")).local  # that proxy's own request, with no header: this PC
 
 
 def test_x_forwarded_for_only_from_a_trusted_proxy_from_the_right():
@@ -185,6 +190,25 @@ def test_a_prompt_above_max_prompt_is_openais_400(net):
     assert out["status"] == 200
 
 
+def test_a_prompt_sure_to_be_over_max_prompt_is_refused_before_the_tokenizer(net):
+    """More text than --max-prompt tokens can hold (48 bytes a token at most) is refused before the template and the
+    tokenizer run under the prompt lock: a 30 MB body does not hold every other request for half a minute."""
+    httpd, app, inbox = net("--max-prompt", "20")
+    seen = []
+    real = app.tok.apply_chat_template
+    app.tok.apply_chat_template = lambda *a, **k: seen.append(1) or real(*a, **k)
+    big = [{"role": "system", "content": "s" * 500}, {"role": "user", "content": [{"type": "text", "text": "ü" * 300}]}]  # 1,100 bytes > 960
+    status, _, body = call(httpd, "POST", "/v1/chat/completions", {"messages": big})
+    err = json.loads(body)["error"]
+    assert status == 400 and err["code"] == "context_length_exceeded" and err["param"] == "messages" and not seen
+    assert "more than 960 bytes of text, more than 20 tokens can hold" in err["message"]
+    status, _, body = call(httpd, "POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "x" * 900}]})
+    assert status == 400 and "resulted in 905 tokens" in json.loads(body)["error"]["message"] and seen  # not sure: tokenized
+    assert N.text_bytes(big) == 6 + 500 + 4 + 4 + 600  # roles and part types count too: a turn's own template tokens more than cover them
+    assert not N.sure_too_long(big, 0) and not N.sure_too_long(big, 24) and N.sure_too_long(big, 23)
+    assert N.text_bytes({"a": ["xy", {"b": "€"}], "n": 5}) == 5
+
+
 def test_max_tokens_above_max_output_is_cut_and_named(net):
     httpd, app, inbox = net("--max-output", "50", max_tokens=40)
     req, out = served(httpd, inbox, {"messages": HI, "max_tokens": 500})
@@ -240,6 +264,24 @@ def test_metrics_from_another_machine_is_refused(net, monkeypatch):
     assert not N.metrics_refused(handler)
 
 
+def test_a_tunnel_on_this_pc_is_not_this_pc(net, capsys):
+    """A proxy or tunnel on this PC that is not in --trusted-proxies: its loopback connections carry X-Forwarded-For.
+    They are the keyless user ip:127.0.0.1, not this PC: no /metrics, no counts on GET /, and the console is told."""
+    httpd, app, inbox = net("--metrics-local", "--anonymous", "--trusted-proxies", "192.168.0.10", keys=KEYS)
+    tunnel = {"X-Forwarded-For": "198.51.100.7"}
+    status, _, body = call(httpd, "GET", "/metrics", headers=tunnel)
+    assert status == 404 and b"sclmd_" not in body
+    about = json.loads(call(httpd, "GET", "/", headers=tunnel)[2])
+    assert about["model"] == S.MODEL and "requests" not in about and "conversations_kept" not in about
+    req, _ = served(httpd, inbox, {"messages": HI}, tunnel)
+    assert req.tenant == "ip:127.0.0.1"
+    assert "is not in --trusted-proxies" in capsys.readouterr().out
+    assert call(httpd, "GET", "/metrics")[0] == 200  # this PC itself
+    assert "requests" in json.loads(call(httpd, "GET", "/")[2])
+    httpd, _, _ = net()  # without --metrics-local: GET / as before, counts for everyone
+    assert "requests" in json.loads(call(httpd, "GET", "/", headers=tunnel)[2])
+
+
 # ZDR
 
 CANARY = "Zdr0123456789q"
@@ -279,6 +321,38 @@ def test_trace_and_why_leave_the_message_out():
         "RuntimeError: CUDA error: an illegal memory access was encountered"
     assert C.why(ValueError("CUDA error " + CANARY)) == "ValueError"  # only torch's RuntimeError keeps the driver's words
     assert C.why(RuntimeError("CUDAx " + CANARY)) == "RuntimeError"
+
+
+def test_quiet_hooks_print_an_escaped_exception_without_its_message(monkeypatch, capsys):
+    """serve.main's C.quiet_hooks(): an exception that escapes a thread, the main program or a __del__ prints its
+    frames and type, as trace() does, not Python's default with the message."""
+    import sys
+    for mod, name in ((sys, "excepthook"), (threading, "excepthook"), (sys, "unraisablehook")):
+        monkeypatch.setattr(mod, name, getattr(mod, name))  # put back after the test
+    C.quiet_hooks()
+
+    def fail():
+        raise ValueError(CANARY)
+
+    th = threading.Thread(target=fail, name="engine")
+    th.start()
+    th.join()
+    try:
+        fail()
+    except ValueError as e:
+        sys.excepthook(type(e), e, e.__traceback__)
+
+    class Dying:
+        def __del__(self):
+            raise KeyError(CANARY)
+
+    Dying()
+    err = capsys.readouterr().err
+    assert "Exception in thread engine:" in err and err.count("\nValueError\n") == 2 and "\nKeyError\n" in err
+    assert "Exception ignored (raised where it could not go on" in err and CANARY not in err
+    threading.Thread(target=lambda: sys.exit(3)).start()  # a thread that exits is no error, as with Python's own hook
+    time.sleep(0.2)
+    assert capsys.readouterr().err == ""
 
 
 def test_a_handler_that_fails_outside_its_answers_is_logged_without_the_message(capsys):
@@ -365,7 +439,7 @@ def test_serve_toml_supervise_and_int8_true(tmp_path):
 def test_the_public_example_is_read_whole():
     path = os.path.join(ROOT, "serve.public.example.toml")
     cli = A.parse_args(S.parser(), ["--config", path])
-    assert (cli.int8, cli.kv4, cli.wide_rows, cli.keyless, cli.context, cli.typical, cli.prefix_gib, cli.image) == (5.0, True, 256, True, 40960, 8192, 2.0, "auto")
+    assert (cli.int8, cli.kv4, cli.wide_rows, cli.keyless, cli.context, cli.typical, cli.prefix_gib, cli.image) == (5.0, True, 256, True, 40992, 8192, 2.0, "auto")
     assert (cli.max_prompt, cli.max_output, cli.max_tokens, cli.stream_ping) == (32768, 8192, 8192, 15.0)
     assert (cli.max_body_mb, cli.idle_timeout, cli.max_connections) == (32.0, 120.0, 256)
     assert cli.anonymous and cli.metrics_local and cli.require_key and cli.trusted_proxies and cli.host == "0.0.0.0"
