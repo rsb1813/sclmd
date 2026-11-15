@@ -1,0 +1,135 @@
+# The edge's Caddyfile (design.md 6.20, 6.23): pve's CT 104 "edge" (192.168.0.40), /etc/caddy/Caddyfile. Caddy takes
+# TLS for every public site of the house and forwards each over the LAN. This file is the whole file in its shape; the
+# repository has no copy of the risuai sites, so their two blocks stay as they are in the live file (marked below), and
+# the ssalmuck-ai block here is complete: it replaces the live file's ssalmuck-ai block whole.
+#
+# ssalmuck-ai.duckdns.org (design.md 6.23):
+# - The pages are static files in /srv/ssalmuck-ai (copy deploy/site/* there; owner root, mode 644): / /keys /guide
+#   /trust /terms /privacy and /assets/*. A page path is served from its .html file without a redirect (/keys, not
+#   /keys/; /keys/ answers 308 to /keys). The .html names themselves, /404.html and every other path are 404.
+# - To the GPU PC (192.168.0.2:8001, as deploy/Caddyfile.example): /v1/*, /health, /keys/google/start,
+#   /keys/callback/*, /keys/api/*. /metrics, /debug and the server's own GET / are not reachable from the internet.
+# - Security headers on every answer: HSTS (a year; no preload, no includeSubDomains), nosniff, Referrer-Policy
+#   same-origin (not no-referrer: with no-referrer a browser sends "Origin: null" on the pages' same-origin POSTs and
+#   the key endpoints' Origin check would refuse them). On the pages also a strict CSP (this origin only, no inline
+#   code), frame-ancestors none, COOP, CORP and a Permissions-Policy that allows passkeys (publickey-credentials-*).
+# - Caching: the pages "no-cache" (revalidated with the ETag file_server sends), /assets for an hour (their names carry
+#   no version; a change reaches everyone within an hour).
+# - No access log (no `log` directive). Caddy's own error log (a line when the GPU PC cannot be reached) keeps the
+#   client's address and the path only: the global `log` below deletes every request header and the query. journald
+#   keeps it 7 days (/etc/systemd/journald.conf.d/sclmd.conf: MaxRetentionSec=7d), as /privacy says.
+#
+# Check before reload: caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile; then systemctl reload caddy.
+# The block's routes and headers are what scripts/site_check.py's stand-in edge serves (it reads this file).
+
+{
+	# KEEP the live file's global options (email, servers, ...) here as they are.
+
+	# what Caddy's error log may write of a request (there is no access log): the address and the path, no header
+	# and no query (no key, no cookie, no OAuth code). It applies to every site's logs of this file.
+	log default {
+		format filter {
+			fields {
+				request>headers delete
+				request>uri query {
+					delete code
+					delete state
+				}
+			}
+		}
+	}
+}
+
+# ---- KEEP: the live file's two risuai site blocks, unchanged (this repository has no copy of them) ----
+
+
+# ---- ssalmuck-ai (sclmd) ----
+
+(sclmd_headers) {
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "same-origin"
+		-Server
+	}
+}
+
+(sclmd_page) {
+	header {
+		Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+		Permissions-Policy "publickey-credentials-create=(self), publickey-credentials-get=(self), camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+		Cross-Origin-Opener-Policy "same-origin"
+		Cross-Origin-Resource-Policy "same-origin"
+		X-Frame-Options "DENY"
+	}
+}
+
+ssalmuck-ai.duckdns.org {
+	root * /srv/ssalmuck-ai
+	import sclmd_headers
+
+	@api path /v1/* /health /keys/google/start /keys/callback/* /keys/api/*
+	@home path /
+	@pages path /keys /guide /trust /terms /privacy
+	@slash path_regexp slash ^/(keys|guide|trust|terms|privacy)/$
+	@assets path /assets/*
+
+	handle @api {
+		request_body {
+			max_size 32MiB
+		}
+		reverse_proxy 192.168.0.2:8001 {
+			lb_try_duration 15s
+			lb_try_interval 500ms
+			transport http {
+				dial_timeout 5s
+				keepalive 60s
+			}
+		}
+	}
+
+	handle @home {
+		import sclmd_page
+		header Cache-Control "no-cache"
+		rewrite * /index.html
+		encode zstd gzip
+		file_server
+	}
+
+	handle @pages {
+		import sclmd_page
+		header Cache-Control "no-cache"
+		rewrite * {path}.html
+		encode zstd gzip
+		file_server
+	}
+
+	handle @slash {
+		redir /{re.slash.1} 308
+	}
+
+	handle @assets {
+		import sclmd_page
+		header Cache-Control "public, max-age=3600"
+		encode zstd gzip
+		file_server
+	}
+
+	# /metrics, /debug, the .html names and everything else
+	handle {
+		error 404
+	}
+
+	# the edge's own 404s get the 404 page; any other error of the edge (502 while the GPU PC is down) keeps its bare
+	# status, as before, so that an API client is not handed an HTML page
+	handle_errors {
+		@notfound expression {err.status_code} == 404
+		handle @notfound {
+			import sclmd_headers
+			import sclmd_page
+			header Cache-Control "no-cache"
+			rewrite * /404.html
+			file_server
+		}
+	}
+}

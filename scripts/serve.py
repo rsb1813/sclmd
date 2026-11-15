@@ -727,6 +727,12 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def do_POST(self) -> None:
+        try:
+            self._post()
+        finally:
+            A.posted(self)  # --concurrency: the request's place is given back, however it ended (scripts/serve_tiers.py)
+
+    def _post(self) -> None:
         app = self.server.app
         if A.post(self):  # an API key asked and not given (401), /debug/fault (scripts/serve_admin.py)
             return
@@ -736,6 +742,8 @@ class Handler(BaseHTTPRequestHandler):
         self.unread = 0
         try:
             body = json.loads(C.read_body(self, getattr(app, "max_body", C.MAX_BODY)))
+            if not A.take_place(self):  # --concurrency: a place once the body has come (scripts/serve_tiers.py)
+                return
             stops, odd = C.stops_of(body, fields)
             req = app.request(body)
         except Refused as e:

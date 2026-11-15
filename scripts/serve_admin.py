@@ -19,6 +19,9 @@
 # - --debug (a loopback host only): POST /debug/fault arms an injected fault, GET /debug/audit checks the books of the
 #   keys and values at idle (scripts/soak.py uses both).
 # Quotas and priorities (N2): scripts/serve_quota.py, through the hooks here (submit, ended, get, post, status_headers).
+# Tiers, concurrency and GET /v1/status (P1): scripts/serve_tiers.py, through the same hooks and posted(); and
+# --request-log-days: lines of the request log older than that are removed (checked at start and every hour).
+# Key issuance (P2, --keys-store): scripts/serve_keys.py, through the hooks here (options, start, install, get, post).
 import argparse
 import hmac
 import ipaddress
@@ -33,8 +36,10 @@ import time
 from datetime import datetime
 
 from scripts import serve_contract as C
+from scripts import serve_keys as KS
 from scripts import serve_net as N
 from scripts import serve_quota as Q
+from scripts import serve_tiers as T
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG = os.path.join(ROOT, "serve.toml")  # read when it is there (--config another; --config "" none)
@@ -253,16 +258,75 @@ def process_numbers() -> dict:
 
 # the request log and the status file
 
+PRUNE_S = 3600.0  # --request-log-days: how often the log's old lines are looked for
+
+
+def _when(line: bytes):
+    """A request log line's time (its "t", seconds since the epoch), None when it cannot be read."""
+    try:
+        return datetime.fromisoformat(json.loads(line)["t"]).timestamp()
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
 class RequestLog:
     """JSON lines, written by a thread of its own (the HTTP threads only queue a record); the file is rotated when it
-    would pass `most` bytes (path.1 ... path.<keep>)."""
+    would pass `most` bytes (path.1 ... path.<keep>). days > 0 (--request-log-days): at start and every PRUNE_S, the
+    lines older than that many days go from every one of those files (the writer's own thread does it, between
+    records): a file whose last write is older goes whole, a file that begins with older lines is written again from its
+    first newer one. A line whose time cannot be read counts as old."""
 
-    def __init__(self, path: str, most: int = 64 << 20, keep: int = 3):
-        self.path, self.most, self.keep = path, most, keep
+    def __init__(self, path: str, most: int = 64 << 20, keep: int = 3, days: float = 0.0, clock=time.time):
+        self.path, self.most, self.keep, self.days, self.clock = path, most, keep, float(days), clock
         self.q, self.written, self.failed = queue.SimpleQueue(), 0, 0
+        self.pruned, self.pruned_at = 0, None  # lines removed for their age; when last looked
+        self._f = None
         d = os.path.dirname(os.path.abspath(path))
         os.makedirs(d, exist_ok=True)
         threading.Thread(target=self._run, daemon=True, name="request-log").start()
+
+    def prune(self) -> int:
+        """(the writer's thread) Lines older than `days` days go -> how many."""
+        cutoff = self.clock() - self.days * 86400.0
+        self.pruned_at = self.clock()
+        if self._f is not None:  # the writer's file is closed while it is looked at (Windows: an open file is not replaced)
+            self._f.close()
+            self._f = None
+        gone = 0
+        for name in [self.path] + [f"{self.path}.{i}" for i in range(1, self.keep + 1)]:
+            try:
+                if not os.path.exists(name):
+                    continue
+                if os.path.getmtime(name) < cutoff:  # its newest line is older
+                    with open(name, "rb") as f:
+                        gone += sum(1 for _ in f)
+                    os.remove(name)
+                    continue
+                with open(name, "rb") as f:
+                    first = f.readline()
+                    t = _when(first) if first else cutoff
+                    if t is not None and t >= cutoff:
+                        continue
+                    old, keep = 1, None
+                    for line in f:
+                        t = _when(line)
+                        if t is not None and t >= cutoff:
+                            keep = line
+                            break
+                        old += 1
+                    with open(name + ".tmp", "wb") as g:
+                        if keep is not None:
+                            g.write(keep)
+                            for line in f:
+                                g.write(line)
+                os.replace(name + ".tmp", name)
+                gone += old
+            except OSError as e:  # another program holds it (Windows): next time
+                print(f"[serve] the request log's old lines could not be removed: {C.why(e)}", flush=True)
+        self.pruned += gone
+        if gone:
+            print(f"[serve] request log: {gone} lines older than {self.days:g} days removed", flush=True)
+        return gone
 
     def write(self, record: dict) -> None:
         self.q.put(record)
@@ -276,7 +340,20 @@ class RequestLog:
     def _run(self) -> None:
         f = None
         while True:
-            record = self.q.get()
+            if self.days > 0:  # --request-log-days: at start, then every PRUNE_S (an idle server too)
+                if self.pruned_at is None or self.clock() - self.pruned_at >= PRUNE_S:
+                    self._f = f
+                    try:
+                        self.prune()
+                    except Exception as e:  # noqa: BLE001  (the log never stops the server)
+                        print(f"[serve] the request log's old lines could not be removed: {C.why(e)}", flush=True)
+                    f = self._f = None
+                try:
+                    record = self.q.get(timeout=max(1.0, PRUNE_S - (self.clock() - self.pruned_at)))
+                except queue.Empty:
+                    continue
+            else:
+                record = self.q.get()
             try:
                 line = (json.dumps(record, ensure_ascii=False, default=str) + "\n").encode("utf-8")
                 if f is None:
@@ -318,11 +395,12 @@ class Entry:
 class Admin:
     def __init__(self, app, server, httpd=None, keys=(), max_waiting: int = 0, queue_timeout: float = 0.0, debug: bool = False,
                  request_log: str = "", request_log_mb: float = 64.0, status_file: str = "", status_every: float = 5.0, port: int = 0,
-                 host: str = "127.0.0.1", users=None):
+                 host: str = "127.0.0.1", users=None, request_log_days: float = 0.0):
         self.app, self.server, self.httpd = app, server, httpd
         self.keys, self.max_waiting, self.queue_timeout, self.debug = list(keys), max_waiting, queue_timeout, debug
         self.users = users if users is not None else N.Users(self.keys, name_of=key_name)  # who a request is (scripts/serve_net.py)
         self.quota = self.order = None  # --quotas, --priorities (scripts/serve_quota.py: install)
+        self.tiers = self.slots = self.status_api = None  # --tiers, --concurrency, --public-status (scripts/serve_tiers.py: install)
         self.host, self.port = host, port
         self.lock = threading.Lock()
         self.inflight = {}  # id(request) -> Entry
@@ -336,7 +414,7 @@ class Admin:
         self.faults = {"handler": 0, "engine": 0}  # armed by POST /debug/fault
         self.injected = {"handler": 0, "engine": 0}
         self.last_request = None
-        self.log = RequestLog(request_log, int(request_log_mb * 2**20)) if request_log else None
+        self.log = RequestLog(request_log, int(request_log_mb * 2**20), days=request_log_days) if request_log else None
         self.tile = {}
         eng = getattr(server, "eng", None)
         if hasattr(eng, "ring"):
@@ -438,6 +516,8 @@ class Admin:
                 self.inflight[id(req)] = entry
                 if self.quota is not None:
                     self.quota.taken(req)
+                if self.tiers is not None:  # --tiers: its prompt's size, for its address's behaviour
+                    self.tiers.taken(req)
                 self.server.submit(req)
                 refused = False
         if daily is not None:  # (scripts/serve_quota.py) OpenAI's 429 with Retry-After; the log keeps which limit
@@ -551,6 +631,8 @@ class Admin:
             record["tenant"] = req.tenant
         if self.order is not None:  # --priorities: its priority when it was last ordered (sclmd/order.py)
             record["priority"] = getattr(req, "priority", 0)
+        if self.tiers is not None:  # --tiers: the tier it was given
+            record["tier"] = getattr(req, "tier", None)
         if getattr(job, "seq", None) is not None:
             record["seq"] = job.seq
         s = self.server
@@ -707,6 +789,11 @@ class Admin:
         family("sclmd_injected_faults_total", "counter", "faults injected through /debug/fault", [({"kind": k}, v) for k, v in sorted(n["injected"].items())])
         if self.quota is not None:  # --quotas (scripts/serve_quota.py): counts only, never a tenant
             self.quota.families(family)
+        if self.tiers is not None:  # --tiers (scripts/serve_tiers.py): counts only
+            self.tiers.families(family)
+        if self.slots is not None:  # --concurrency
+            family("sclmd_concurrency_refused_total", "counter", "requests refused for their tenant's requests at once (429 concurrency_limit)",
+                   [({}, self.slots.refused)])
         if self.order is not None:  # --priorities (sclmd/order.py)
             o = self.order.n
             family("sclmd_order_total", "counter", "the order of service: requests placed, placed past the waiting list's head, placed while "
@@ -783,7 +870,7 @@ def _allowed(adm, handler, path: str) -> bool:
     """Whether the request may go on; else a 401 has been sent. Who it is (scripts/serve_net.py) goes on the handler
     first. Without keys (and without --anonymous) everything may."""
     w = handler._n1_who = adm.users.who(handler)
-    if path == "/health" or w.refusal is None:
+    if path == "/health" or w.refusal is None or (path == "/v1/status" and adm.status_api is not None):  # (--public-status: open)
         handler._r4_key = w.key
         return True
     with adm.lock:
@@ -826,6 +913,8 @@ def get(handler) -> bool:
     adm = _admin(handler)
     if adm is None:
         return False
+    if KS.answer(adm, handler):  # --keys-store: /keys/* needs no API key (scripts/serve_keys.py)
+        return True
     path = handler.path.split("?")[0].rstrip("/")
     if not _allowed(adm, handler, path):
         return True
@@ -840,7 +929,11 @@ def get(handler) -> bool:
         handler.wfile.write(data)
         return True
     if path == "/v1/usage" and adm.quota is not None:  # --quotas: the caller's own usage and limits (scripts/serve_quota.py)
-        handler._json(200, adm.quota.usage_of(N.who_of(handler).tenant))
+        w = N.who_of(handler)
+        handler._json(200, adm.quota.usage_of(w.tenant, Q.tier_now(adm, w)))
+        return True
+    if path == "/v1/status" and adm.status_api is not None:  # --public-status (scripts/serve_tiers.py)
+        handler._json(200, adm.status_api.body(handler))
         return True
     if path == "/debug/audit" and adm.debug and _local(handler):
         s = adm.server
@@ -872,8 +965,12 @@ def post(handler) -> bool:
     adm = _admin(handler)
     if adm is None:
         return False
+    if KS.answer(adm, handler):  # --keys-store: /keys/api/* (scripts/serve_keys.py)
+        return True
     path = handler.path.split("?")[0].rstrip("/")
     if not _allowed(adm, handler, path):
+        return True
+    if path == "/v1/chat/completions" and adm.slots is not None and T.refused_busy(adm, handler):  # --concurrency: its tenant's places taken
         return True
     if path == "/v1/chat/completions" and adm.quota is not None and Q.refused_early(adm, handler):  # --quotas: already at a daily limit
         return True
@@ -899,6 +996,19 @@ def post(handler) -> bool:
         handler._json(200, {"armed": dict(adm.faults)})
         return True
     return False
+
+
+def take_place(handler) -> bool:
+    """POST /v1/chat/completions once its body has come: --concurrency's place (False: a 429 has been sent)."""
+    adm = _admin(handler)
+    return adm is None or adm.slots is None or T.take_place(adm, handler)
+
+
+def posted(handler) -> None:
+    """do_POST is over, however it ended (its finally): --concurrency's place is given back."""
+    adm = _admin(handler)
+    if adm is not None and adm.slots is not None:
+        T.posted(adm, handler)
 
 
 def submit(handler, req, rid: str, stream: bool) -> bool:
@@ -1082,10 +1192,14 @@ def add_options(ap) -> None:
                    "serve.public.example.toml leaves it off: it would refuse over-quota requests that --priorities keeps waiting)")
     g.add_argument("--request-log", default="", help="a JSON line a request here, e.g. logs/serve_requests.jsonl (\"\": none, as before)")
     g.add_argument("--request-log-mb", type=float, default=64.0, help="the request log is rotated (.1, .2, .3) past this size")
+    g.add_argument("--request-log-days", type=float, default=0.0, help="lines of the request log (and of its .1, .2, .3) older than this many "
+                   "days are removed, at start and every hour (0: kept, as before; 30 in serve.public.example.toml)")
     g.add_argument("--status-file", default="", help="the server's state as JSON, rewritten every 5 s, e.g. logs/serve_status.json (\"\": none)")
     g.add_argument("--debug", action="store_true", help="POST /debug/fault and GET /debug/audit, for scripts/soak.py (a loopback --host only)")
     N.add_options(ap)  # who a request is and the limits (scripts/serve_net.py)
     Q.add_options(ap)  # quotas and priorities (scripts/serve_quota.py)
+    T.add_options(ap)  # tiers, concurrency, GET /v1/status (scripts/serve_tiers.py)
+    KS.add_options(ap)  # key issuance (scripts/serve_keys.py)
 
 
 def _defaults_from(ap, data: dict, path: str) -> dict:
@@ -1151,6 +1265,10 @@ def start(cli) -> list:
     keys = load_keys(cli)
     N.check(cli)
     Q.check(cli, keys)
+    T.check(cli)
+    if getattr(cli, "request_log_days", 0) < 0:
+        raise SystemExit("--request-log-days is 0 (keep) or more")
+    KS.check(cli, keys)  # --keys-store: the store's place, the OAuth client file, the origin
     if cli.debug and not loopback(cli.host):
         raise SystemExit("--debug serves its fault endpoint only on a loopback --host (127.0.0.1)")
     if not loopback(cli.host) and not keys:
@@ -1174,17 +1292,21 @@ def install(app, server, cli, httpd, keys: list) -> Admin:
     users = N.users_of(cli, keys, key_name)  # who a request is (scripts/serve_net.py): off without --anonymous and keys
     adm = Admin(app, server, httpd, keys, max_waiting=cli.max_waiting, queue_timeout=cli.queue_timeout, debug=cli.debug,
                 request_log=cli.request_log, request_log_mb=cli.request_log_mb, status_file=cli.status_file, port=cli.port, host=cli.host,
-                users=users)
+                users=users, request_log_days=getattr(cli, "request_log_days", 0.0))
     adm.time_engine()
     app.admin = adm
     N.apply(cli, app)
     on = [f"API keys: {', '.join(n for n, _ in keys)}" if keys else None, f"--max-waiting {cli.max_waiting}" if cli.max_waiting else None,
           f"--queue-timeout {cli.queue_timeout:g} s" if cli.queue_timeout else None, f"request log {cli.request_log}" if cli.request_log else None,
           f"status file {cli.status_file}" if cli.status_file else None, "--debug (fault and audit endpoints)" if cli.debug else None]
+    if cli.request_log and getattr(cli, "request_log_days", 0):
+        on.insert(on.index(f"request log {cli.request_log}") + 1, f"its lines kept {cli.request_log_days:g} days")
     on = [x for x in on if x]
     print("[serve] GET /metrics" + (f"; {'; '.join(on)}" if on else ""), flush=True)
     said = N.line(cli, users)
     if said:
         print(said, flush=True)
     Q.install(adm, server, cli)  # --quotas, --priorities (scripts/serve_quota.py; nothing without them)
+    T.install(adm, server, cli, app)  # --tiers, --concurrency, --public-status (scripts/serve_tiers.py; nothing without them)
+    KS.install(adm, cli)  # --keys-store: /keys/* and the store's keys (scripts/serve_keys.py; nothing without it)
     return adm

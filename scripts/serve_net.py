@@ -39,11 +39,12 @@ class Who:
     (loopback, no proxy); proxied: the address came from X-Forwarded-For; refusal: None, "unknown_key" (a key the
     server does not have) or "key_needed" (keys are set, no key given, and no --anonymous)."""
 
-    __slots__ = ("tenant", "key", "address", "local", "proxied", "refusal", "unsure")
+    __slots__ = ("tenant", "key", "address", "local", "proxied", "refusal", "unsure", "tier")
 
     def __init__(self, tenant=None, key=None, address=None, local=False, proxied=False, refusal=None):
         self.tenant, self.key, self.address, self.local, self.proxied, self.refusal = tenant, key, address, local, proxied, refusal
         self.unsure = False  # Users.who: a keyless address from a forwarded connection that is not a trusted proxy's
+        self.tier = None  # the tier its request was given (scripts/serve_tiers.py, --tiers; Users.tier_of)
 
     def __repr__(self) -> str:
         return f"Who(tenant={self.tenant!r}, key={self.key!r}, local={self.local}, proxied={self.proxied}, refusal={self.refusal!r})"
@@ -202,6 +203,10 @@ class Users:
     def priority_of(self, req, w: Who) -> int:
         return 0
 
+    def tier_of(self, req, w: Who):
+        """The request's tier (scripts/serve_tiers.py replaces it with --tiers): None, no tiers."""
+        return None
+
     def scope_of(self, req, w: Who):
         """The cache scope: the tenant (per_tenant), None (shared, tenancy off). An unsure keyless address (a forwarded
         connection from a proxy not in --trusted-proxies) gets a scope of its own request: nothing it saves is ever found
@@ -227,6 +232,7 @@ def tag(handler, req) -> None:
         return
     w = who_of(handler)
     req.tenant = w.tenant
+    req.tier = users.tier_of(req, w)  # (before its priority: the tier is part of its class)
     req.priority = users.priority_of(req, w)
     req.scope = users.scope_of(req, w)
 

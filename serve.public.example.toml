@@ -42,6 +42,15 @@ anonymous = true                 # a request without a key is served as its addr
 trusted-proxies = "192.168.0.10" # EDIT: the proxy PC's LAN address: its X-Forwarded-For alone is read
 metrics-local = true             # GET /metrics, and GET /'s counts, from this PC only
 
+# key issuance (scripts/serve_keys.py, design.md 6.20, 6.22): one Google check (openid only: no name or e-mail), then a
+# passkey; the key is shown once. The edge forwards /keys/google/start, /keys/callback/google and /keys/api/*; the
+# pages are its own. The store keeps the keys' SHA-256, HMACs of the Google accounts and the passkeys' public keys
+keys-store = "C:/Users/jolib/sclmd-keys/store.json"   # EDIT: OUTSIDE the repository (its HMAC secret is made beside it)
+oauth-file = "C:/Users/jolib/sclmd-oauth.json"        # Google's OAuth client ("web"): read at start, never printed
+public-origin = "https://ssalmuck-ai.duckdns.org"     # the keys page's Origin; passkeys for its host; Google returns to
+                                                      # /keys/callback/google (the redirect URI in Google's console)
+keys-per-ip-day = 3              # keys a Google check or a rotation issues to one address in 24 hours; past it 429
+
 # quotas and priorities (scripts/serve_quota.py, sclmd/order.py; design.md 6.18). 6.16's numbers are the defaults:
 # a key 500,000 tokens and 600 requests an hour, an address without a key 100,000 and 120, the day 24 times that, all
 # requests without a key 20,000,000 tokens a day (tph, rph, ip-tph, ip-rph, daily-times, keyless-day). A key's own:
@@ -52,6 +61,24 @@ priorities = true                # this PC, then in quota, then over quota 12 st
 # max-waiting and queue-timeout stay off: each refuses requests (429, 503), and 6.16 refuses only at the daily limit;
 # max-connections (256) bounds the requests that wait
 
+# tiers, limits and requests at once (scripts/serve_tiers.py, design.md 6.20, 6.21): 6.20's numbers. A request's tokens:
+# the prompt not cached + the reply x 5 + the cached prompt x 0.1. Requests an hour stay N2's (a key 600, an address 120).
+tiers = true                     # key; verified address (a Korean home or mobile ISP, behaving); unverified address
+ipdb = "C:/models/sclmd-ipdb"    # DB-IP Lite's country and ASN files (CC BY 4.0; a new month: design.md 6.21)
+output-weight = 5
+tph = 1250000                    # a key: an hour, a day
+tpd = 40000000
+verified-tph = 750000            # a verified address
+verified-tpd = 15000000
+ip-tph = 300000                  # an unverified address
+ip-tpd = 7500000
+concurrency = "1,3,8"            # a user's requests at once: priority, normal, low; the 13th: 429 concurrency_limit
+public-status = true             # GET /v1/status, open (the pages read it): never a threshold, never another user's anything
+# The behaviour conditions of a verified address (verify-rpm, verify-rph, verify-tph, verify-least, verify-most,
+# verify-outside, verify-spread, verify-window; -h): the code's defaults apply here. EDIT: the owner's own thresholds go
+# in serve.toml only (6.20: not on a public page; this file is pushed to the mirror).
+
 # what is written: metadata only (ZDR: no prompt or reply)
 request-log = "logs/serve_requests.jsonl"
+request-log-days = 30            # its lines older than 30 days are removed (6.20's privacy policy), at start and every hour
 status-file = "logs/serve_status.json"

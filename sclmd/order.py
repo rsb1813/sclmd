@@ -23,6 +23,16 @@
 #   can go on, the last of the worst level gives its memory up and starts over;
 # - make room (Server._make_room): the kept conversation of the worst class leaves the GPU first, then the one used
 #   longest ago.
+#
+# Tiers and the concurrency ladder (design.md 6.20, 6.21; scripts/serve_tiers.py: --tiers, --concurrency). Off (the
+# defaults: ladder None, tiers the one of N2) the numbers above are what they were. With a ladder, a tenant's requests
+# under way or waiting are not a step each but a band each: the first BANDS[0] of them +0 ("priority"), the next
+# +1 ("normal"), the next +2 ("low"), so its 13th is no worse than its 5th (the server refuses a 13th: 429). With
+# tiers, the class is the tier's base plus the over-quota gap: this PC 0; then the key's, the verified address's and
+# the unverified address's bases, each `tier_steps` above the one before. The first base is past every band of this
+# PC (3 with a ladder), so this PC's requests stay ahead of any key's; tier_steps is the gap plus the bands plus one
+# by default, so that an over-quota key in its low band is still ahead of an in-quota verified address: tier first,
+# then quota, then band. Aging stops at the first base for everyone but this PC (as N2: nobody waits for ever).
 import collections
 import time
 
@@ -32,27 +42,57 @@ GAP = 12  # steps from in quota to over quota (--over-quota-steps)
 AGE = 10.0  # seconds of waiting that make a request one step better (--priority-age)
 GUARD = 5.0  # seconds after which the waiting list's head is not passed by a request longer than it
 SCAN = 4  # requests past a refused one that the waiting list tries a turn
+TIERS = ("key", "ip_verified", "ip_unverified")  # best first (scripts/serve_tiers.py); None (no --tiers) is the first
+BANDS = (1, 3, 8)  # a tenant's requests at once: so many "priority", "normal", "low" (--concurrency); the next is refused
+BAND_STEPS = (0, 1, 2)  # what each band adds to the class
 
 
 def best_of(klass: int) -> int:
-    """The best level aging may give a request of this class: only this PC's are LOCAL."""
+    """The best level aging may give a request of this class: only this PC's are LOCAL (without tiers or a ladder;
+    Order.best_of in general)."""
     return LOCAL if klass == LOCAL else IN_QUOTA
 
 
 class Order:
-    """klass(req) -> the request's class now (LOCAL, IN_QUOTA or over); without it: this PC or in quota."""
+    """klass(req) -> the request's class now (LOCAL, IN_QUOTA or over); without it: this PC or in quota. ladder: the
+    concurrency bands' sizes (None: a step for each earlier request of the tenant, as N2). tier_steps: the steps from
+    one tier's base to the next (0: gap + the bands + 1)."""
 
-    def __init__(self, age: float = AGE, gap: int = GAP, klass=None, clock=time.perf_counter):
-        assert age > 0 and gap >= 0, (age, gap)
+    def __init__(self, age: float = AGE, gap: int = GAP, klass=None, clock=time.perf_counter, ladder=None, tier_steps: int = 0):
+        assert age > 0 and gap >= 0 and tier_steps >= 0, (age, gap, tier_steps)
         self.age, self.gap, self.clock = float(age), int(gap), clock
-        self.over = IN_QUOTA + self.gap
-        self.klass = klass or (lambda req: LOCAL if getattr(req, "local", False) else IN_QUOTA)
+        self.ladder = tuple(int(x) for x in ladder) if ladder else None
+        span = BAND_STEPS[len(self.ladder) - 1] if self.ladder else 0
+        self.first = IN_QUOTA + span  # the best class of a request that is not this PC's: past every band of this PC's
+        self.tier_steps = int(tier_steps) or self.gap + span + 1
+        self.over = self.first + self.gap
+        self.klass = klass or (lambda req: LOCAL if getattr(req, "local", False) else self.first)
         self.now = 0.0
         self.classes = {}  # sequence -> the class of the request last placed on it (make room: its kept conversation's)
         self.n = collections.Counter()
 
+    def class_of(self, tier, over: bool) -> int:
+        """A request's class that is not this PC's: its tier's base (None, no --tiers: the first), and the gap when it
+        came over its hour's quota."""
+        base = self.first + (TIERS.index(tier) * self.tier_steps if tier in TIERS else 0)
+        return base + (self.gap if over else 0)
+
+    def band(self, earlier: int) -> int:
+        """The steps a tenant's request gets for the `earlier` ones of its own under way or waiting before it."""
+        if self.ladder is None:
+            return earlier
+        top = 0
+        for i, size in enumerate(self.ladder):
+            top += size
+            if earlier < top:
+                return BAND_STEPS[i]
+        return BAND_STEPS[len(self.ladder) - 1]
+
+    def best_of(self, klass: int) -> int:
+        return LOCAL if klass == LOCAL else self.first
+
     def level(self, priority: int, since: float, klass: int) -> int:
-        return max(priority - int((self.now - since) // self.age), best_of(klass))
+        return max(priority - int((self.now - since) // self.age), self.best_of(klass))
 
     # ---- the waiting list (scripts/serve.py: Server.turn)
 
@@ -64,7 +104,7 @@ class Order:
         for r in sorted(server.active + server.waiting, key=lambda r: r.t_in):
             r.klass = k = self.klass(r)
             tenant = getattr(r, "tenant", None)
-            r.priority = k + (seen[tenant] if tenant is not None else 0)  # its tenant's second ... concurrent request: a step each
+            r.priority = k + (self.band(seen[tenant]) if tenant is not None else 0)  # its tenant's second ... concurrent request: a step (band) each
             if tenant is not None:
                 seen[tenant] += 1
             r.level = self.level(r.priority, r.t_in, k)
@@ -118,7 +158,7 @@ class Order:
 
     def to_park(self, server):
         """The kept conversation that leaves the GPU first: of the worst class, then the one used longest ago."""
-        return min(server.kept.values(), key=lambda k: (-self.classes.get(k.seq, IN_QUOTA), k.used))
+        return min(server.kept.values(), key=lambda k: (-self.classes.get(k.seq, self.first), k.used))
 
     # ---- the batcher (sclmd/batch.py)
 
@@ -130,7 +170,7 @@ class Order:
         for i, j in enumerate(batch.jobs):
             if j.t_arrival is None:
                 j.t_arrival = self.now
-                j.priority = j.klass = self.classes.get(j.seq, IN_QUOTA)
+                j.priority = j.klass = self.classes.get(j.seq, self.first)
             j.rank = i  # as they came (Batcher.jobs is in that order)
             j.level = self.level(j.priority, j.t_arrival, j.klass)
         return sorted(live, key=lambda j: (j.level, j.rank))
@@ -182,4 +222,7 @@ class Order:
         return max(reversed(holders), key=lambda j: j.level)
 
     def about(self) -> dict:
-        return {"age_s": self.age, "over_quota_steps": self.gap, **dict(self.n)}
+        out = {"age_s": self.age, "over_quota_steps": self.gap}
+        if self.ladder is not None:  # (only then: GET / of a server without it stays as it was)
+            out.update(bands=list(self.ladder), tier_steps=self.tier_steps)
+        return {**out, **dict(self.n)}

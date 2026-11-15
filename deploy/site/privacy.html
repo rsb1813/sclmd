@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>개인정보 처리방침 · ssalmuck-ai</title>
+<meta name="description" content="ssalmuck-ai 개인정보 처리방침: 항목, 목적, 보유 기간, 파기, 정보주체의 권리, 안전성 확보 조치, 문의처.">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/site.css">
+</head>
+<body>
+<header class="top">
+<div class="wrap">
+<a class="brand" href="/">ssalmuck-ai</a>
+<nav aria-label="주 메뉴">
+<ul class="nav">
+<li><a href="/">소개</a></li>
+<li><a href="/keys">키 발급</a></li>
+<li><a href="/guide">사용 안내</a></li>
+<li><a href="/trust">신뢰</a></li>
+</ul>
+</nav>
+</div>
+</header>
+
+<main id="main">
+<div class="wrap doc">
+<h1>개인정보 처리방침</h1>
+<p class="muted">시행일 2026년 11월 16일. 운영자가 직접 작성했으며 법률 검토를 받지 않았습니다.</p>
+<p>ssalmuck-ai(<code>https://ssalmuck-ai.duckdns.org</code>, 이하 "서비스")를 운영하는 개인(이하 "운영자")은 개인정보를 다음과 같이 처리합니다.</p>
+
+<h2 id="p1">1. 처리하는 항목</h2>
+<ul>
+<li>IP 주소. 요청 기록과 할당량 카운터에는 IPv6의 경우 앞의 /64만 남깁니다.</li>
+<li>요청 시각, 토큰 수, 응답 코드와 그 밖의 민감하지 않은 메타데이터: 걸린 시간, 종료 사유, 우선순위, 무시한 필드 이름, 오류 종류.</li>
+<li>키 이름과 발급한 키의 SHA-256 해시.</li>
+<li>구글 회원 식별번호의 HMAC. 식별번호 원문은 저장하지 않습니다.</li>
+<li>패스키의 공개키와 자격증명 ID.</li>
+<li>엣지 오류 기록: 엣지가 서버에 연결하지 못한 요청의 전체 IP 주소와 요청 경로. 머리글과 본문은 남지 않습니다. 엣지는 접근 기록을 남기지 않습니다.</li>
+</ul>
+<p>프롬프트와 답의 내용은 수집하지 않습니다. 구글에서는 이름, 이메일, 프로필을 받지 않습니다. 서버의 처리 방법은 <a href="/trust">신뢰</a> 페이지에 있습니다.</p>
+
+<h2 id="p2">2. 처리 목적</h2>
+<p>할당량 계산, 악용 방지, 장애 확인에만 씁니다.</p>
+
+<h2 id="p3">3. 보유 기간</h2>
+<div class="table">
+<table>
+<thead><tr><th scope="col">항목</th><th scope="col">기간</th></tr></thead>
+<tbody>
+<tr><td>요청 기록</td><td>30일</td></tr>
+<tr><td>할당량 카운터</td><td>24시간</td></tr>
+<tr><td>키 해시, 구글 회원 식별번호의 HMAC, 패스키</td><td>키를 회수할 때까지. 회수를 요청하면 바로 삭제</td></tr>
+<tr><td>키 페이지 세션(쿠키 <code>sclmd_keys</code>와 서버 메모리)</td><td>15분</td></tr>
+<tr><td>구글 확인 진행 정보(쿠키 <code>sclmd_flow</code>와 서버 메모리)</td><td>10분</td></tr>
+<tr><td>엣지 오류 기록</td><td>7일</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="p4">4. 파기</h2>
+<p>보유 기간이 지난 정보는 자동으로 지웁니다. 키를 회수하면 그 키의 해시, 구글 회원 식별번호의 HMAC, 패스키 기록을 지웁니다. 회수는 이용자가 키 페이지에서 하거나, 운영자에게 요청하거나, 약관 위반 시 운영자가 합니다. 전자 파일은 해당 줄이나 파일을 삭제해 파기하며, 출력물은 없습니다.</p>
+
+<h2 id="p5">5. 제3자 제공</h2>
+<p>제3자에게 제공하지 않습니다. 법령에 따른 요구가 있으면 그 법령을 따릅니다.</p>
+
+<h2 id="p6">6. 국외 이전</h2>
+<p>국외로 옮기지 않습니다. 서버는 대한민국에 있습니다. 키 발급의 확인 단계에서 이용자는 구글(Google LLC)에 직접 로그인하며, 그 과정에는 구글의 개인정보처리방침이 적용됩니다. 운영자는 구글에서 서명된 확인 결과만 받고, 검증한 뒤 회원 식별번호의 HMAC만 남깁니다.</p>
+
+<h2 id="p7">7. 처리 위탁</h2>
+<p>위탁하지 않습니다. 서버와 엣지는 운영자가 직접 운영합니다.</p>
+
+<h2 id="p8">8. 정보주체의 권리</h2>
+<p>이용자는 언제든 개인정보의 열람, 정정, 삭제, 처리정지를 요구할 수 있습니다. 키에 관한 정보는 <a href="/keys">키 발급</a> 페이지에서 패스키로 로그인해 확인하고 회수할 수 있습니다. 그 밖의 요구는 아래 연락처로 보내면 본인임을 확인할 수 있는 범위에서 지체 없이 처리하고 결과를 알립니다. IP 주소만 남은 기록은 본인 확인이 어려울 수 있습니다. 법정대리인이나 위임받은 사람을 통해서도 요구할 수 있습니다.</p>
+
+<h2 id="p9">9. 안전성 확보 조치</h2>
+<ul>
+<li>프롬프트와 답의 내용을 기록하지 않습니다.</li>
+<li>발급한 키는 SHA-256 해시로만, 구글 회원 식별번호는 HMAC으로만 저장합니다.</li>
+<li>인터넷 구간은 TLS로 암호화합니다. 서버의 포트는 엣지의 연결만 받습니다.</li>
+<li>1시간 디스크 캐시는 AES-GCM으로 암호화하고, 그 키는 서버 프로세스의 메모리에만 둡니다.</li>
+<li>키 저장소와 설정은 운영자만 접근할 수 있습니다.</li>
+<li>키 페이지는 Origin 확인, 전용 머리글, SameSite 쿠키로 다른 사이트의 요청을 막고 발급 횟수를 제한합니다.</li>
+</ul>
+
+<h2 id="p10">10. 쿠키</h2>
+<p>키 발급 페이지에서만 쿠키 두 개를 씁니다. 둘 다 무작위 값이며 HttpOnly, Secure, SameSite=Lax입니다.</p>
+<ul>
+<li><code>sclmd_flow</code>: 구글 확인을 시작한 브라우저를 확인합니다. 경로 <code>/keys/callback/google</code>, 10분.</li>
+<li><code>sclmd_keys</code>: 키 페이지의 세션입니다. 경로 <code>/keys</code>, 15분.</li>
+</ul>
+<p>분석, 광고, 추적용 쿠키는 쓰지 않습니다. 쿠키를 막으면 키 발급과 로그인은 할 수 없지만 API는 쓸 수 있습니다.</p>
+
+<h2 id="p11">11. 개인정보 보호책임자</h2>
+<p>운영자(개인), <a href="mailto:rsb2890.sasm@gmail.com">rsb2890.sasm@gmail.com</a>. 개인정보에 관한 문의, 불만, 피해 구제는 이 주소로 보냅니다.</p>
+
+<h2 id="p12">12. 권익침해 구제</h2>
+<p>다음 기관에 상담하거나 신고할 수 있습니다.</p>
+<ul>
+<li>개인정보분쟁조정위원회: 1833-6972, www.kopico.go.kr</li>
+<li>개인정보침해신고센터: 118, privacy.kisa.or.kr</li>
+<li>대검찰청: 1301, www.spo.go.kr</li>
+<li>경찰청: 182, ecrm.police.go.kr</li>
+</ul>
+
+<h2 id="changes">13. 변경</h2>
+<p>이 방침은 2026년 11월 16일부터 시행합니다. 바꿀 때는 시행 전에 이 사이트에 알리고 아래에 적습니다.</p>
+<ul>
+<li>2026-11-16: 처음 만듦.</li>
+</ul>
+</div>
+</main>
+
+<footer class="foot">
+<div class="wrap">
+<p><a href="/terms">이용약관</a> · <a href="/privacy" aria-current="page">개인정보 처리방침</a> · <a href="mailto:rsb2890.sasm@gmail.com">rsb2890.sasm@gmail.com</a></p>
+</div>
+</footer>
+</body>
+</html>

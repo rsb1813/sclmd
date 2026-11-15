@@ -1092,6 +1092,162 @@ R1 열은 마지막 코드로 잰 것이다(그 전 코드로 한 번 더: 80.3%
 
 **바로 하지 않는 것.** 채팅 페이지. 결제·가입.
 
+### 6.21 등급·한도·동시 요청 (P1) [CPU에서 잼, GPU 확인은 합칠 때]
+
+6.20의 "사용자와 등급", "한도", "우선순위"다. 새 모듈 `scripts/serve_tiers.py`(등급, 주소록, 동시 요청, `GET /v1/status`)와 `serve_quota.py`(등급의 한도, 출력 가중치, 하루 토큰)·`sclmd/order.py`(등급과 동시 요청의 단계)·`serve_admin.py`(훅, 요청 기록 30일)·`serve_net.py`(이음매 `tier_of` 하나)·`serve.py`(`do_POST`의 finally 한 줄)를 고쳤다. 엔진·배처·커널은 그대로다. 모두 선택지이고 **기본은 꺼져 있다**: 끄면 숫자(`O.LOCAL` 0, `O.IN_QUOTA` 1, 단계 +1씩)와 답이 6.18 그대로다(아래 "끄면 그대로"). 공개 설정이 켠다. 키 저장(P2)에는 손대지 않았다: 키가 있으면 어떤 키든 `key` 등급이다.
+
+**등급 (`--tiers`, `--quotas`와 `--ipdb`가 있어야 뜬다).** 요청이 올 때(프롬프트를 안 뒤, `serve_net.tag`) 한 번 정하고 그 요청이 끝날 때까지 간다(`req.tier`; 그 요청의 한도·머리글·우선순위가 이것을 본다).
+- `key`: 서버의 키. `local`: 이 PC(할당량 밖, 맨 앞).
+- `ip_verified`: 키가 없고, DB-IP Lite가 주소를 한국(KR)에 두고 그 ASN이 한국 가정용·모바일 ISP 목록(`KR_CONSUMER`)에 있으며, 행동 조건(아래)을 지킨 주소.
+- `ip_unverified`: 그 밖의 모든 주소. 해외, 한국의 클라우드·IDC·호스팅·기업·학교, 파일에 없는 주소, 사설 주소, `ip:unknown`, 믿지 않는 프록시를 거친 주소(`Who.unsure`: 여러 사용자를 대신하므로), 조건을 어긴 검증 주소. 조회가 실패해도 여기로 간다(검증으로 가는 일은 없음).
+- 주소는 N1이 읽은 것이다: `X-Forwarded-For`는 `--trusted-proxies`에서 온 연결의 것만, 오른쪽부터. 그래서 클라이언트가 머리글에 한국 주소를 써도 등급이 바뀌지 않는다(아래 잰 것). IPv6는 주소로 찾고, 사용자는 N1대로 /64다.
+
+**주소록 (`--ipdb C:/models/sclmd-ipdb`).** DB-IP Lite의 `dbip-country-lite-YYYY-MM.mmdb`와 `dbip-asn-lite-YYYY-MM.mmdb`(CC BY 4.0, 2026-11, 8.5MB·9.6MB). maxminddb 3.2.0의 C 확장으로 메모리 매핑해 읽는다(요청마다 밖에 묻지 않음). 폴더에서 이름으로 가장 새 달의 것을 시작할 때 고른다.
+- 갱신(월 1회): `https://download.db-ip.com/free/dbip-country-lite-YYYY-MM.mmdb.gz`와 `dbip-asn-lite-YYYY-MM.mmdb.gz`를 같은 폴더에 받아 풀고(gzip만, 실행하는 것은 없음) 서버를 다시 띄운다. 매핑된 파일은 Windows에서 덮어쓸 수 없으므로 새 이름으로 옆에 둔다. 옛 달은 다시 띄운 뒤 지운다. `--kr-consumer-asns`는 목록을 통째로 바꾼다.
+- CC BY 4.0이므로 공개 페이지에 출처 표기("IP Geolocation by DB-IP", https://db-ip.com)가 있어야 한다(P3).
+- `KR_CONSUMER` 71개 ASN: APNIC Labs의 AS별 사용자 추정(KR, 2026-11-13, 60일 창; `logs/exp/P1-tiers/apnic_kr_2026-11-13.json`)과 DB-IP ASN의 조직 이름으로 골랐다. KT(4766, IPv6 3559), LG U+(17858, 3786, 9316, 모바일 17853), SKT(모바일 9644), SK브로드밴드(9318, 그리고 이름이 SK브로드밴드로 바뀐 옛 케이블 ASN 18개), 케이블(LG헬로비전 16, 딜라이브, HCN 6, CMB 8, 독립 SO 12), 아파트·지역 ISP(새로넷, 드림라인). 뺀 것: 클라우드·CDN(Amazon 32만 명, Vultr, Cloudflare, Microsoft, Oracle, Tencent, Alibaba, NAVER Cloud, Kakao), IDC·호스팅(KINX, Hostcenter, BROADBANDIDC, SMILESERV, DAOU, Elimnet), 기업(삼성SDS, LG CNS, 현대오토에버), 학교·연구망(KISTI, 서울대, 교육청), 정부(NIRS, SKB-GOV, SKBMIL, NICNET), 크기에 비해 사용자가 적은 것(세종네트웍스 79만 주소에 7,230명, 신비로, abcle, SKT AS18302, SKTelink, PUBNETPLUS2).
+- 잰 것: APNIC이 한국에서 센 사용자 52,107,921명 중 50,625,009명(97.15%)이 이 ASN들에 있다. DB-IP에서 KR이고 ASN이 있는 IPv4 110,493,792개 중 95,615,584개(86.5%)가 검증 종류다. 실제 파일에서 KT 모바일 39.7.0.1·KT 가정 121.134.0.1·SKT 223.38.0.1·LG U+ 106.101.0.1·SKT IPv6 2001:2d8::1·KT IPv6 2001:e60::1은 검증 종류, AWS 서울 3.34.0.1·NAVER Cloud 110.93.150.1은 `kr_other`, 8.8.8.8은 해외, 사설·루프백은 모름이다(시험).
+- **한계.** KT·LG U+·SK브로드밴드의 ASN에는 그들 자신의 IDC와 기업 회선도 있다. DB-IP Lite에는 용도 구분이 없어 그 주소들도 검증 종류가 된다. 그것을 묶는 것은 행동 조건이다.
+
+**행동 조건 (검증 주소만; 문턱은 `serve.toml`에만 둔다(git 밖): 저장소의 코드와 이 문서에는 숫자가 없고, 코드의 기본은 모두 끔(0)).** 하나라도 어기면 그 요청은 `ip_unverified`다(한도와 우선순위 모두). 할당량처럼 이 요청 앞의 것으로 본다.
+- 요청 빈도: 지난 1분 칸과 그 앞 칸(N2의 1분 칸이라 60~120초)에 이미 `--verify-rpm`개.
+- 시간당: 지난 한 시간에 이미 `--verify-rph`개 또는 `--verify-tph` 토큰(할당량을 넘어 한참 더 쓴 주소).
+- 요청 크기의 범위: 마지막 `--verify-window`개(5개부터 봄) 프롬프트 중 `--verify-outside`보다 많은 몫이 `--verify-least`..`--verify-most` 토큰 밖.
+- 크기의 퍼짐(`--verify-spread`, 기본 끔): 마지막 프롬프트들의 90번째 백분위가 10번째의 그 배를 넘음. 6.20의 "일정한 범위"는 범위로도 퍼짐으로도 읽히므로 둘 다 두었다. 보통 대화(턴마다 프롬프트가 자람)는 퍼짐 조건에 몇 턴 만에 걸려서 기본은 끔이다. 조건별로 잰 강등 시점은 관리자의 값과 함께 git 밖에 둔다(`C:\Users\jolib\sclmd-tiers-notes.txt`).
+- 상태: 크기 기록은 검증될 수 있는 주소만, 주소당 정수 20개, 최근에 본 65,536개까지(넘으면 가장 오래 안 본 것부터 지움: 지워진 주소는 기록이 없어 크기 조건을 다시 처음부터 본다). 빈도·시간당은 N2의 카운터를 읽는다.
+
+**한도 (6.20의 표, 공개 설정).** 차감은 모든 등급이 같다: 캐시에서 안 온 입력 + 출력 × `--output-weight`(공개 5, 기본 1) + 캐시에서 읽은 입력 × 0.1. 가중치는 세 곳에 다 들어간다: 끝날 때의 정산(떠난 클라이언트의 것 포함), 하루 한도를 위해 잡아 두는 답(`max_tokens` × 5), 하루 한도 검사의 `Requested`. 시간당·하루는 키 125만·4,000만(`--tph`, `--tpd`), 검증 주소 75만·1,500만(`--verified-tph`, `--verified-tpd`), 미검증 주소 30만·750만(`--ip-tph`, `--ip-tpd`). 표의 하루/시간 비가 25·20·32라 `--daily-times` 대신 하루 토큰을 따로 두었다(없으면 전처럼 24배). RPH는 6.20대로 기본값(키 600, 주소 120, 검증 주소도 120; RPD는 그 24배). 시간당을 넘으면 받되 낮게(6.18), 하루를 넘으면 429와 Retry-After, 키 없는 요청 전체의 하루 2,000만(6.16)도 그대로다. 키 파일의 `tph=`·`tpd=` 등은 전처럼 키 등급 위에 얹힌다. `x-ratelimit-*`와 `GET /v1/usage`는 부른 사람의 등급의 한도를 쓰고, `/v1/usage`에 `tier`가 붙는다(키는 그대로라 P2의 `/keys/api/me`가 같은 모양을 쓴다).
+
+**우선순위 (`--priorities`와 함께; `sclmd/order.py`).** 숫자가 작을수록 앞이다. 등급과 할당량은 받을 때 정해지는 종류(`klass`), 동시 요청의 띠는 차례마다 다시 세는 단계다(종류에 넣으면 6.18이 잰 짐작 깊이 다툼(645 → 502 tok/s)이 되살아나므로 넣지 않았다).
+- 종류: 이 PC 0. 키 3, 검증 18, 미검증 33(`--tier-steps` 기본 = 넘음 간격 12 + 띠 2 + 1 = 15). 할당량을 넘으면 +12: 키 15, 검증 30, 미검증 45.
+- 띠(`--concurrency 1,3,8`): 한 사용자의 진행 중·대기 중 요청 가운데 첫 1개 +0(우선), 다음 3개 +1(보통), 다음 8개 +2(낮음). 띠가 없으면 6.18대로 앞의 요청마다 +1이다.
+- 그래서 순서는 6.20의 글자대로 등급 → 할당량 → 띠다: 낮음 띠의 이 PC(2) < 키(3), 넘은 키의 낮음(17) < 할당량 안의 검증(18), 넘은 검증의 낮음(32) < 미검증(33).
+- 기다림(6.18): 10초마다 한 단계, 이 PC가 아닌 요청은 3(키의 할당량 안)에서 멈춘다. 가장 나쁜 것(넘은 미검증의 낮음, 47)이 새로 온 키 요청과 같아지는 데 440초다 [계산: 44단계 × 10초]. 넘은 키는 120초, 할당량 안의 미검증은 300초.
+- CPU의 가짜 엔진(`tests/test_order.py`의 Fake, 시퀀스 하나)에서 미검증·검증·키·이 PC의 요청을 그 차례로 넣으니 자리는 이 PC → 키 → 검증 → 미검증 순으로 받았다(시험). 진짜 엔진의 통과·타일·짐작 순서는 재지 않았다(GPU가 공개 서버의 것): `logs/exp/P1-tiers/gpu_tiers.py`를 합칠 때 돌린다.
+
+**동시 요청 (`--concurrency P,N,L`).** P+N+L(12)개를 넘는 13번째는 몸통을 읽기 전에 429, OpenAI의 꼴(`code concurrency_limit`, `type requests`), `Retry-After: 2`(`retry-after-ms` 2000; 공식 openai 클라이언트는 120초 이하면 다시 시도한다, 6.14). 보낸 몸통은 읽어 버리고 닫는다(하루 한도의 거절과 같게). 자리는 머리글을 읽은 순간부터 그 `do_POST`가 끝날 때까지다: `serve.py`의 `do_POST`가 `try/finally`로 `A.posted`를 부르므로 400·413·몸통 중간에 떠난 클라이언트·`--queue-timeout`의 503·스트림 중간에 떠난 클라이언트·200 모두 자리를 돌려준다(시험). 그래서 20개를 한꺼번에 보내면 정확히 12개가 들어간다(시험). 이 PC는 제한하지 않는다(벤치마크가 16명을 보냄). 요청 기록에는 `finish: concurrency_limit`과 사용자만, `/metrics`에는 수만.
+
+**요청 기록 30일 (`--request-log-days 30`, 공개 설정).** 기록하는 스레드가 시작할 때와 한 시간마다(쉬는 서버도) 요청 기록과 그 `.1`·`.2`·`.3`에서 30일보다 오래된 줄을 지운다. 마지막으로 쓴 때가 30일 전인 파일은 통째로, 앞에 오래된 줄이 있는 파일은 처음 새 줄부터 다시 쓴다(줄은 시각 순). 시각을 읽을 수 없는 줄은 오래된 것으로 본다(늦게보다 일찍 지움). 그래서 줄은 길어야 30일 + 1시간 남는다. 6.20의 개인정보 처리방침("요청 기록 30일")이 이것을 약속한다.
+
+**`GET /v1/status` (`--public-status`, `--tiers`가 있어야).** 키 없이 열려 있다(`/health`처럼; 모르는 키도 401 대신 주소로 본 등급). 계약 그대로: `ok`(엔진이 살아 있음, `--crash-only`면 그 상태), `model`, `version`(시작할 때 `git rev-parse --short HEAD` 한 번), `uptime_s`, `queue`(진행 중, 대기), `zdr`(`prompt_logging` false, 캐시가 RAM 15분, 디스크 1시간, AES-GCM, 사용자 사이 공유 없음: 켜진 설정에서 읽음. 캐시가 꺼져 있으면 `cache_ram_minutes` null, `cache_disk_hours` 0, `disk_encryption` "none", `shared_between_users` true로 사실대로), `limits`(세 등급의 tph·tpd, `output_weight` 5, `cached_weight` 0.1, `concurrency` 1·3·8; 끄면 0·0·0), `caller.tier`. 행동 조건의 문턱, 다른 사용자의 주소·키 이름은 없다(시험이 숫자와 이름을 찾아봄). 디스크를 읽지 않고 잠금을 오래 쥐지 않는다.
+
+**잰 것 (CPU, `CUDA_VISIBLE_DEVICES=-1`; 스크립트 `logs/exp/P1-tiers/`).**
+- 받아들임에 더해지는 시간(`measure_lookup.py`, 2,000개 주소 × 5번, 가장 좋은 것 / 가운데): `AddressBook.kind` 한국 가정 IPv4 5.36 / 5.49 µs, 무작위 IPv4 5.12 / 5.22 µs, SKT IPv6 4.86 / 4.91 µs. `Tiers.decide`(주소 종류 + 행동, 크기 기록이 찬 주소들) 6.99 / 7.47, 5.63 / 5.68, 6.29 / 6.33 µs(`measure_lookup.log`). N1의 `Users.who`만 6.75 / 6.79 µs, 그것에 `decide`를 더하면 14.46 / 14.52 µs(+7.7 µs). POST 하나에 P1이 더하는 일 전부(몸통 전의 `tier_of`, `decide`, 자리 잡기·돌려주기, 크기 기록) 12.79 / 12.99 µs. 실제 파일을 스레드 8개가 한꺼번에 읽어도(24,000개 주소 × 3번씩) 한 스레드의 답과 다른 것 0. maxminddb를 순수 파이썬(`MODE_MEMORY`)으로 읽으면 조회 둘에 24.8 µs라 C 확장(같은 조회 3.3 µs)을 쓴다.
+- 가짜 엔진의 서버(`run_public.py`, `serve_canned`, 포트 8102·8103, N1·N2 선택지는 같고 P1 선택지만 다름, 4토큰 답, 300개씩 번갈아): p50 55.15 → 60.26 ms, p10 42.41 → 42.43, p90 64.82 → 65.01. 차이는 Windows 타이머의 잡음 크기다(가짜 답이 10 ms씩 잠). 더해진 것은 위의 µs다.
+- 머리글로 등급을 고를 수 없음(같은 서버, 믿는 프록시 127.0.0.1): `X-Forwarded-For` `121.134.0.1` → 검증(`x-ratelimit-limit-tokens` 750000), `8.8.8.8` → 미검증(300000), `121.134.0.1, 8.8.8.8`(클라이언트가 왼쪽에 한국 주소를 씀) → 미검증, `8.8.8.8, 121.134.0.1` → 검증(프록시가 본 것이 오른쪽), AWS 서울 `3.34.0.1` → 미검증. `/v1/status`의 `caller.tier`도 같다.
+- 끄면 그대로: 5c35fb9의 깨끗한 클론과 이 클론을 옵션 없이 가짜 엔진으로 띄워 R4-land의 `ab_wire.py` 165개: 164개가 바이트 단위로 같고 남은 하나는 `GET /metrics`, 숫자를 빼면 103줄이 같다. `test_quota`·`test_serve_net`·`test_order`·`test_serve_admin`·`test_serve_http`를 고치지 않고 통과(115개 통과, 3개 건너뜀: GPU 둘, openai 패키지 하나).
+- ZDR(`zdr_check`, 가짜 엔진, N1·N2·P1 선택지 모두와 `--debug`, 키, 프록시, 요청 기록·상태 파일·카운터 파일·콘솔): 54개 요청(200 32, 400 17, 401 3, 404 2, 500 1, 501 1), 파일 4개와 `/metrics`에서 0건. 새로 쓰는 것은 요청 기록의 `tier`와 `finish: concurrency_limit`, 콘솔의 시작 줄(문턱의 값은 찍지 않고 몇 개가 켜졌는지만)뿐이다.
+
+**시험 (`tests/test_tiers.py` 21개, GPU 없이).** 등급(키, 이 PC, 검증, IPv6의 /64, 클라우드·해외·사설·주소 아님, tenancy 끔), 클라이언트가 쓴 `X-Forwarded-For`(믿는 프록시의 왼쪽, 믿지 않는 연결, 믿지 않는 프록시의 한국 주소), 실제 DB-IP 파일(있을 때), 새 달의 파일, 행동(빈도, 시간당 요청·토큰, 범위, 퍼짐과 자라는 대화), 크기 기록의 상한, 등급의 한도와 × 5(정산, 떠난 클라이언트, 잡아 둠, 하루 검사, 검증 1,500만 / 미검증 750만), 옵션 없이 N2의 숫자, 종류의 차례(등급 → 할당량 → 띠, 기다림의 멈춤, N2 숫자), 가짜 엔진의 대기열 순서, HTTP의 등급·머리글·우선순위·기록·`/metrics`, 20개 중 12개와 몸통 전의 13번째, 모든 끝에서 자리 돌려주기, `/v1/status`의 모양과 비밀 없음, 캐시 설정에 따른 `zdr`(켬·디스크 없음·끔), 옵션 없이 404, 선택지 검사, 30일(시작할 때, 한 시간 뒤, `.1`·`.2`), 옵션 없이 기록 그대로, 공개 예시. 일부러 고친 코드 7가지(정산의 × 5 없음, 잡아 둠의 × 5 없음, 13번째를 받음, 자리를 안 돌려줌, 띠 없음, 믿지 않는 프록시를 검증, 오래된 줄을 안 지움)를 모두 잡는다.
+
+**재지 않은 것·주의.**
+- 진짜 엔진에서 등급의 순서(통과의 행, 짐작 깊이, 타일, 자리 만들기)와 같은 토큰은 재지 않았다. 합칠 때 `sh scripts/gpu.sh P1-tiers <venv python> logs/exp/P1-tiers/gpu_tiers.py <tree> order|ladder|mixed|same`(클론의 엔진 빌드가 있어야 함; 포트 8104; 캐시 폴더는 그 실행의 것: `C:\models\sclmd-cache`는 시작할 때 지워지므로 절대 쓰지 않음). `mixed`는 세 등급 16명의 전체 tok/s를 켜고 끄고 잰다: 등급이 종류에 들어가므로 키의 쓰는 대화가 짐작 깊이를 먼저 다 가진다(6.18이 한 사용자 안에서 본 645 → 502 tok/s의 다툼이 등급 사이에서 생길 수 있음). 이 스크립트의 흐름(요청, 12개와 429 하나, 결과 줄)은 `P1_SMOKE=1`로 가짜 엔진에서 돌려 보았다(시간은 의미 없음).
+- 검증은 ASN 단위라 큰 통신사의 IDC 주소도 검증 종류다(위). 한국의 VPN·프록시 서비스가 가정용 회선에 있으면 그것도 그렇다.
+- 동시 요청 자리는 사용자마다다. 믿지 않는 프록시 하나 뒤의 사용자들(`unsure`)은 자리 12개를 함께 쓴다(N1의 콘솔 한 줄이 그 설정 오류를 알린다).
+- 키 없는 요청 전체의 하루 2,000만(6.16)은 검증 주소 둘의 하루(1,500만씩)보다 작다. 6.20이 그대로 두라 했으므로 두었다.
+- 요청 기록의 지우기는 한 시간마다라 30일을 한 시간까지 넘을 수 있다. 다른 프로그램이 파일을 쥐고 있으면 다음 시간으로 미룬다(콘솔에 형식 이름).
+- 행동 조건의 기본값은 내가 고른 것이고 실제 사용으로 재지 않았다. 등급이 머리글(`x-ratelimit-limit-tokens`)과 `/v1/status`에 보이므로 문턱은 두드려 보면 알아낼 수 있다(숨기는 것은 값을 적지 않는 것뿐).
+- **강등과 하루 한도.** 강등된 요청은 미검증의 한도를 받는다. 오늘 이미 750만 토큰 넘게 쓴 검증 주소가 빈도 조건을 한 번 어기면 그 요청은 하루 한도(750만)에 걸려 429, Retry-After는 몇 시간이다. 강등은 1~2분이면 풀리는데 거절은 길다. 6.20의 글자대로(강등 = 미검증) 두었다.
+
+**관리자가 정할 것.** 행동 조건의 문턱(`serve.toml`에; 지금은 코드의 기본값; 기본 빈도 30은 2초에 한 걸음인 에이전트 루프를 1분에 강등함), 강등된 검증 주소에 하루 한도까지 미검증의 것을 줄지(지금 줌: 위), 퍼짐 조건을 켤지(보통 대화를 강등함: 위), 등급 사이 간격(15단계: 넘은 키가 할당량 안의 검증보다 앞, 6.20의 글자대로 읽음; "크게 내려간다"를 등급보다 앞세우려면 `--tier-steps`를 12보다 작게), 띠의 단계(+0/+1/+2), 기다림의 상한(넘은 미검증의 낮음 440초), 이 PC를 동시 요청 한도에서 뺀 것, 검증 주소의 RPH(지금 주소와 같은 120: 75만 토큰을 쓰려면 요청당 평균 6,250토큰), `/v1/status`가 모르는 키를 401 대신 주소로 답하는 것, `KR_CONSUMER`에서 뺀 세종네트웍스·신비로 등.
+**합치며 고친 것 (verify-P1-tiers).**
+- 통신사 ASN 안의 IDC·클라우드·호스팅(KT Cloud, Cafe24 등은 AS4766)이 검증으로 나왔다: DB-IP Lite에는 용도가 없다. `--unverified-prefixes`(한 줄에 CIDR 하나)의 대역은 검증하지 않는다. 목록은 git 밖(`C:\models\sclmd-ipdb\idc-prefixes.txt`)에 두고, 검증이 찾은 대역으로 시작했다. 빠짐없는 목록은 아니다.
+- 동시 요청의 자리를 몸통을 읽기 전에 잡아서, 머리글만 보내고 몸통을 천천히 보내는 연결 12개가 한 주소의 자리를 다 쥘 수 있었다(한국 모바일은 여럿이 한 주소를 쓴다). 이제 몸통을 읽기 전에는 다 찼는지만 보고(다 찼으면 바로 429), 자리는 몸통이 다 온 뒤에 잡는다.
+- `::a.b.c.d`(IPv4 호환 IPv6)를 검증했다: 이제 모르는 주소다.
+- 행동 조건의 문턱이 저장소에 있었다: 코드의 기본은 끔이고 숫자는 `serve.toml`에만 둔다.
+
+### 6.22 키 발급: 구글 1회 확인 + 패스키 (P2) [실측(CPU, 가짜 구글), 진짜 구글은 관리자가 한 번 손으로]
+
+6.20의 키 발급이다. 새 모듈 `scripts/serve_keys.py`, 시험 `tests/test_serve_keys.py`, `serve_admin.py`에 이음매 몇 줄(선택지, 시작 검사, 설치, GET·POST 훅), `serve.public.example.toml`에 선택지 넷. `serve_net.py`·`serve_quota.py`·`order.py`는 손대지 않았다. **기본은 꺼져 있다**: `--keys-store`가 없으면 `/keys/*`는 오늘처럼 모르는 경로의 404다. 패키지는 더하지 않았다(WebAuthn 검증은 있던 `cryptography`로 직접 씀).
+
+**흐름.**
+- `GET /keys/google/start`: 구글로 302. 인가 코드 + PKCE(S256), 범위 `openid` 하나(이름·이메일·프로필을 받지 않음), `prompt=select_account`. `state`·`nonce`·검증자는 서버 메모리에 10분. 그 `state`를 이 브라우저에 묶는 짧은 쿠키 `sclmd_flow`(HttpOnly, Secure, SameSite=Lax, Path=/keys/callback/google, 10분)도 준다. 없으면 남이 제 구글 계정의 콜백 주소를 피해자에게 열게 해서 피해자가 남의 계정에 패스키를 등록하게 할 수 있다(로그인 CSRF).
+- `GET /keys/callback/google?code&state`: `state`는 한 번만 쓴다(틀린 쿠키로 와도 지워짐). 코드를 구글의 토큰 끝점에서 바꾸고, id_token을 검사한다: RS256만, 구글 JWKS의 키(답의 `max-age`만큼 캐시, 5분~하루; 모르는 `kid`는 1분에 한 번만 다시 받음), `iss`(`https://accounts.google.com` 또는 `accounts.google.com`), `aud` = 클라이언트 ID(목록이면 `azp`도), `exp`(60초 여유), `iat`이 5분 넘게 미래가 아님, `nonce`. 그다음 세션 쿠키 `sclmd_keys`(불투명한 난수, HttpOnly, Secure, SameSite=Lax, Path=/keys, 15분; 세션은 계정의 HMAC만 들고 있음)와 302 `/keys#verified`. 실패는 `/keys#error=<코드>`(고정된 목록: denied, expired, browser, google, token, rate_limited, busy, bad_request, server). 리다이렉트는 언제나 `--public-origin` + 고정 경로다(열린 리다이렉트 없음).
+- `POST /keys/api/*`(전부 `X-Requested-With: sclmd`와 `Origin` = `--public-origin`, `Content-Type: application/json`, 몸통 64KiB까지, 오류는 OpenAI 꼴 `{"error": {"message", "type", "param", "code"}}`): `passkey/register/options`(구글로 확인한 세션만: 생성 옵션, base64url, rp id, `residentKey: required`, `userVerification: preferred`, `attestation: none`, 알고리즘 ES256·EdDSA·RS256) → `passkey/register/verify` `{"credential": <PublicKeyCredential JSON>}` → `{"key", "name", "replaced"}`(키는 이때 한 번만 보임). `passkey/login/options`(발견 가능한 자격증명: `allowCredentials` 빈 목록) → `passkey/login/verify` → `{"ok": true}`와 세션. `me` → `{"name", "created", "tier": "key", "usage"}`(`usage`는 `GET /v1/usage`와 같은 것, `--quotas`가 꺼지면 null). `rotate` → `{"key"}`(옛 키 회수). `revoke` → `{"revoked": true}`(키, 패스키, 계정의 HMAC을 지우고 그 계정의 세션을 모두 끝냄). `logout` → `{"ok": true}`. 옵션 JSON은 브라우저의 `PublicKeyCredential.parseCreationOptionsFromJSON`·`parseRequestOptionsFromJSON`에 그대로 넣는 꼴이다.
+
+**WebAuthn 검사 (직접 씀).** 등록: `clientDataJSON`의 `type`(`webauthn.create`), 챌린지(세션의 것, 한 번만, 5분), `origin`(정확히 `--public-origin`), `crossOrigin`·`topOrigin`; 증명 객체의 CBOR(정해진 길이만, 깊이 16, 한 층 1,024개, 끝에 남는 바이트 없음); authenticatorData의 rp id 해시, UP 플래그, BS는 BE와 함께만, 자격증명 ID(16~1,023바이트, `rawId`와 같음), COSE 공개키(P-256 위의 점, Ed25519, 2,048비트 이상 RSA). 증명문(attStmt)은 검사하지 않는다: `attestation: none`을 청하므로 기기의 제조를 믿을 일이 없고, 브라우저가 대개 `none`으로 바꿔 준다. 로그인: 같은 것에 더해 챌린지는 서버가 준 것을 한 번만(검사 전에 지움), 자격증명 ID로 계정을 찾고, `userHandle`이 그 계정의 것, 서명(authenticatorData ‖ SHA-256(clientDataJSON)), 서명 횟수(둘 중 하나라도 0이 아니면 늘어야 함; 동기화되는 패스키는 늘 0이라 0 → 0은 받음). UV는 요구하지 않는다(preferred).
+
+**키와 저장소.**
+- 키: `sk-` + 난수 32바이트의 base64url(46자). 저장은 SHA-256만. 서버의 키 검사(`serve_admin.key_name`을 거쳐 N1의 `who()`)는 파일의 키를 상수 시간으로 본 뒤, 없으면 저장소에서 SHA-256으로 찾고 상수 시간으로 한 번 더 견준다: 다시 띄우지 않아도 새 키가 바로 되고, 회수한 키는 바로 401이다. 한 번에 0.8µs(맞는 키)·0.6µs(아닌 키), 2만 번의 평균.
+- 키의 이름(사용자 이름) `key:g-<12자>`: 계정 HMAC과 다른 라벨의 HMAC에서 만든다(저장소의 계정 ID가 요청 기록·할당량 파일에 나오지 않게). 같은 구글 계정이면 언제나 같은 이름이라, 재발급·다시 확인으로 하루 할당량을 새로 받을 수 없다. 할당량은 키 등급의 것(`serve_quota.limits_of`가 모르는 키 이름에 키의 기본값을 줌).
+- 계정당 활성 키 하나: 같은 구글 계정으로 다시 확인하고 패스키를 등록하면 옛 키를 회수하고(`replaced: true`), **옛 패스키도 새것으로 바꾼다**(잃어버린 기기의 패스키로 키를 회수·재발급하지 못하게). WebAuthn의 `user.id`는 계정에서 만든 HMAC이라 같은 기기에서 다시 등록하면 기기가 옛 패스키를 덮어쓴다. 패스키로 로그인한 세션은 패스키를 더 등록할 수 없다(구글 확인이 먼저).
+- 주소당 하루 3개(`--keys-per-ip-day`, 지난 24시간; 등록과 재발급이 하나씩 셈; IPv4는 주소, IPv6는 /64, `X-Forwarded-For`는 N1대로 믿는 프록시에서만): 넘으면 429 `rate_limit_exceeded`와 Retry-After. 시작에서도 미리 막는다(`#error=rate_limited`). 저장소에 (주소의 HMAC, 시각)으로 24시간 남아 다시 띄워도 이어진다. 그 밖에 `/keys/*` 전체에 주소당 1분 30개.
+- 저장소(`--keys-store`, git 밖; 저장소 폴더 안이면 뜨지 않음): JSON 하나. 계정 ID = HMAC(비밀, `"google:" + sub`), 키 이름, 키의 SHA-256과 만든 시각, 패스키(자격증명 ID, COSE 공개키, 알고리즘, 서명 횟수). 비밀(32바이트)은 처음 한 번 저장소 옆 `<저장소>.secret`에 만든다. 쓸 때마다 새 파일에 쓰고 fsync한 뒤 `os.replace`로 바꾼다(죽어도 옛것이나 새것이지 반쪽이 아님; 쓰기가 실패하면 메모리도 그대로). 두 파일 모두 `icacls`로 상속을 끊고 이 사용자만 남긴다(시험이 `icacls`의 출력에서 항목이 이 사용자 하나뿐임을 봄). 쓰기 한 번 중앙값 6.8ms, 가장 길게 16.6ms(icacls 6.7ms 포함, 20번). 읽을 수 없는 저장소는 손대지 않고 뜨지 않는다.
+- OAuth 클라이언트(`--oauth-file`, 구글이 내려 주는 JSON의 `web`(또는 `installed`)): 시작할 때 읽어 메모리에만 둔다. 오류는 파일 이름과 필드 이름만 말한다. `auth_uri`·`token_uri`·`--oauth-jwks`는 https만(이 PC의 http는 시험용으로 허용).
+- 메모리: 진행 중인 구글 확인·세션·로그인 챌린지 각 4,096개까지. 확인과 챌린지는 차면 거절(503 `busy`, `#error=busy`: 메모리가 늘지 않음), 세션은 가장 오래된 것을 밀어냄, 계정당 세션 4개. 1분 카운터는 주소 65,536개까지.
+
+**ZDR.** 콘솔·요청 기록·상태 파일·할당량 파일·저장소 어디에도 키, id_token, 인가 코드, `state`, `sub`, 클라이언트 비밀, 세션 ID가 없다(시험의 카나리: 흐름 전체에 재발급, 틀린 서명, 틀린 nonce, 가짜 콜백, 구글이 거절한 코드, JWKS를 못 받음(실패 줄 둘이 실제로 찍힘)을 더하고, 콘솔·`/metrics`·폴더의 모든 파일(요청 기록, 상태 파일, 할당량 파일, 저장소와 그 비밀)을 찾음: 0건). 자격증명 ID는 저장소에만 있다. 실패는 형식 이름만 찍는다(`the code's exchange with Google failed (HTTPError)`). 요청 기록의 거절 줄은 코드만(`no_session`, `invalid_credential`)이고 경로는 `other`다. `/keys` 응답은 모두 `Cache-Control: no-store`, `Referrer-Policy: no-referrer`.
+
+**잰 것 (GPU 없이; 구글은 이 PC의 가짜).**
+- `tests/test_serve_keys.py` 17개 통과(30초, CPU): ES256·RS256·EdDSA 소프트웨어 인증기로 흐름 전체(구글 확인 → 등록 → 채팅 200, `req.tenant == key:g-…` → 로그아웃 → 패스키 로그인(구글을 다시 안 거침) → 재발급: 옛 키 바로 401·새 키 200·같은 이름 → 회수: 키 401, 패스키 로그인 400, 저장소 빈 것), 두 번째 구글 확인(옛 키·패스키 회수), 다시 띄운 뒤의 저장소, 등록의 거절(남의 origin, 남의 rp id, UP 없음, 틀린 챌린지, 같은 등록 다시), 로그인의 거절(다시 보냄, 바꾼 서명, origin, rp id, 줄어든 서명 횟수, 남의 userHandle, UP 없음, 모르는 패스키), CSRF(Origin 없음·틀림, X-Requested-With 없음·틀림, text/plain, GET, 64KiB 넘는 몸통), id_token의 거절(nonce, aud, iss, exp, sub 없음, `azp` 틀림, 남의 키, `alg: none`, 모르는 `kid`), state를 다른 브라우저에서·다시, 주소당 하루 3개(IPv6 /64 포함, 다시 띄워도), 메모리 상한, 카나리, 옵션 없이 404, 시작 검사, 공개 설정, 저장소의 원자적 쓰기와 권한, 쓰레기 CBOR 3,000개(예외 없이 거절). 이웃 시험 `test_serve_net.py`·`test_serve_admin.py`·`test_quota.py`·`test_serve_cache.py` 87개 통과·1개 건너뜀.
+- `serve_canned`(진짜 토크나이저, 포트 8112)를 `--keys-store`로 띄워: 저장소 키 200, 파일 키 200, 모르는 키 401, 키 없음 200(`--anonymous`), `login/options` 200, `google/start` 302(구글 주소; 따라가지 않음). 요청 기록의 사용자 `key:g-8408e3e864f8`, 콘솔·기록에 키와 비밀 없음.
+- 진짜 브라우저(Playwright의 Chromium, CDP 가상 인증기: CTAP2, 내장, 상주 키, UV): 엣지를 흉내 낸 프록시(8113, `localhost`, `X-Forwarded-For`를 붙임)가 시험 페이지를 주고 `/keys/*`·`/v1/*`를 넘긴다. 가짜 구글의 `/auth`가 바로 동의하고 돌려보냄. `/keys#verified`, 쿠키(HttpOnly, Secure, SameSite=Lax, Path=/keys), 표준 `parseCreationOptionsFromJSON`·`toJSON()`으로 등록 200(키 46자), `me` 200, 그 키로 채팅 200, 로그아웃 뒤 `me` 401, 패스키 로그인 200(표준 꼴과 손으로 만든 꼴 둘 다), 재발급 200, 옛 키 401, 인증기의 서명 횟수 3(늘어나는 횟수도 받음), 회수 200, 그 뒤 로그인 400.
+
+**안 한 것·주의.**
+- **진짜 구글과는 한 번도 말하지 않았다**(지시: 실제 클라이언트 파일을 열지도, 구글을 부르지도 않음). 관리자가 브라우저로 한 번 확인한다(아래).
+- 증명문(attestation)은 검사하지 않는다(위). 패스키를 만든 기기의 종류는 가리지 않는다.
+- 브라우저가 아닌 프로그램은 패스키 없이 키를 받을 수 없다(구글 확인과 WebAuthn이 브라우저의 일). 캡챠는 없다: 6.20의 "캡챠를 거쳐"는 구글 확인이 대신한다(관리자 결정 2026-11-15 밤).
+- 세션·확인·챌린지는 메모리에만 있어 다시 띄우면 로그인이 풀린다(키와 패스키는 저장소에 남음).
+- 한 주소에서 키를 받은 사람이 많으면(회사·학교의 NAT, 이동통신사의 CGNAT) 하루 3개가 일찍 찬다.
+- 카카오: 제공자는 `Google` 클래스 하나이고 계정 ID의 라벨(`google:`)이 제공자의 이름이라, 다른 제공자를 같은 꼴로 더할 수 있게 두었다(만들지는 않음).
+
+**관리자가 정할 것.** 구글 콘솔: 승인된 리디렉션 URI에 `https://ssalmuck-ai.duckdns.org/keys/callback/google`, OAuth 동의 화면은 범위 `openid`만 두고 "프로덕션"으로(시험 중 상태면 등록한 시험 사용자만 됨). 다시 확인할 때 옛 패스키를 지우는 것(지금 지움: 기기를 둘 쓰면 마지막 것만 남음). 주소당 하루 3개와 1분 30개. 저장소의 자리(`serve.public.example.toml`의 `C:/Users/jolib/sclmd-keys/store.json`).
+**합치며 고친 것 (verify-P2-keys).**
+- 다시 구글로 확인해 새 패스키를 등록하면 옛 패스키는 지웠지만, 옛 기기의 로그인 세션은 15분까지 남아 키를 재발급·회수할 수 있었다(잼). 이제 바뀌는 순간 그 계정의 다른 세션을 모두 끝낸다.
+- 진행 중인 구글 확인과 로그인 도전의 표가 4,096개에서 새 사람을 거절해서, 137개 주소로 1초 만에 채우면 10분·5분 동안 모두가 발급·로그인을 못 했다(잼). 이제 주소(IPv4, IPv6는 /48)마다 4개까지이고, 표가 차면 가장 많이 쥔 주소의 가장 오래된 것을 밀어낸다(새 사람은 거절하지 않음). 분당 제한도 /48로 세고, 셀 주소가 65,536개를 넘으면 새 주소를 거절하는 대신 세지 않고 받는다.
+- 키 저장소는 있는데 그 비밀 파일이 없으면 새 비밀을 조용히 만들어 같은 구글 계정이 두 번째 계정이 됐다: 이제 뜨지 않고 비밀을 되살리라고 한다.
+- 그대로 둔 것: 저장소 쓰기가 잠금 안에서 전체를 다시 쓴다(1만 계정에서 요청이 최대 0.1초 기다림, 지금 규모에서는 문제 없음). 서명 횟수 확인과 갱신이 한 단계가 아니다(복제된 인증기의 동시 로그인).
+
+### 6.23 공개 페이지와 엣지 (P3) [실측(가짜 엣지·가짜 API·Chromium), 만듦]
+
+6.20의 페이지다. 새 파일만 있다: `deploy/site/`(정적 페이지 여섯과 404, `assets/site.css`·`site.js`·`keys.js`·`favicon.svg`), `deploy/Caddyfile.edge`(엣지의 파일), `scripts/site_check.py`(가짜 엣지와 가짜 API, 검사), `tests/test_site.py`, `tests/site_keys_check.js`. 서버 코드는 건드리지 않았다. 그래서 새 선택지도 없고 서버는 master 그대로다. 페이지는 P1(`GET /v1/status`, 등급)과 P2(`/keys/*`)가 합쳐진 상태를 그리며 적었고, 둘은 계약(이 작업의 지시서)에 맞춘 가짜 API로 시험했다.
+
+**페이지 (한국어, 97KB 전부).** `/` 소개, `/keys` 발급·관리, `/guide` 사용 안내, `/trust` 신뢰, `/terms` 이용약관, `/privacy` 개인정보 처리방침. HTML과 CSS 하나(6.9KB), 스크립트 둘(`site.js` 7.7KB: 상태와 한도표·복사 단추, `keys.js` 23.6KB: 키 페이지)이다. 다른 출처에서는 아무것도 부르지 않는다(글꼴은 시스템 글꼴, 분석 도구 없음). 페이지 안의 `<script>`, `style=`, `on*=`도 없다: CSP가 `'self'`만 허락한다. 스크립트 없이도 `/keys` 말고는 다 읽힌다(한도표는 6.20의 숫자가 먼저 적혀 있고, `GET /v1/status`가 오면 서버의 값과 부른 사람의 등급으로 바뀐다). 다크 모드(Chromium에서 `prefers-color-scheme: dark`로 그려 봄)와 360px 폭을 맞췄다.
+- `/guide`: curl, 파이썬 openai(키 없이 쓰는 빈 `Authorization` 포함, 6.17), Node.js fetch와 openai 패키지, 스트림과 `: ping`, 생각 켜기, 등급표(6.20, 행동 조건의 문턱과 ASN 목록은 적지 않음; DB-IP Lite CC BY 4.0의 출처 표시는 글로만), 차감(출력 × 5, 캐시 × 0.1), 동시 요청(1·3·8, 13번째 429 `concurrency_limit`), 429와 `Retry-After`, `cache_control`(6.19), 문맥 32,768 / 8,192, 받지 않는 필드.
+- `/trust`: 6.17~6.19가 실제로 하는 것만 적었다. 지나는 길(엣지까지 TLS, LAN은 암호화 안 함), 남기는 것과 기간, 남기지 않는 것, 캐시, 키와 구글 확인, 확인한 방법(카나리 53개 0건, 캐시가 섞이지 않음, 다시 띄운 뒤 디스크 캐시 1,289가지로 찾아 0건), 보장하지 않는 것(가용성, 정확성, 처리 중의 메모리: 보관된 대화의 토큰 목록이 보통 RAM에 15분(6.19 남은 것), WER 덤프는 안 잼, LAN 구간, 엣지의 오류 기록, 운영자에 대한 신뢰), 준비 중인 것. 맨 위 칸은 `GET /v1/status`(살아 있음, 모델, 판, 켜진 시간, 대기열, `zdr`)다.
+- `/terms`, `/privacy`: 6.20의 요지 그대로, 조항과 시행일(2026-11-16), 변경 이력, "운영자가 직접 쓴 글이며 법률 검토를 받지 않음"을 적었다. 처리방침은 개인정보 보호법의 순서(항목, 목적, 보유 기간, 파기, 제3자 제공, 국외 이전, 위탁, 정보주체의 권리, 안전성 확보 조치, 쿠키, 책임자, 권익침해 구제, 변경)다. 요지에 없던 것 몇 가지를 더했다(아래 "관리자가 정할 것"). 운영자의 이름은 적지 않았다(연락처는 관리자가 준 메일만).
+
+**`/keys`의 흐름 (`keys.js`).** "구글로 확인"은 `/keys/google/start`로 가는 그냥 링크다. 돌아온 `#verified`면 "패스키 만들고 키 받기": `register/options` → `navigator.credentials.create` → `register/verify` → 키를 한 번 보이고 복사 단추와 "다시 보여 주지 않음" 경고. "패스키로 로그인"은 `login/options` → `navigator.credentials.get`(발견 가능한 자격증명, `allowCredentials` 없음) → `login/verify` → `me`(사용량), 그리고 재발급·회수(확인 창)·로그아웃.
+- 모든 호출은 계약대로 POST, `X-Requested-With: sclmd`, `credentials: same-origin`, `redirect: error`다(지시서의 "GET me"도 계약을 따라 POST로).
+- WebAuthn: 브라우저에 `parseCreationOptionsFromJSON`·`parseRequestOptionsFromJSON`·`toJSON()`이 있으면 쓰고, 없거나 던지면 손으로 base64url을 바꾼다(옛 Safari·Firefox, 일부 비밀번호 관리자). rp id는 서버의 옵션에서 받는다(박아 두지 않음).
+- 키는 저장소(localStorage 등), 주소, 콘솔 어디에도 쓰지 않는다. 화면에 있는 동안 페이지를 떠나려 하면 묻고, "다 적었습니다"가 지운다.
+- `#error=<code>`는 남이 만들 수 있는 값이라 `[a-z0-9_.-]{1,48}`만 받고(아니면 `unknown`) `textContent`로만 쓰며, 읽은 뒤 `replaceState`로 주소에서 지운다. 오류 글은 코드 98개(읽은 P2 클론의 코드 19개를 포함: `denied`·`expired`·`browser`·`google`·`token`·`rate_limited`·`busy`·`bad_request`·`server`, `bad_body`·`invalid_credential`·`no_session`·`csrf`·`google_check_needed`·`no_key`·`unknown_path`·`method_not_allowed`·`rate_limit_exceeded`·`server_error`), 모르는 코드는 HTTP 상태(400~504)로, WebAuthn의 `DOMException` 이름 8개, 연결 실패, 패스키를 못 쓰는 브라우저마다 한국어 글이 있다. 429는 `Retry-After`로 "약 N분 뒤"를 붙인다. 서버의 자유 글(`message`)은 화면에 내지 않는다(코드와 상태만 작게).
+
+**엣지 (`deploy/Caddyfile.edge`).** 저장소에 risuai 두 사이트의 사본이 없으므로 그 자리는 "라이브 파일의 것을 그대로 둠"이라는 표시이고, 전역 선택지도 라이브 파일의 것을 둔다. ssalmuck-ai 블록은 통째로다.
+- 길: `@api`(`/v1/*`, `/health`, `/keys/google/start`, `/keys/callback/*`, `/keys/api/*`)는 `reverse_proxy 192.168.0.2:8001`(6.17의 `Caddyfile.example`과 같은 선택지: `lb_try_duration 15s`, keepalive 60s, 몸통 32MiB(이 길에만), 접근 기록 없음). 페이지 여섯은 `rewrite`로 `.html`을 내준다(`/keys`는 리디렉트 없이 200, `/keys/`는 308로 `/keys`). `/assets/*`. 나머지(`/metrics`, `/debug`, `.html` 이름, `/404.html`)는 `error 404` → `handle_errors`가 `/404.html`을 404로. 엣지의 다른 오류(GPU PC가 꺼졌을 때 502)는 HTML을 주지 않고 빈 몸통 그대로 둔다(API 클라이언트를 위해). 이름 붙인 matcher만 쓴 `handle`이라 적은 순서대로다(Caddy 문서의 정렬 규칙).
+- 머리글: 모든 답에 HSTS(1년, preload·includeSubDomains 없음), `nosniff`, `Referrer-Policy: same-origin`, `-Server`. 페이지에는 CSP(`default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`), `Permissions-Policy`(`publickey-credentials-create=(self)`, `-get=(self)`, 카메라 등은 끔), COOP, CORP, `X-Frame-Options: DENY`. API의 답에는 페이지 머리글을 붙이지 않는다(서버의 머리글 그대로).
+- **`no-referrer`를 쓰지 않은 까닭**: Fetch 표준은 같은 출처의 POST라도 문서의 referrer 정책이 `no-referrer`면 `Origin: null`을 보낸다. 그러면 키 끝점의 Origin 검사가 모두 거절한다. `same-origin`은 구글로 갈 때 referrer를 보내지 않으면서 같은 출처의 `Origin`은 그대로 둔다. 가짜 API도 `null`을 거절한다(시험).
+- 캐시: 페이지 `no-cache`(file_server의 ETag로 다시 확인), `/assets` 1시간(이름에 판이 없으므로 `immutable`은 쓰지 않음: 바꾸면 한 시간 안에 모두에게).
+- **엣지의 오류 기록**: Caddy 문서로는 오류 줄(`http.log.error`)에 요청의 주소, URI(쿼리 포함), 머리글이 들어가고, 스스로 가리는 머리글은 Cookie·Authorization·Proxy-Authorization·Set-Cookie뿐이다. 그래서 GPU PC가 꺼진 동안 `x-api-key`로 온 요청은 키가 엣지의 journald에 남을 수 있다(오늘 라이브 엣지도 그럴 것: 재지 않음). 전역 `log default`의 `format filter`로 `X-Api-Key`·`Authorization`·`Cookie`와 쿼리의 `code`·`state`를 `REDACTED`로 바꾸게 했다. 이 필터는 엣지의 모든 사이트의 기록에 걸리고, 검증하지 못했다(옛 Caddy는 `wrap`을 요구할 수 있음). ssalmuck-ai 블록은 필터 없이도 된다. 그래서 `/trust`와 처리방침은 필터가 있든 없든 맞는 말로 적었다("남길 수 있다", "가리도록 설정하고 있다").
+- Caddy가 이 PC에 없어 `caddy validate`는 돌리지 못했다(선임이 엣지에서). 지시어는 Caddy 문서(context7)로 맞췄다.
+
+**검사 (`python -m scripts.site_check`, `tests/test_site.py` 7개 1.4초).** 가짜 엣지가 `Caddyfile.edge`의 ssalmuck-ai 블록을 읽어(matcher, 머리글 조각, 길마다의 Cache-Control) 그대로 길을 낸다. 리눅스처럼 파일 이름의 대소문자를 가린다(`/KEYS`는 404). 가짜 API는 계약의 `GET /v1/status`와 P2의 끝점(가짜 구글을 다음 포트에 두고 state·nonce·PKCE S256·`scope=openid`, 쿠키 `sclmd_keys`(HttpOnly, Secure, SameSite=Lax, Path=/keys, 15분), X-Requested-With와 Origin 검사, clientDataJSON의 type·challenge·origin)를 흉내 낸다. 서명은 검증하지 않는다(P2의 일). `POST /_mock/next-error`로 다음 답을 오류로 만든다.
+- HTML: 표준 라이브러리 파서로 엄격하게(모든 요소를 닫음, 같은 id·속성 없음, 아는 요소만, `lang="ko"`, 첫 meta가 charset, viewport, title·main·h1 하나씩, `aria-*`·`for`·`data-copy`가 가리키는 id가 있음). HTML5 검증기는 아니다(이 PC에 없음).
+- 링크: 모든 `href`·`src`를 가짜 엣지로 열어 200, `#조각`은 그 페이지에 있는 id, `mailto:`는 문의 주소뿐, 다른 출처 0. CSS의 `url()`·`@import` 0. 스크립트(주석 뺌)에 다른 출처, `localStorage`·`sessionStorage`·`indexedDB`·`document.cookie`·`console.`·`eval`·`innerHTML`·`XMLHttpRequest` 0.
+- 길과 머리글 25가지(위의 200·308·404·405, 머리글 값), CSP에 `unsafe`·`*`·`http` 없음, 프록시되는 길과 안 되는 길.
+- 흐름: 구글 → 콜백 → 쿠키 → CSRF 세 가지(머리글 없음, 다른 Origin, `Origin: null`) 403 → 패스키 등록 → 키 → me → 재발급 → 로그아웃 → 패스키 로그인 → 회수 → 회수한 패스키의 로그인 400.
+- node(`tests/site_keys_check.js`, 78개): base64url 0~299바이트와 200,000바이트 왕복, 틀린 입력 거절, 옵션을 손으로(`{publicKey: ...}` 꼴 포함)와 네이티브 파서로, 던지는 파서와 `toJSON()`의 대체, 옛 브라우저의 응답(`getTransports` 없음, `getPublicKey`가 던짐), 모든 오류 코드·상태·WebAuthn 이름의 한국어 글, `Retry-After`의 초·분·시간, `<img ...>` 코드가 보이지 않음, `#error=`의 끝 경우들, 6.20의 숫자(`site.js`의 대체값 = 안내 페이지의 글 = 가짜 status).
+- 일부러 고친 것 24가지(페이지 안의 스크립트·style·onclick, 다른 출처의 링크·이미지·@import·fetch, 닫히지 않은 요소, 같은 id, 없는 조각, 없는 페이지, `lang`, 다른 메일, `localStorage`, 대체 숫자, CSP의 `unsafe-inline`, `no-referrer`, `/keys/`로 바꾼 matcher, 프록시되는 `/metrics`, `immutable` 캐시, Server 머리글, 틀린 upstream)를 검사가 모두 잡는다(Server 머리글은 처음에 놓쳐서 검사를 더함).
+
+**Chromium으로 (Playwright, 가짜 엣지 `--serve 8120`, `localhost`).**
+- 일곱 페이지가 뜨고 콘솔에 CSP 위반 0(나온 것은 `/keys`가 처음 조용히 부르는 `me`의 401과 404 페이지의 404뿐). 360px에서 모든 페이지의 가로 스크롤 0(표와 코드는 제 안에서 스크롤).
+- 가상 인증기(CDP WebAuthn, ctap2, internal, resident key)로 처음부터 끝까지: 구글 → `#verified` → 패스키 등록 → 키(`sk-mock-…`) → "다 적었습니다" → 사용량 표 → 로그아웃 → 패스키 로그인 → 재발급(새 키) → 회수 → 회수한 패스키로 로그인하면 `invalid_credential`/`credential_unknown`의 글. 네이티브 파서와 `toJSON()`을 지운 페이지에서도 같은 흐름이 됐다(손으로 바꾸는 길). 저장소 0, `document.cookie` 빈 값(HttpOnly).
+- `#error=access_denied`, `#error=state_expired`, `#error=<img src=x onerror=...>`(→ "알 수 없는 오류", img 요소 0), 429 `too_many_keys` + `Retry-After 7200`(→ "약 2시간 뒤"), 403 `origin_mismatch`의 글.
+- `/guide`의 한도표가 가짜 status의 값으로 바뀌고 부른 사람의 등급 줄이 칠해짐, `/trust`의 상태 칸 10개가 채워짐.
+
+**안내의 예제를 돌려 봄 (`scripts.serve_canned`, 127.0.0.1:8123, 키 하나 + `--anonymous`).** 파이썬 openai(uv 캐시의 패키지, `--offline`): 키, 스트림, 429 다시 시도 함수, `cache_control` 예, 키 없이(빈 `Authorization`) 모두 끝까지. Node 26의 fetch 예 200. curl 예는 Git Bash의 curl이 명령줄의 한글을 cp949로 보내 400(`utf-8 codec can't decode`)이었고, UTF-8 파일을 `-d @request.json`으로 보내면 200이었다. 그래서 안내와 소개에 Windows에서는 그렇게 하라고 적었다(cmd·PowerShell은 재지 않음).
+
+**재지 않은 것.** `caddy validate`와 실제 엣지(선임), Safari·Firefox·휴대폰·진짜 인증기(Chromium의 가상 인증기만), P1·P2의 진짜 끝점(가짜 API만; P2 클론의 코드를 읽어 오류 코드와 응답 꼴을 맞춤), Caddy 오류 기록의 내용(문서로만), 법률 검토.
+
+**관리자가 정할 것.**
+- **요청 기록 30일**: 처리방침은 요지대로 30일이지만 master의 요청 기록은 크기로만 돌려 쓴다(64MB, 옛 파일 셋; 날짜로 지우지 않음). `/trust`에는 "준비 중"으로 적었다. 처리방침을 올리기 전에 지우는 일을 만들지, 문구를 바꿀지.
+- **엣지의 오류 기록**: 위의 필터를 넣을지, journald의 보관 기간. 처리방침에는 "엣지의 시스템 기록 설정을 따름(정하는 중)" 한 줄을 더했다.
+- 요지에 없이 더한 것: 약관의 "관련 법령이 허용하는 범위에서"(면책), "개인정보에 관한 변경은 미리 알림"(요지의 "민감사항 제외"에서 읽음), 처리방침의 위탁 없음·쿠키·권익침해 구제 기관(분쟁조정위원회 1833-6972, 침해신고센터 118, 대검찰청 1301, 경찰청 182)·엣지 오류 기록·세션 15분.
+- HSTS preload, DB-IP 출처 표시를 링크로 할지(지금은 다른 출처 0을 지키려 글로만), `/assets` 1시간.
+- 오류 코드: P2의 코드는 모두 글이 있다. P2가 코드를 바꾸면 `keys.js`의 `CODES`에 더한다(모르는 코드도 HTTP 상태의 글로 나옴).
+
+**관리자 지적 뒤 고침 (2026-11-16 새벽).** "디자인과 문체가 AI 슬롭 같다, 간결하고 단정하고 간단하게"에 따라 일곱 페이지를 다시 썼다: 한 가지는 한 번만, 짧은 서술문, 꾸밈·안심시키는 말 없음. 디자인은 흑백에 링크만 파랑, 상자·점·그림자 없음. 소개 253 → 78단어, 약관 485 → 313, 방침 698 → 513. 사실 고침: 쿠키 둘(sclmd_keys, sclmd_flow), 요청 기록 30일은 이제 사실, "발급한 키"만 SHA-256, 엣지 오류 로그는 주소와 경로만(머리글·쿼리는 Caddy 필터가 지움) 7일, /keys의 요청마다 10초 제한. 사이트 검사 여섯 묶음과 Chrome(밝음·어두움, 360px, 가상 인증기로 발급 흐름 전체) 통과.
+
 ## 7. 벤치마크 (2026-11-14) [실측, 도는 중]
 
 관리자 지시: 모델 카드의 벤치마크와 그 외 주요 벤치마크. 원본을 이 PC에서 같은 방식으로 돌릴 수는 없으므로(60GB, 글을 못 씀), 점수는 모델 카드의 값과 나란히 본다. 단, 카드의 설정(프롬프트, 답 뽑는 법, 시도 횟수)이 공개돼 있지 않아서 **카드와의 차이가 전부 양자화 탓은 아니다**. 양자화만의 차이는 7.3의 맞대기로 본다.

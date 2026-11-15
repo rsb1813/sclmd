@@ -28,6 +28,11 @@
 #   read back at start. Buckets that have left the day are dropped every 10 s, with or without the file.
 # --priorities: sclmd/order.py on the server's waiting list, passes and make room. A request's class is this PC, in
 #   quota or over quota (--quotas), its priority a step lower for each earlier request of its tenant under way.
+# Tiers (scripts/serve_tiers.py, design.md 6.20, 6.21; --tiers): a request's tier (key, ip_verified, ip_unverified; this
+#   PC is exempt) is decided when it comes and kept (req.tier); an address's limits are its tier's (--verified-tph ...
+#   for a verified one, --ip-tph ... for the rest). --output-weight: a reply token counts that many times (6.20: 5),
+#   in what is held for the daily check too. --tpd, --ip-tpd, --verified-tpd: a day's tokens of their own (else
+#   --daily-times x the hour's). Without them every number is N2's.
 # Nothing here imports torch.
 import atexit
 import collections
@@ -93,9 +98,13 @@ class Quota:
     """The counters, the limits and what they say. clock: the wall clock (buckets survive a restart)."""
 
     def __init__(self, key=KEY, ip=IP, daily: float = DAILY, keyless_day: int = KEYLESS_DAY, per_key: dict | None = None, path: str = "",
-                 clock=time.time, bucket: float = BUCKET):
+                 clock=time.time, bucket: float = BUCKET, verified=None, output: float = 1.0):
+        """key, ip, verified: (tph, rph) or (tph, rph, tpd) (tpd None: daily x tph); verified None: no tier of its own (an
+        address is an address, as N2). output: what a reply token counts for (--output-weight)."""
         self.daily, self.keyless_day, self.path, self.clock, self.bucket = float(daily), int(keyless_day), path, clock, float(bucket)
         self.key, self.ip = self._limits(*key), self._limits(*ip)
+        self.verified = self._limits(*verified) if verified is not None else None
+        self.output = float(output)
         self.per_key = {name: self._limits(d.get("tph", key[0]), d.get("rph", key[1]), d.get("tpd"), d.get("rpd")) for name, d in (per_key or {}).items()}
         self.lock = threading.Lock()
         self.used = {}  # tenant -> {bucket: [tokens, requests]}
@@ -109,12 +118,15 @@ class Quota:
     def _limits(self, tph, rph, tpd=None, rpd=None) -> Limits:
         return Limits(tph, rph, round(self.daily * int(tph)) if tpd is None else tpd, round(self.daily * int(rph)) if rpd is None else rpd)
 
-    def limits_of(self, tenant) -> Limits | None:
-        """None: no limits (this PC, or tenancy off)."""
+    def limits_of(self, tenant, tier=None) -> Limits | None:
+        """None: no limits (this PC, or tenancy off). tier (scripts/serve_tiers.py): an address's "ip_verified" has the
+        verified limits; any other (or None) an address's."""
         if not isinstance(tenant, str) or tenant == N.LOCAL:
             return None
         if tenant.startswith("key:"):
             return self.per_key.get(tenant[4:], self.key)
+        if tier == "ip_verified" and self.verified is not None:
+            return self.verified
         return self.ip
 
     # the counters (under self.lock)
@@ -158,30 +170,36 @@ class Quota:
 
     # what the server asks
 
-    def over(self, tenant) -> bool:
+    def over(self, tenant, tier=None) -> bool:
         """Whether the tenant is at or over its hourly quota (tokens or requests) now: a request that comes now is over
         quota (what it counts itself is not in it yet: the 600th request of 600, or one whose own prompt passes the
-        tokens, is still in quota)."""
-        lim = self.limits_of(tenant)
+        tokens, is still in quota). tier: whose limits (limits_of)."""
+        lim = self.limits_of(tenant, tier)
         if lim is None:
             return False
         now = self.clock()
         with self.lock:
             hit = self._over.get(tenant)
-            if hit is not None and hit[0] > now:
+            if hit is not None and hit[0] > now and hit[2] == tier:
                 return hit[1]
             tokens, requests = self._sum(self.used.get(tenant, {}), now, HOUR)
             over = bool((lim.tph and tokens >= lim.tph) or (lim.rph and requests >= lim.rph))
-            self._over[tenant] = (now + 1.0, over)
+            self._over[tenant] = (now + 1.0, over, tier)
             return over
 
-    def refusal(self, tenant, prompt: float, now: float | None = None, reply: float = 0.0, held: bool = True) -> Refusal | None:
+    def used_of(self, tenant, span: float = HOUR) -> tuple:
+        """(tokens, requests) of the tenant over the last `span` seconds (minute buckets: a bucket counts while any of
+        it is inside), for scripts/serve_tiers.py's behaviour."""
+        with self.lock:
+            return self._sum(self.used.get(tenant, {}), self.clock(), span)
+
+    def refusal(self, tenant, prompt: float, now: float | None = None, reply: float = 0.0, held: bool = True, tier=None) -> Refusal | None:
         """A request of `prompt` tokens that may write `reply` more (its max_tokens) is refused when the tenant's day
         would pass a daily limit with it (its requests or tokens), or when it has no key and all such requests' day would
         pass --keyless-day. held: the replies of the tenant's requests under way count at their max_tokens until they are
         settled, so that requests at once cannot pass a day's tokens by their replies (False: the day's counters alone,
-        for the check before a body is read)."""
-        lim = self.limits_of(tenant)
+        for the check before a body is read). reply is in tokens as counted (its max_tokens x --output-weight)."""
+        lim = self.limits_of(tenant, tier)
         if lim is None:
             return None
         now = self.clock() if now is None else now
@@ -215,16 +233,16 @@ class Quota:
     def taken(self, req) -> None:
         """The request is taken in: its class for the rest of its life (req.over_quota: its tenant's hour, before it, was
         at the quota), then counted with its whole prompt, until settle() counts what it cost."""
-        tenant = getattr(req, "tenant", None)
+        tenant, tier = getattr(req, "tenant", None), getattr(req, "tier", None)
         req.over_quota = False
-        if self.limits_of(tenant) is None:
+        if self.limits_of(tenant, tier) is None:
             self.n["class_local"] += tenant == N.LOCAL
             return
-        req.over_quota = self.over(tenant)
+        req.over_quota = self.over(tenant, tier)
         self.n["class_over_quota" if req.over_quota else "class_in_quota"] += 1
         now = self.clock()
         m = int(now // self.bucket)
-        reply = float(max(0, int(getattr(req, "max_new", 0) or 0)))  # held for the daily check until settled
+        reply = float(max(0, int(getattr(req, "max_new", 0) or 0))) * self.output  # held for the daily check until settled
         req._quota = (tenant, m, float(len(req.full)), reply)
         with self.lock:
             self._add(tenant, m, float(len(req.full)), 1)
@@ -259,14 +277,14 @@ class Quota:
                 prompt, cached, out = u["prompt_tokens"], (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0), u["completion_tokens"]
             else:  # failed, or its client left: what it had read and written by then
                 prompt, cached, out = len(req.full), getattr(req, "reused", 0), len(getattr(job, "out", ()))
-            tokens, requests = (prompt - cached) + out + CACHED * cached - counted, 0
+            tokens, requests = (prompt - cached) + self.output * out + CACHED * cached - counted, 0
         with self.lock:
             if m >= self._first(self.clock(), DAY):
                 self._add(tenant, m, tokens, requests)
 
-    def headers(self, tenant) -> dict:
+    def headers(self, tenant, tier=None) -> dict:
         """OpenAI's x-ratelimit-* of the hour for an answer to this tenant ({}: no limits)."""
-        lim = self.limits_of(tenant)
+        lim = self.limits_of(tenant, tier)
         if lim is None:
             return {}
         now = self.clock()
@@ -291,11 +309,17 @@ class Quota:
             out["x-ratelimit-reset-tokens"] = reset
         return out
 
-    def usage_of(self, tenant) -> dict:
-        """GET /v1/usage: the caller's own usage and limits."""
+    def tokens_are(self) -> str:
+        w = self.output
+        reply = "the reply" if w == 1 else f"the reply x {w:g}"
+        return f"the prompt that was not cached + {reply} + the cached prompt x 0.1"
+
+    def usage_of(self, tenant, tier=None) -> dict:
+        """GET /v1/usage: the caller's own usage and limits. tier (--tiers): its tier now, also in the answer."""
         if tenant == N.LOCAL:
-            return {"object": "usage", "user": tenant, "exempt": True, "priority": "this PC: no quota, served first"}
-        lim = self.limits_of(tenant)
+            return {"object": "usage", "user": tenant, "exempt": True, "priority": "this PC: no quota, served first",
+                    **({"tier": "local"} if tier is not None else {})}
+        lim = self.limits_of(tenant, tier)
         if lim is None:
             return {"object": "usage", "user": None, "exempt": True}
         now = self.clock()
@@ -316,13 +340,15 @@ class Quota:
                     "reset_s": reset}
 
         out = {"object": "usage", "user": tenant, "exempt": False,
-               "tokens_are": "the prompt that was not cached + the reply + the cached prompt x 0.1",
+               "tokens_are": self.tokens_are(),
                "hour": part(ht, hr, lim.tph, lim.rph, round(self._leaves(newest, HOUR) - now) if newest is not None else 0),
                "day": part(dt, dr, lim.tpd, lim.rpd, None),
                "over_quota": over, "back_in_quota_s": round(back),
                "priority": "over quota: served, at a much lower priority" if over else "in quota"}
         if keyless is not None:
             out["keyless_day"] = {"tokens": round(keyless, 1), "limit_tokens": self.keyless_day or None}
+        if tier is not None:
+            out["tier"] = tier
         return out
 
     # the file
@@ -340,7 +366,7 @@ class Quota:
                 if not b:
                     del self.used[tenant]
                     self._over.pop(tenant, None)
-            for tenant in [t for t, (until, _) in self._over.items() if until <= now]:
+            for tenant in [t for t, (until, *_) in self._over.items() if until <= now]:
                 del self._over[tenant]
             for m in [m for m in self.keyless if m < first]:
                 del self.keyless[m]
@@ -451,7 +477,8 @@ def admit(adm, req) -> Refusal | None:
     quota = adm.quota
     if quota is None:
         return None
-    refusal = quota.refusal(getattr(req, "tenant", None), float(len(req.full)), reply=float(getattr(req, "max_new", 0) or 0))
+    refusal = quota.refusal(getattr(req, "tenant", None), float(len(req.full)), reply=float(getattr(req, "max_new", 0) or 0) * quota.output,
+                            tier=getattr(req, "tier", None))
     if refusal is not None:
         quota.n[refusal.kind] += 1
     return refusal
@@ -462,7 +489,8 @@ def refused_early(adm, handler) -> bool:
     then read and thrown away, as for R4's 401). True: answered."""
     quota = adm.quota
     w = N.who_of(handler)
-    refusal = quota.refusal(w.tenant, 1.0, held=False) if quota is not None else None  # the day's counters: replies under way are not known to stay
+    tier = tier_now(adm, w)  # --tiers: its tier as it is now (the request's own is decided once its prompt is known)
+    refusal = quota.refusal(w.tenant, 1.0, held=False, tier=tier) if quota is not None else None  # the day's counters: replies under way are not known to stay
     if refusal is None:
         return False
     quota.n[refusal.kind] += 1
@@ -482,9 +510,19 @@ def refused_early(adm, handler) -> bool:
     return True
 
 
+def tier_now(adm, w):
+    """The tier of a Who (scripts/serve_tiers.py): the one its request was given, else as it would be now; None without
+    --tiers."""
+    tiers = getattr(adm, "tiers", None)
+    if tiers is None:
+        return None
+    return w.tier if getattr(w, "tier", None) is not None else tiers.tier_of(w)
+
+
 def status_headers(adm, handler) -> None:
     """After an answer's status line: the tenant's x-ratelimit-* headers."""
-    for name, value in adm.quota.headers(N.who_of(handler).tenant).items():
+    w = N.who_of(handler)
+    for name, value in adm.quota.headers(w.tenant, tier_now(adm, w)).items():
         handler.send_header(name, value)
 
 
@@ -506,6 +544,13 @@ def add_options(ap) -> None:
     g.add_argument("--daily-times", type=float, default=DAILY, help="the daily limit, over the last 24 hours: this many times the hour's "
                    "(a key's own tpd, rpd win)")
     g.add_argument("--keyless-day", type=int, default=KEYLESS_DAY, help="tokens a day of all requests without a key together (0: no limit)")
+    g.add_argument("--tpd", type=int, default=None, help="tokens a day of an API key (0: no limit; default --daily-times x --tph; 40000000 in "
+                   "serve.public.example.toml)")
+    g.add_argument("--ip-tpd", type=int, default=None, help="tokens a day of an address without a key (with --tiers: an unverified one; "
+                   "0: no limit; default --daily-times x --ip-tph; 7500000 in serve.public.example.toml)")
+    g.add_argument("--output-weight", type=float, default=1.0, help="what a reply token counts for in the quotas: a request's tokens are its "
+                   "prompt not cached + its reply x this + its cached prompt x 0.1, and a reply under way is held at its max_tokens x this "
+                   "for the daily check (1: as before; 5 in serve.public.example.toml)")
     g.add_argument("--priorities", action="store_true", help="serve by priority (sclmd/order.py): this PC first, then requests in quota, "
                    "then over quota far below; a tenant's second and later requests under way a step lower each; a step better for every "
                    "--priority-age seconds waited (never past this PC). It orders the waiting list (any request that fits is placed), "
@@ -520,9 +565,11 @@ def check(cli, keys) -> None:
     """Checks made before the model loads."""
     if getattr(cli, "quotas", False) and not (keys or getattr(cli, "anonymous", False)):
         raise SystemExit("--quotas counts by API key or address: set an API key (SCLMD_API_KEY or --api-key-file) or --anonymous")
-    for name in ("tph", "rph", "ip_tph", "ip_rph", "keyless_day", "over_quota_steps"):
-        if getattr(cli, name, 0) < 0:
+    for name in ("tph", "rph", "ip_tph", "ip_rph", "keyless_day", "over_quota_steps", "tpd", "ip_tpd"):
+        if (getattr(cli, name, 0) or 0) < 0:
             raise SystemExit(f"--{name.replace('_', '-')} is 0 or more")
+    if getattr(cli, "output_weight", 1.0) <= 0:
+        raise SystemExit("--output-weight is more than 0")
     if getattr(cli, "daily_times", 1.0) < 0 or getattr(cli, "priority_age", 1.0) <= 0:
         raise SystemExit("--daily-times is 0 or more and --priority-age more than 0")
 
@@ -531,8 +578,11 @@ def install(adm, server, cli) -> None:
     """--quotas and --priorities onto a running server (adm: its Admin)."""
     quota = None
     if getattr(cli, "quotas", False):
-        quota = Quota((cli.tph, cli.rph), (cli.ip_tph, cli.ip_rph), cli.daily_times, cli.keyless_day, getattr(cli, "key_limits", None) or {},
-                      cli.quota_file)
+        from scripts import serve_tiers as T  # (--tiers: the verified tier's limits)
+
+        quota = Quota((cli.tph, cli.rph, getattr(cli, "tpd", None)), (cli.ip_tph, cli.ip_rph, getattr(cli, "ip_tpd", None)), cli.daily_times,
+                      cli.keyless_day, getattr(cli, "key_limits", None) or {}, cli.quota_file, verified=T.verified_limits(cli),
+                      output=getattr(cli, "output_weight", 1.0))
         back = quota.load()
         quota.keep_saving()
         adm.quota = quota
@@ -540,27 +590,41 @@ def install(adm, server, cli) -> None:
         print(f"[serve] quotas: a key {quota.key.tph:,} tokens and {quota.key.rph:,} requests an hour, an address without a key "
               f"{quota.ip.tph:,} and {quota.ip.rph:,}; the day {cli.daily_times:g} times; all requests without a key {quota.keyless_day:,} "
               f"tokens a day" + (f"; keys of their own: {own}" if own else "")
-              + (f"; counters in {cli.quota_file} ({back} tenants read back)" if cli.quota_file else "; counters in memory only"), flush=True)
+              + (f"; counters in {cli.quota_file} ({back} tenants read back)" if cli.quota_file else "; counters in memory only")
+              + (f"; a reply token counts {quota.output:g} times" if quota.output != 1 else "")
+              + (f"; a day's tokens of their own: a key {quota.key.tpd:,}, an address {quota.ip.tpd:,}"
+                 if getattr(cli, "tpd", None) is not None or getattr(cli, "ip_tpd", None) is not None else ""), flush=True)
     if getattr(cli, "priorities", False):
-        def klass(req) -> int:  # this PC; else the class it was taken in with (Quota.taken: its tenant's hour before it)
+        def klass(req) -> int:  # this PC; else the class it was taken in with (Quota.taken: its tenant's hour before it; its tier)
             if getattr(req, "local", False):
                 return O.LOCAL
-            return order.over if getattr(req, "over_quota", False) else O.IN_QUOTA
+            return order.class_of(getattr(req, "tier", None), getattr(req, "over_quota", False))
 
-        order = O.Order(cli.priority_age, cli.over_quota_steps, klass)
+        from scripts import serve_tiers as T  # (--concurrency: the bands; --tier-steps)
+
+        order = O.Order(cli.priority_age, cli.over_quota_steps, klass, ladder=T.ladder_of(cli), tier_steps=getattr(cli, "tier_steps", 0) or 0)
         adm.order = order
 
         def priority_of(req, w) -> int:  # the seam of scripts/serve_net.py: its class as it comes (Quota.taken fixes it)
             req.local = bool(w.local) and w.tenant in (None, N.LOCAL)
             if req.local:
                 return O.LOCAL
-            return order.over if quota is not None and quota.over(getattr(req, "tenant", None)) else O.IN_QUOTA
+            tier = getattr(req, "tier", None)
+            return order.class_of(tier, quota is not None and quota.over(getattr(req, "tenant", None), tier))
 
         adm.users.priority_of = priority_of
         if hasattr(server, "batch"):
             server.order = server.batch.order = order
-            print(f"[serve] priorities: this PC, then in quota, then over quota {order.gap} steps lower; a tenant's later requests under way "
-                  f"a step lower each; a step better every {order.age:g} s of waiting (never past this PC)", flush=True)
+            if order.ladder is None and not getattr(cli, "tiers", False):
+                print(f"[serve] priorities: this PC, then in quota, then over quota {order.gap} steps lower; a tenant's later requests under way "
+                      f"a step lower each; a step better every {order.age:g} s of waiting (never past this PC)", flush=True)
+            else:
+                tiered = getattr(cli, "tiers", False)
+                print("[serve] priorities: this PC, then " + (f"a key, a verified address, an unverified one, each {order.tier_steps} steps lower; "
+                      "within a tier " if tiered else "") + f"in quota, then over quota {order.gap} steps lower; "
+                      + (f"a tenant's requests at once {'/'.join(map(str, order.ladder))} at +0/+1/+2 steps" if order.ladder else
+                         "a tenant's later requests under way a step lower each")
+                      + f"; a step better every {order.age:g} s of waiting (never past this PC)", flush=True)
         else:
             print("[serve] --priorities: no batcher here (a stand-in engine): the order is not installed", flush=True)
     elif quota is not None:
