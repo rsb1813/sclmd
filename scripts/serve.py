@@ -977,9 +977,11 @@ def main() -> None:
     C.apply(cli, app, Handler)
     engine_thread = threading.Thread(target=server.run, daemon=True)
     engine_thread.start()
-    httpd = C.BoundedHTTPServer((cli.host, cli.port), Handler, cli.max_connections) if early is None else serve_ops.serving(early, Handler, app)
+    httpd = C.BoundedHTTPServer((cli.host, cli.port), Handler, cli.max_connections) if early is None else early
     httpd.app = app
     A.install(app, server, cli, httpd, keys)  # /metrics, keys, back-pressure, the request log and status file (scripts/serve_admin.py)
+    if early is not None:  # --crash-only: the port already serves its placeholder; the real handler only once keys and limits are set
+        serve_ops.serving(early, Handler, app)
     serve_ops.started(app, ops, engine_thread)  # --crash-only's watchdog; --image auto: the image written while it serves
     print(f"[serve] {MODEL} at http://{cli.host}:{cli.port}/v1 · {bits} bits a weight"
           + (f" (KL about {estimate:.3f} on its own text)" if estimate else " (KL about 0.10 on its own text)")
