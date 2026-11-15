@@ -16,6 +16,8 @@ data/*
 *.npz
 *.npy
 .claude/worktrees/
+# the server's own options (scripts/serve_admin.py): may name a key file; never pushed to the mirror
+serve.toml
 !data/plans/
 !data/speed_check/
 !data/plans/*.json

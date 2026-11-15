@@ -1,7 +1,12 @@
 # The official openai client against the server's HTTP side with a canned reply (python -m scripts.serve_canned PORT):
 # what the library makes of each kind of answer. It does not import the project (the library need not be installed
 # in its environment): uv run --no-project --with openai python scripts/openai_client_check.py PORT
+# The back-pressure items (R4: --max-waiting's 429 and Retry-After) need a stand-in that answers one request slowly:
+#   python -m scripts.serve_canned PORT --max-waiting 1 --token-ms 300
+#   uv run --no-project --with openai python scripts/openai_client_check.py PORT --rate-limit
 import sys
+import threading
+import time
 
 import openai
 from openai import OpenAI
@@ -15,6 +20,43 @@ def check(name: str, cond: bool, detail="") -> None:
     global ok
     ok = ok and bool(cond)
     print(("ok  " if cond else "FAIL"), name, detail)
+
+
+if "--rate-limit" in sys.argv[2:]:
+    # the stand-in gives no request a sequence, so the one it answers slowly fills the bound of 1: the next gets 429
+    # with Retry-After and retry-after-ms (the client prefers the latter; it waits any value up to 120 s, measured
+    # by logs/exp/R4-land/retry_after.py). Without retries the library raises RateLimitError at once; with
+    # max_retries=2 it waits what the server said and is served once the slow reply is over.
+    def slow():
+        OpenAI(base_url=client.base_url, api_key="none", max_retries=0, timeout=60).chat.completions.create(
+            model="x", messages=[{"role": "user", "content": "a long one"}])
+
+    def refused_once() -> float:
+        try:
+            client.chat.completions.create(model="x", messages=[{"role": "user", "content": "hi"}])
+            check("a 429 without retries", False, "no error raised")
+            return 0.0
+        except openai.RateLimitError as e:
+            h = e.response.headers
+            check("a 429 without retries", e.status_code == 429 and h.get("retry-after") is not None and h.get("retry-after-ms") is not None
+                  and (e.body or {}).get("code") == "rate_limit_exceeded", f"Retry-After {h.get('retry-after')}, retry-after-ms {h.get('retry-after-ms')}")
+            return int(h.get("retry-after-ms") or 0) / 1000
+
+    busy = threading.Thread(target=slow)
+    busy.start()
+    time.sleep(0.5)
+    said = refused_once()
+    t = time.perf_counter()
+    try:
+        r = client.with_options(max_retries=2).chat.completions.create(model="x", messages=[{"role": "user", "content": "hi"}])
+        took = time.perf_counter() - t
+        check("the library waits Retry-After and is then served", took >= min(said, 60) - 0.05 and r.choices[0].message.content.startswith("Hello!"),
+              f"served after {took:.1f} s; the server said {said:.1f} s")
+    except openai.RateLimitError:
+        check("the library waits Retry-After and is then served", False, f"gave up after {time.perf_counter() - t:.1f} s")
+    busy.join()
+    print("ALL OK" if ok else "SOMETHING FAILED")
+    sys.exit(0 if ok else 1)
 
 
 models = client.models.list()

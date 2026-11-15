@@ -4,6 +4,9 @@ reply in the engine's place: for trying a client against the server's protocol w
     python -m scripts.serve_canned 8017            (and the real server's --max-body-mb, --max-connections, ... fields options)
     uv run --no-project --with openai python scripts/openai_client_check.py 8017
 
+and the operator's options (scripts/serve_admin.py: keys, --max-waiting, --queue-timeout, the request log, --debug):
+    python -m scripts.serve_canned 8024 --max-waiting 1 --token-ms 300
+
 A user message "fail" makes the server fail after three tokens, "fail first" before any."""
 import argparse
 import queue
@@ -15,6 +18,7 @@ import transformers
 from transformers import AutoTokenizer
 
 from sclmd import ckpt
+from scripts import serve_admin as A
 from scripts import serve_contract as C
 from scripts.serve import MODEL, App, Handler
 
@@ -23,6 +27,7 @@ class Canned:
     def __init__(self, tok, stop):
         self.tok, self.stop, self.canon = tok, stop, None
         self.eng = SimpleNamespace(capacity=8192, rows=32)
+        self.token_s = 0.01  # between the canned reply's tokens (--token-ms)
         self.inbox = queue.Queue()
         self.opening, self.closing = tok.convert_tokens_to_ids("<|channel>"), tok.convert_tokens_to_ids("<channel|>")
 
@@ -58,7 +63,7 @@ class Canned:
                     failed = True
                     break
                 req.events.put(("token", token))
-                time.sleep(0.01)
+                time.sleep(self.token_s)
             if not failed:
                 usage = {"prompt_tokens": len(req.full), "completion_tokens": len(out), "total_tokens": len(req.full) + len(out),
                          "prompt_tokens_details": {"cached_tokens": 0}}
@@ -68,19 +73,28 @@ class Canned:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("port", type=int)
+    ap.add_argument("port", type=int, nargs="?")
+    ap.add_argument("--port", type=int, dest="port_option", help="the port, as scripts/serve.py takes it (scripts/soak.py --serve-module)")
+    ap.add_argument("--token-ms", type=float, default=10.0, help="milliseconds between the canned reply's tokens")
     C.add_options(ap)  # the real server's: fields, body cap, idle timeout, connections
+    A.add_options(ap)  # and the operator's (keys, --max-waiting, --queue-timeout, the request log, --debug)
     cli = ap.parse_args()
+    cli.host, cli.port = "127.0.0.1", cli.port_option if cli.port_option is not None else cli.port
+    if cli.port is None:
+        ap.error("the port")
+    keys = A.start(cli)
     transformers.logging.set_verbosity_error()
     tok = AutoTokenizer.from_pretrained(ckpt("orig"))
     stop = (tok.eos_token_id, tok.convert_tokens_to_ids("<turn|>"), tok.convert_tokens_to_ids("<|tool_response>"))
     server = Canned(tok, stop)
+    server.token_s = cli.token_ms / 1000
     app = App(server, tok, False, 4096, {"bits_per_weight": 3.0})
     server.canon = None
     C.apply(cli, app, Handler)
     threading.Thread(target=server.run, daemon=True).start()
     httpd = C.BoundedHTTPServer(("127.0.0.1", cli.port), Handler, cli.max_connections)
     httpd.app = app
+    A.install(app, server, cli, httpd, keys)
     print(f"[canned] {MODEL} at http://127.0.0.1:{cli.port}/v1", flush=True)
     httpd.serve_forever()
 

@@ -7,7 +7,8 @@
 #   GET  /v1/models, /health, / (what the server is doing)
 #
 # One thread owns the engine; the HTTP threads only hand it requests and turn the tokens it settles into text.
-# Fields it does not serve, the body's size and the connections: scripts/serve_contract.py.
+# Fields it does not serve, the body's size and the connections: scripts/serve_contract.py. API keys, back-pressure,
+# GET /metrics, the request log and the status file: scripts/serve_admin.py.
 import argparse
 import json
 import os
@@ -30,6 +31,7 @@ from sclmd.batch import Batcher, Job
 from sclmd.generate import Picker
 from sclmd.text import Pieces
 from sclmd.stream import VRAM_MARGIN, cap_vram
+from scripts import serve_admin as A
 from scripts import serve_contract as C
 
 DEPTH = 6  # the drafter's generation_config.json: num_assistant_tokens
@@ -594,6 +596,10 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args) -> None:  # the engine's thread prints a line per request
         pass
 
+    def send_response(self, code, message=None) -> None:
+        A.answered(self, code)  # every answer's status: /metrics and the request log (scripts/serve_admin.py)
+        super().send_response(code, message)
+
     def _json(self, status: int, obj: dict, headers: dict | None = None) -> None:
         data = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(status)
@@ -608,6 +614,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _error(self, status: int, message: str, param: str | None = None) -> None:
         kind = "invalid_request_error" if status < 500 else "server_error"
+        A.message(self, message)
         self._json(status, {"error": {"message": message, "type": kind, "param": param, "code": None}})
 
     def _gone(self) -> bool:
@@ -622,6 +629,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         app = self.server.app
         path = self.path.split("?")[0].rstrip("/")
+        if A.get(self):  # an API key asked and not given (401), /metrics, /debug/audit (scripts/serve_admin.py)
+            return
         if path == "/v1/models":
             self._json(200, {"object": "list", "data": [app.card()]})
         elif path.startswith("/v1/models/"):
@@ -650,6 +659,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         app = self.server.app
+        if A.post(self):  # an API key asked and not given (401), /debug/fault (scripts/serve_admin.py)
+            return
         if self.path.split("?")[0].rstrip("/") != "/v1/chat/completions":
             return self._error(404, "unknown path: GET / lists the endpoints")
         fields = getattr(app, "fields", "default")
@@ -683,7 +694,9 @@ class Handler(BaseHTTPRequestHandler):
         hold = max((len(s) for s in stops), default=1) - 1
         stopped = False
         event, looked = None, time.monotonic()  # the last event taken; when the connection was last looked at
-        app.server.submit(req)
+        finish = None  # what the client is told the reply ended with (the request log)
+        if not A.submit(self, req, head["id"], stream):  # app.server.submit(req), or 429 past --max-waiting
+            return
 
         def chunk(delta: dict, finish: str | None = None, **more) -> None:
             data = {**head, "object": "chat.completion.chunk",
@@ -692,6 +705,8 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
         try:
+            if not A.started(self, req):  # --queue-timeout: 503 when no sequence came in time (nothing was written before)
+                return
             if stream:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -826,6 +841,7 @@ class Handler(BaseHTTPRequestHandler):
 
             traceback.print_exc()
             print(f"[serve] {head['id']}: the reply could not be sent: {type(e).__name__}: {e}", flush=True)
+            A.failed(self, e)  # logged as the server's failure, not as the client leaving
             self.close_connection = True
             try:
                 if stream:
@@ -839,6 +855,7 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             if event is None or event[0] not in ("done", "error"):  # the reply is not over, and nobody will read it
                 req.cancelled = True
+            A.ended(self, req, event, finish)  # the request log, the histograms
 
 
 def conversations_at(eng: E.Engine, lengths) -> dict:
@@ -862,8 +879,8 @@ def pool_for(cfg: M.Config, budget: int, full_per_sliding: float, keyless: bool 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--host", default="127.0.0.1", help="address to listen on (this machine only by default; 0.0.0.0 lets others in, "
-                    "and there is no password)")
+    ap.add_argument("--host", default="127.0.0.1", help="address to listen on (this machine only by default; 0.0.0.0 lets others in: "
+                    "set SCLMD_API_KEY, else there is no password)")
     ap.add_argument("--port", type=int, default=8001)
     ap.add_argument("--name", default="v1", help="the codes' folder under C:\\models\\sclmd-codes")
     ap.add_argument("--kv-gib", type=float, default=0.0, help="VRAM for the conversations' keys and values (0: all that 3 bits a weight "
@@ -897,7 +914,9 @@ def main() -> None:
     E.add_int8_option(ap)
     E.add_kv4_option(ap)
     C.add_options(ap)
-    cli = ap.parse_args()
+    A.add_options(ap)
+    cli = A.parse_args(ap)  # serve.toml's options (--config) under the command line's
+    keys = A.start(cli)  # the API keys; a host other than loopback without one: a warning (--require-key: no start)
     E.use_int8_option(cli)  # the whole engine: every request's rows on the integer products, so a reply's bits do not depend on its neighbours
     kv4 = E.use_kv4_option(cli)
     import sys
@@ -946,6 +965,7 @@ def main() -> None:
     threading.Thread(target=server.run, daemon=True).start()
     httpd = C.BoundedHTTPServer((cli.host, cli.port), Handler, cli.max_connections)
     httpd.app = app
+    A.install(app, server, cli, httpd, keys)  # /metrics, keys, back-pressure, the request log and status file (scripts/serve_admin.py)
     print(f"[serve] {MODEL} at http://{cli.host}:{cli.port}/v1 · {bits} bits a weight"
           + (f" (KL about {estimate:.3f} on its own text)" if estimate else " (KL about 0.10 on its own text)")
           + f" · VRAM {facts['vram_gib']} GiB\n[serve] keys and values {kv / 2**30:.2f} GiB: about {kv // one} conversations of {typical} tokens "

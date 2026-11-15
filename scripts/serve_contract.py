@@ -296,6 +296,9 @@ class BoundedHTTPServer(ThreadingHTTPServer):
     that the client reads the 503 rather than a reset. Past those too, the 503 is written and the connection closed."""
 
     daemon_threads = True
+    # connections the OS holds for accept(): socketserver's 5 reset a burst (100 clients at once on Windows: 63 to 67
+    # of them got WinError 10054 before the server saw them; R4's flood test)
+    request_queue_size = 128
 
     def __init__(self, address, handler, most: int = 0):
         super().__init__(address, handler)

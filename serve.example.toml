@@ -1,0 +1,13 @@
+# The server's options as a file (scripts/serve_admin.py): copy to serve.toml (which git ignores) and serve.bat reads
+# it; an option given on the command line wins. Names are the command line's, with - or _. API keys are never read
+# from here: set SCLMD_API_KEY, or name a key file outside the repository with api-key-file.
+#
+# host = "0.0.0.0"                      # others on the LAN may connect: then set a key
+# require-key = true                    # and refuse to start without one
+# api-key-file = "C:/Users/me/sclmd_keys.txt"
+# max-waiting = 64                      # 429 with Retry-After past 64 requests waiting beyond the free sequences
+# queue-timeout = 120                   # 503 to a request that waited 2 minutes for a place
+# request-log = "logs/serve_requests.jsonl"
+# status-file = "logs/serve_status.json"
+# max-connections = 256
+# kv-gib = 2.0
