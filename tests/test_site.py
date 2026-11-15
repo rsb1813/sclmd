@@ -43,7 +43,7 @@ def test_the_scripts_under_node():
 def test_the_caddyfile_block_is_read():
     conf = S.caddy_config()
     assert set(conf["matchers"]) >= {"api", "home", "pages", "slash", "assets"}
-    assert conf["cache"]["pages"] == "no-cache" and conf["cache"]["assets"] == "public, max-age=3600"
+    assert conf["cache"]["pages"] == "no-cache" and conf["cache"]["assets"] == "no-cache"
     for name in ("home", "pages", "assets"):
         assert "sclmd_page" in conf["cache"]["_imports_" + name]
     assert "sclmd_page" not in conf["cache"]["_imports_api"]  # the API's answers keep the server's own headers

@@ -18,9 +18,10 @@
 <a class="brand" href="/">ssalmuck-ai</a>
 <nav aria-label="주 메뉴">
 <ul class="nav">
-<li><a href="/">소개</a></li>
-<li><a href="/keys" aria-current="page">키 발급</a></li>
+<li><a href="/">홈</a></li>
+<li><a href="/keys" aria-current="page">키</a></li>
 <li><a href="/guide">사용 안내</a></li>
+<li><a href="/developers">개발자 안내</a></li>
 <li><a href="/trust">신뢰</a></li>
 </ul>
 </nav>
@@ -67,7 +68,7 @@
 <button type="button" id="copy-key">복사</button>
 </div>
 <p class="small" id="key-note" hidden></p>
-<p>요청에 <code>Authorization: Bearer &lt;키&gt;</code> 머리글을 붙입니다. 예제는 <a href="/guide#start">사용 안내</a>에 있습니다.</p>
+<p>앱의 API 키 칸에 넣습니다. 코드에서는 <code>Authorization: Bearer &lt;키&gt;</code> 머리글로 보냅니다. 앱 설정은 <a href="/guide#start">사용 안내</a>에, 코드 예제는 <a href="/developers#auth">개발자 안내</a>에 있습니다.</p>
 <div class="actions">
 <button type="button" class="secondary" id="key-done">화면에서 지우기</button>
 </div>
@@ -88,7 +89,7 @@
 </table>
 </div>
 <p class="note" id="me-over" hidden></p>
-<p class="small muted">토큰은 <a href="/guide#limits">차감 기준</a>으로 센 값입니다. 로그인은 15분 동안 유지됩니다.</p>
+<p class="small muted">토큰은 <a href="/guide#cost">차감 기준</a>으로 센 값입니다. 로그인은 15분 동안 유지됩니다.</p>
 <div class="actions">
 <button type="button" class="secondary" id="rotate">재발급</button>
 <button type="button" class="danger" id="revoke">회수</button>
@@ -100,7 +101,7 @@
 
 <footer class="foot">
 <div class="wrap">
-<p><a href="/terms">이용약관</a> · <a href="/privacy">개인정보 처리방침</a> · <a href="mailto:rsb2890.sasm@gmail.com">rsb2890.sasm@gmail.com</a></p>
+<p><a href="/terms">이용약관</a> · <a href="/privacy">개인정보 처리방침</a> · <a href="mailto:rsb2890.sasm@gmail.com">문의</a></p>
 </div>
 </footer>
 </body>

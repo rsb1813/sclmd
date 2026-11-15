@@ -16,9 +16,10 @@
 <a class="brand" href="/">ssalmuck-ai</a>
 <nav aria-label="주 메뉴">
 <ul class="nav">
-<li><a href="/" aria-current="page">소개</a></li>
-<li><a href="/keys">키 발급</a></li>
+<li><a href="/" aria-current="page">홈</a></li>
+<li><a href="/keys">키</a></li>
 <li><a href="/guide">사용 안내</a></li>
+<li><a href="/developers">개발자 안내</a></li>
 <li><a href="/trust">신뢰</a></li>
 </ul>
 </nav>
@@ -28,22 +29,30 @@
 <main id="main">
 <div class="wrap">
 <h1>Gemma 4 31B API</h1>
-<p>Google Gemma 4 31B를 양자화해 운영자 집의 RTX 5080 한 장에서 돌리는 OpenAI 호환 API입니다. 개인이 무료로 운영하는 시험 서비스이며, 가용성과 답의 정확성을 보장하지 않습니다.</p>
+<p class="lead">Google Gemma 4 31B를 양자화해 운영자 집의 RTX 5080 한 장에서 돌리는 OpenAI 호환 API입니다. 개인이 무료로 운영하는 시험 서비스이며, 가용성과 답의 정확성을 보장하지 않습니다.</p>
 
 <dl class="facts">
 <dt>API 주소</dt><dd><code>https://ssalmuck-ai.duckdns.org/v1</code></dd>
 <dt>모델</dt><dd><code>gemma-4-31b-it</code></dd>
-<dt>서버</dt><dd data-state="ok">확인하는 중</dd>
 </dl>
 
-<p>키 없이도 IP 주소별 한도 안에서 쓸 수 있습니다. 한도가 더 큰 키는 <a href="/keys">키 발급</a>에서 구글 확인 한 번과 패스키로 받습니다.</p>
-<p>예제와 한도는 <a href="/guide">사용 안내</a>에 있습니다.</p>
+<h2 id="live">서버 상태</h2>
+<dl class="facts live">
+<dt>상태</dt><dd data-state="ok">확인하는 중</dd>
+<dt>처리량</dt><dd data-state="live.tok_s" data-unit=" tok/s">-</dd>
+<dt>요청</dt><dd>처리 중 <span class="fix fix-2" data-state="queue.under_way">-</span> · 대기 <span data-state="queue.waiting">-</span></dd>
+</dl>
+<p class="small muted">처리량은 지난 10초 동안 서버 전체가 낸 답 토큰의 초당 수입니다. 5초마다 다시 읽습니다. 자세한 상태는 <a href="/trust#live">신뢰</a> 페이지에 있습니다.</p>
+
+<h2 id="use">쓰는 법</h2>
+<p>키 없이도 IP 주소별 한도 안에서 쓸 수 있습니다. 한도가 더 큰 키는 <a href="/keys">키</a> 페이지에서 구글 확인 한 번과 패스키로 받습니다.</p>
+<p>앱에 넣는 법과 한도는 <a href="/guide">사용 안내</a>에, 코드 예제는 <a href="/developers">개발자 안내</a>에 있습니다.</p>
 </div>
 </main>
 
 <footer class="foot">
 <div class="wrap">
-<p><a href="/terms">이용약관</a> · <a href="/privacy">개인정보 처리방침</a> · <a href="mailto:rsb2890.sasm@gmail.com">rsb2890.sasm@gmail.com</a></p>
+<p><a href="/terms">이용약관</a> · <a href="/privacy">개인정보 처리방침</a> · <a href="mailto:rsb2890.sasm@gmail.com">문의</a></p>
 </div>
 </footer>
 </body>

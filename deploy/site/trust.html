@@ -16,9 +16,10 @@
 <a class="brand" href="/">ssalmuck-ai</a>
 <nav aria-label="주 메뉴">
 <ul class="nav">
-<li><a href="/">소개</a></li>
-<li><a href="/keys">키 발급</a></li>
+<li><a href="/">홈</a></li>
+<li><a href="/keys">키</a></li>
 <li><a href="/guide">사용 안내</a></li>
+<li><a href="/developers">개발자 안내</a></li>
 <li><a href="/trust" aria-current="page">신뢰</a></li>
 </ul>
 </nav>
@@ -31,20 +32,23 @@
 <p>프롬프트와 답의 내용은 디스크와 기록 어디에도 남기지 않습니다(ZDR). 예외는 이용자가 요청한 1시간 디스크 캐시로, 암호화한 모델의 중간 계산값만 씁니다.</p>
 
 <section id="live" aria-labelledby="h-live">
-<h2 id="h-live">현재 상태 <span class="small muted" data-state-time></span></h2>
-<dl class="facts">
-<dt>서버</dt><dd data-state="ok">확인하는 중</dd>
-<dt>모델</dt><dd data-state="model">?</dd>
-<dt>버전</dt><dd data-state="version">?</dd>
-<dt>가동 시간</dt><dd data-state="uptime_s">?</dd>
-<dt>요청</dt><dd data-state="queue">?</dd>
-<dt>프롬프트 기록</dt><dd data-state="zdr.prompt_logging">?</dd>
-<dt>RAM 캐시</dt><dd data-state="zdr.cache_ram_minutes">?</dd>
-<dt>디스크 캐시</dt><dd data-state="zdr.cache_disk_hours">?</dd>
-<dt>디스크 암호화</dt><dd data-state="zdr.disk_encryption">?</dd>
-<dt>사용자 간 공유</dt><dd data-state="zdr.shared_between_users">?</dd>
+<h2 id="h-live">현재 상태</h2>
+<dl class="facts live">
+<dt>상태</dt><dd data-state="ok">확인하는 중</dd>
+<dt>처리량, 지난 10초</dt><dd data-state="live.tok_s" data-unit=" tok/s">-</dd>
+<dt>처리량, 지난 1분</dt><dd data-state="live.tok_s_1m" data-unit=" tok/s">-</dd>
+<dt>끝난 요청, 지난 1분</dt><dd data-state="live.requests_1m" data-unit="개">-</dd>
+<dt>요청</dt><dd>처리 중 <span class="fix fix-2" data-state="queue.under_way">-</span> · 대기 <span data-state="queue.waiting">-</span></dd>
+<dt>모델</dt><dd data-state="model">-</dd>
+<dt>버전</dt><dd data-state="version">-</dd>
+<dt>가동 시간</dt><dd data-state="uptime_s">-</dd>
+<dt>프롬프트 기록</dt><dd data-state="zdr.prompt_logging">-</dd>
+<dt>RAM 캐시</dt><dd data-state="zdr.cache_ram_minutes">-</dd>
+<dt>디스크 캐시</dt><dd data-state="zdr.cache_disk_hours">-</dd>
+<dt>디스크 암호화</dt><dd data-state="zdr.disk_encryption">-</dd>
+<dt>사용자 간 공유</dt><dd data-state="zdr.shared_between_users">-</dd>
 </dl>
-<p class="small muted">서버가 <code>GET /v1/status</code>로 알려 주는 값입니다.</p>
+<p class="small muted">서버가 <code>GET /v1/status</code>로 알려 주는 값이며 5초마다 다시 읽습니다. <span class="stamp" data-state-time></span></p>
 </section>
 
 <h2 id="path">요청 경로</h2>
@@ -56,17 +60,17 @@
 
 <h2 id="kept">남기는 것</h2>
 <div class="table">
-<table>
+<table class="stack">
 <thead><tr><th scope="col">항목</th><th scope="col">내용</th><th scope="col">기간</th></tr></thead>
 <tbody>
-<tr><th scope="row">요청 기록</th><td>시각, 사용자(IP 주소 또는 키 이름, IPv6는 /64), 토큰 수, 응답 코드, 걸린 시간, 종료 사유, 우선순위, 무시한 필드 이름, 오류 종류</td><td>30일</td></tr>
-<tr><th scope="row">할당량 카운터</th><td>사용자와 1분 단위 토큰·요청 수</td><td>24시간</td></tr>
-<tr><th scope="row">상태 파일</th><td>서버 전체의 숫자. 사용자 정보는 없음</td><td>5초마다 덮어씀</td></tr>
-<tr><th scope="row">키 저장소</th><td>발급한 키의 SHA-256 해시, 구글 회원 식별번호의 HMAC, 패스키의 공개키와 자격증명 ID, 키 이름, 발급 시각</td><td>키 회수 시까지</td></tr>
-<tr><th scope="row">키 페이지 세션</th><td>쿠키 <code>sclmd_keys</code>의 무작위 ID와 계정의 HMAC. 서버 메모리에만 있음</td><td>15분</td></tr>
-<tr><th scope="row">구글 확인 진행 정보</th><td>state, nonce, PKCE 값(서버 메모리)과 쿠키 <code>sclmd_flow</code></td><td>10분</td></tr>
-<tr><th scope="row">캐시</th><td>대화의 키·값 텐서</td><td>마지막 사용 후 15분, 요청 시 1시간</td></tr>
-<tr><th scope="row">엣지 오류 기록</th><td>엣지가 GPU PC에 연결하지 못한 요청의 전체 IP 주소와 요청 경로. 머리글과 본문은 없음</td><td>7일</td></tr>
+<tr><th scope="row">요청 기록</th><td>시각, 사용자(IP 주소 또는 키 이름, IPv6는 /64), 토큰 수, 응답 코드, 걸린 시간, 종료 사유, 우선순위, 무시한 필드 이름, 오류 종류</td><td data-label="기간">30일</td></tr>
+<tr><th scope="row">할당량 카운터</th><td>사용자와 1분 단위 토큰·요청 수</td><td data-label="기간">24시간</td></tr>
+<tr><th scope="row">상태 파일</th><td>서버 전체의 숫자. 사용자 정보는 없음</td><td data-label="기간">5초마다 덮어씀</td></tr>
+<tr><th scope="row">키 저장소</th><td>발급한 키의 SHA-256 해시, 구글 회원 식별번호의 HMAC, 패스키의 공개키와 자격증명 ID, 키 이름, 발급 시각</td><td data-label="기간">키 회수 시까지</td></tr>
+<tr><th scope="row">키 페이지 세션</th><td>쿠키 <code>sclmd_keys</code>의 무작위 ID와 계정의 HMAC. 서버 메모리에만 있음</td><td data-label="기간">15분</td></tr>
+<tr><th scope="row">구글 확인 진행 정보</th><td>state, nonce, PKCE 값(서버 메모리)과 쿠키 <code>sclmd_flow</code></td><td data-label="기간">10분</td></tr>
+<tr><th scope="row">캐시</th><td>대화의 키·값 텐서</td><td data-label="기간">마지막 사용 후 15분, 요청 시 1시간</td></tr>
+<tr><th scope="row">엣지 오류 기록</th><td>엣지가 GPU PC에 연결하지 못한 요청의 전체 IP 주소와 요청 경로. 머리글과 본문은 없음</td><td data-label="기간">7일</td></tr>
 </tbody>
 </table>
 </div>
@@ -117,7 +121,7 @@
 
 <footer class="foot">
 <div class="wrap">
-<p><a href="/terms">이용약관</a> · <a href="/privacy">개인정보 처리방침</a> · <a href="mailto:rsb2890.sasm@gmail.com">rsb2890.sasm@gmail.com</a></p>
+<p><a href="/terms">이용약관</a> · <a href="/privacy">개인정보 처리방침</a> · <a href="mailto:rsb2890.sasm@gmail.com">문의</a></p>
 </div>
 </footer>
 </body>

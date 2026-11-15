@@ -1,5 +1,6 @@
-/* ssalmuck-ai: the pages' shared script (design.md 6.23). GET /v1/status fills the live state and the limits
-   table; buttons with data-copy copy a code block. No storage, no other origin, no inline code (the CSP forbids it). */
+/* ssalmuck-ai: the pages' shared script (design.md 6.23). GET /v1/status fills the limits table (once) and the live
+   state (every 5 s while the tab is visible); buttons with data-copy copy a code block. No storage, no other origin,
+   no inline code (the CSP forbids it). */
 (function () {
   "use strict";
 
@@ -15,6 +16,8 @@
     }
   };
   var TIERS = { ip_unverified: "미검증 IP", ip_verified: "검증 IP", key: "키", local: "운영자 PC" };
+  var POLL_MS = 5000;      // the live state, while the tab is visible
+  var TIMEOUT_MS = 10000;  // one GET /v1/status
 
   function tokens(n) {
     // 1,250,000 -> "125만", 40,000,000 -> "4,000만", 7,500,000 -> "750만"
@@ -33,6 +36,12 @@
     return s + "초";
   }
 
+  // a live number: tokens a second with one decimal, counts whole; anything else (absent, null) a dash
+  function live(v, decimals) {
+    if (typeof v !== "number" || !isFinite(v) || v < 0) return "-";
+    return decimals ? v.toLocaleString("ko-KR", { minimumFractionDigits: 1, maximumFractionDigits: 1 }) : Math.round(v).toLocaleString("ko-KR");
+  }
+
   function pick(obj, path) {
     var parts = path.split(".");
     for (var i = 0; i < parts.length; i++) {
@@ -42,9 +51,7 @@
     return obj;
   }
 
-  function setText(el, text) { if (el) el.textContent = text; }
-
-  function fillLimits(limits, live) {
+  function fillLimits(limits, fromServer) {
     var cells = document.querySelectorAll("[data-limit]");
     for (var i = 0; i < cells.length; i++) {
       var v = pick(limits, cells[i].getAttribute("data-limit"));
@@ -59,73 +66,96 @@
     }
     var src = document.querySelectorAll("[data-limits-source]");
     for (var j = 0; j < src.length; j++) {
-      src[j].textContent = live ? "서버가 알려 준 현재 값입니다." : "서버에 연결하지 못해 공개한 기본값을 표시합니다.";
+      src[j].textContent = fromServer ? "서버가 알려 준 현재 값입니다." : "서버에 연결하지 못해 공개한 기본값을 표시합니다.";
     }
   }
 
   function fillCaller(tier) {
     var rows = document.querySelectorAll("tr[data-tier]");
     for (var i = 0; i < rows.length; i++) {
-      if (rows[i].getAttribute("data-tier") === tier) rows[i].classList.add("you");
+      rows[i].classList.toggle("you", rows[i].getAttribute("data-tier") === tier);
     }
     var els = document.querySelectorAll("[data-caller]");
     for (var j = 0; j < els.length; j++) {
-      els[j].textContent = TIERS[tier] ? "이 브라우저의 등급: " + TIERS[tier] : "";
+      els[j].textContent = TIERS[tier] ? "이 브라우저의 등급은 " + TIERS[tier] + "입니다." : "";
       els[j].hidden = !TIERS[tier];
     }
   }
 
+  // st: the status object, or null when it could not be read (the server is off, or no answer in 10 s)
+  function stateText(f, st) {
+    if (f === "ok") return !st ? "꺼짐" : st.ok === true ? "정상" : "점검 중";
+    if (!st) return "-";
+    var v = pick(st, f);
+    if (f.indexOf("live.") === 0 || f.indexOf("queue.") === 0) return live(v, /tok_s/.test(f));
+    if (f === "uptime_s") return duration(v);
+    if (f.indexOf("zdr.") === 0) {
+      if (f === "zdr.cache_ram_minutes" || f === "zdr.cache_disk_hours") {
+        if (!v) return v === undefined ? "?" : "꺼짐";
+        if (typeof v === "number") return v + (f === "zdr.cache_ram_minutes" ? "분" : "시간");
+      }
+      return v === false ? "아니요" : v === true ? "예" : v === undefined || v === "" ? "?" : v === null ? "없음" : String(v);
+    }
+    return v === undefined || v === null || v === "" ? "?" : String(v);
+  }
+
   function fillState(st) {
-    var up = !!(st && st.ok === true);
     var fields = document.querySelectorAll("[data-state]");
     for (var j = 0; j < fields.length; j++) {
-      var f = fields[j].getAttribute("data-state"), text = "?";
-      if (!st) {
-        text = f === "ok" ? "응답 없음" : "?";
-      } else if (f === "ok") {
-        text = up ? "정상" : "준비되지 않음";
-      } else if (f === "uptime_s") {
-        text = duration(st.uptime_s);
-      } else if (f === "queue") {
-        var q = st.queue || {};
-        text = "처리 중 " + (q.under_way | 0) + " · 대기 " + (q.waiting | 0);
-      } else if (f.indexOf("zdr.") === 0) {
-        var z = pick(st, f);
-        text = z === false ? "아니요" : z === true ? "예" : (z === undefined || z === "" ? "?" : z === null ? "없음" : String(z));
-        if (f === "zdr.cache_ram_minutes" || f === "zdr.cache_disk_hours") {
-          text = !z ? "꺼짐" : typeof z === "number" ? z + (f === "zdr.cache_ram_minutes" ? "분" : "시간") : text;
-        }
-      } else {
-        var v = pick(st, f);
-        text = v === undefined || v === null || v === "" ? "?" : String(v);
-      }
-      fields[j].textContent = text;
+      var text = stateText(fields[j].getAttribute("data-state"), st), unit = fields[j].getAttribute("data-unit");
+      if (unit && text !== "-") text += unit;  // a number that ends its line carries its unit: nothing after it can move
+      if (fields[j].textContent !== text) fields[j].textContent = text;
     }
     var when = document.querySelectorAll("[data-state-time]");
-    for (var k = 0; k < when.length; k++) {
-      when[k].textContent = new Date().toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) + " 기준";
-    }
+    var now = new Date().toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+    for (var k = 0; k < when.length; k++) when[k].textContent = now + " 기준";
+  }
+
+  var polls = false, timer = null, inflight = false, limitsFromServer = false;
+
+  function visible() { return document.visibilityState !== "hidden"; }
+
+  function schedule() {
+    if (timer) clearTimeout(timer);
+    timer = polls && visible() ? setTimeout(loadStatus, POLL_MS) : null;
   }
 
   function loadStatus() {
-    var wants = document.querySelector("[data-limit], [data-state], [data-caller]");
-    if (!wants || typeof fetch !== "function") return;
+    timer = null;
+    if (inflight || typeof fetch !== "function") return;
+    inflight = true;
     var ctl = typeof AbortController === "function" ? new AbortController() : null;
-    var timer = ctl ? setTimeout(function () { ctl.abort(); }, 10000) : null;
+    var stop = ctl ? setTimeout(function () { ctl.abort(); }, TIMEOUT_MS) : null;
     fetch("/v1/status", { method: "GET", credentials: "omit", cache: "no-store", signal: ctl ? ctl.signal : undefined })
       .then(function (r) { if (!r.ok) throw new Error("status " + r.status); return r.json(); })
       .then(function (st) {
-        if (timer) clearTimeout(timer);
-        var limits = st && st.limits && typeof st.limits === "object" ? st.limits : null;
-        fillLimits(limits || FALLBACK.limits, !!limits);
-        fillCaller(st && st.caller ? st.caller.tier : null);
+        if (!st || typeof st !== "object") throw new Error("not an object");
+        var limits = st.limits && typeof st.limits === "object" ? st.limits : null;
+        if (limits || !limitsFromServer) fillLimits(limits || FALLBACK.limits, !!limits);
+        limitsFromServer = limitsFromServer || !!limits;
+        fillCaller(st.caller ? st.caller.tier : null);
         fillState(st);
       })
       .catch(function () {
-        if (timer) clearTimeout(timer);
-        fillLimits(FALLBACK.limits, false);
+        if (!limitsFromServer) fillLimits(FALLBACK.limits, false);
         fillState(null);
+      })
+      .then(function () {
+        if (stop) clearTimeout(stop);
+        inflight = false;
+        schedule();
       });
+  }
+
+  function startStatus() {
+    if (!document.querySelector("[data-limit], [data-state], [data-caller]")) return;
+    polls = !!document.querySelector("[data-state]");  // the limits alone: read once
+    document.addEventListener("visibilitychange", function () {
+      if (!polls) return;
+      if (!visible()) { if (timer) clearTimeout(timer); timer = null; }
+      else if (!inflight) loadStatus();
+    });
+    loadStatus();
   }
 
   function copyText(text, button) {
@@ -166,14 +196,14 @@
     }
   }
 
-  window.SclmdSite = { tokens: tokens, duration: duration, copyText: copyText, FALLBACK: FALLBACK, TIERS: TIERS };
+  window.SclmdSite = { tokens: tokens, duration: duration, live: live, copyText: copyText, FALLBACK: FALLBACK, TIERS: TIERS };
 
   if (typeof document !== "undefined" && document.addEventListener) {
     if (document.readyState === "loading") {
-      document.addEventListener("DOMContentLoaded", function () { wireCopy(); loadStatus(); });
+      document.addEventListener("DOMContentLoaded", function () { wireCopy(); startStatus(); });
     } else {
       wireCopy();
-      loadStatus();
+      startStatus();
     }
   }
 })();

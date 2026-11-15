@@ -5,7 +5,7 @@
 #
 # ssalmuck-ai.duckdns.org (design.md 6.23):
 # - The pages are static files in /srv/ssalmuck-ai (copy deploy/site/* there; owner root, mode 644): / /keys /guide
-#   /trust /terms /privacy and /assets/*. A page path is served from its .html file without a redirect (/keys, not
+#   /developers /trust /terms /privacy and /assets/*. A page path is served from its .html file without a redirect (/keys, not
 #   /keys/; /keys/ answers 308 to /keys). The .html names themselves, /404.html and every other path are 404.
 # - To the GPU PC (192.168.0.2:8001, as deploy/Caddyfile.example): /v1/*, /health, /keys/google/start,
 #   /keys/callback/*, /keys/api/*. /metrics, /debug and the server's own GET / are not reachable from the internet.
@@ -13,8 +13,8 @@
 #   same-origin (not no-referrer: with no-referrer a browser sends "Origin: null" on the pages' same-origin POSTs and
 #   the key endpoints' Origin check would refuse them). On the pages also a strict CSP (this origin only, no inline
 #   code), frame-ancestors none, COOP, CORP and a Permissions-Policy that allows passkeys (publickey-credentials-*).
-# - Caching: the pages "no-cache" (revalidated with the ETag file_server sends), /assets for an hour (their names carry
-#   no version; a change reaches everyone within an hour).
+# - Caching: pages and /assets "no-cache" (revalidated with the ETag file_server sends: a 304 costs a round trip, and
+#   an unversioned asset never outlives its page).
 # - No access log (no `log` directive). Caddy's own error log (a line when the GPU PC cannot be reached) keeps the
 #   client's address and the path only: the global `log` below deletes every request header and the query. journald
 #   keeps it 7 days (/etc/systemd/journald.conf.d/sclmd.conf: MaxRetentionSec=7d), as /privacy says.
@@ -70,8 +70,8 @@ ssalmuck-ai.duckdns.org {
 
 	@api path /v1/* /health /keys/google/start /keys/callback/* /keys/api/*
 	@home path /
-	@pages path /keys /guide /trust /terms /privacy
-	@slash path_regexp slash ^/(keys|guide|trust|terms|privacy)/$
+	@pages path /keys /guide /developers /trust /terms /privacy
+	@slash path_regexp slash ^/(keys|guide|developers|trust|terms|privacy)/$
 	@assets path /assets/*
 	# Google Search Console's ownership file (the OAuth consent screen's home page check): /srv/ssalmuck-ai/verify/
 	# (google648f85958943202a.html, 2026-11-16). Google checks it again from time to time: a new copy of the site keeps verify/
@@ -132,7 +132,7 @@ ssalmuck-ai.duckdns.org {
 
 	handle @assets {
 		import sclmd_page
-		header Cache-Control "public, max-age=3600"
+		header Cache-Control "no-cache"
 		encode zstd gzip
 		file_server
 	}

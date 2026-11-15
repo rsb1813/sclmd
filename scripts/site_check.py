@@ -44,13 +44,14 @@ ROOT = Path(__file__).resolve().parents[1]
 SITE = ROOT / "deploy" / "site"
 CADDY = ROOT / "deploy" / "Caddyfile.edge"
 NODE_CHECK = ROOT / "tests" / "site_keys_check.js"
-PAGES = {"/": "index.html", "/keys": "keys.html", "/guide": "guide.html", "/trust": "trust.html", "/terms": "terms.html",
-         "/privacy": "privacy.html"}
+PAGES = {"/": "index.html", "/keys": "keys.html", "/guide": "guide.html", "/developers": "developers.html", "/trust": "trust.html",
+         "/terms": "terms.html", "/privacy": "privacy.html"}
 CONTACT = "mailto:rsb2890.sasm@gmail.com"
 
 # GET /v1/status as the contract has it (P1); 6.20's numbers
 STATUS = {
     "ok": True, "model": "gemma-4-31b-it", "version": "mock000", "uptime_s": 3725, "queue": {"under_way": 2, "waiting": 1},
+    "live": {"tok_s": 41.3, "tok_s_1m": 37.8, "requests_1m": 9},  # the server's live block (may be null or absent)
     "zdr": {"prompt_logging": False, "cache_ram_minutes": 15, "cache_disk_hours": 1, "disk_encryption": "AES-GCM",
             "shared_between_users": False},
     "limits": {"ip_unverified": {"tph": 300000, "tpd": 7500000}, "ip_verified": {"tph": 750000, "tpd": 15000000},
@@ -662,12 +663,14 @@ def check_routes(port: int) -> list:
         ("/", "GET", 200, ("cache-control", "no-cache"), "<h1>"),
         ("/keys", "GET", 200, ("content-security-policy", csp), 'id="keys-app"'),
         ("/guide", "GET", 200, ("permissions-policy", None), "사용 안내"),
+        ("/developers", "GET", 200, ("content-security-policy", csp), "개발자 안내"),
+        ("/developers/", "GET", 308, ("location", "/developers"), None),
         ("/trust", "GET", 200, ("x-frame-options", "DENY"), "신뢰"),
         ("/terms", "GET", 200, ("referrer-policy", "same-origin"), "이용약관"),
         ("/privacy", "GET", 200, ("strict-transport-security", "max-age=31536000"), "개인정보"),
         ("/keys/", "GET", 308, ("location", "/keys"), None),
         ("/terms/", "GET", 308, ("location", "/terms"), None),
-        ("/assets/site.css", "GET", 200, ("cache-control", "public, max-age=3600"), None),
+        ("/assets/site.css", "GET", 200, ("cache-control", "no-cache"), None),
         ("/assets/keys.js", "GET", 200, ("content-type", "text/javascript; charset=utf-8"), None),
         ("/assets/", "GET", 404, None, None),
         ("/index.html", "GET", 404, ("content-security-policy", csp), "찾을 수 없는"),
