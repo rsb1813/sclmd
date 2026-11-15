@@ -781,7 +781,8 @@ class Cache:
                 # this boundary, give or take the few tokens a reply's text is written again with; a copy at every turn
                 # would be 0.3-0.9 GiB a turn
                 continue
-            if kind == "turn" and (0 <= n - req.reused <= TURN_NEAR or store.longest(scope, full[:n], n - TURN_NEAR - 1) is not None):
+            if kind == "turn" and ((req.reused > 0 and n - req.reused <= TURN_NEAR)
+                                   or store.longest(scope, full[:n], max(0, n - TURN_NEAR - 1)) is not None):
                 # nor a state a few tokens past one this user holds already (a marked part's end and its message's
                 # boundary, 2 tokens apart, measured): 0.3-0.9 GiB of page-locked RAM for a few tokens of reading
                 self.near += 1

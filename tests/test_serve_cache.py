@@ -84,6 +84,7 @@ def test_cache_turns_saves_no_state_a_few_tokens_past_one_already_there():
         return job.pause
 
     cache = K.Cache(1 << 30, turns=True)
+    assert arm(cache, 40, 0) == 40 and cache.near == 0  # nothing read (reused 0) is no state before it, however short
     assert arm(cache, 2000, 1998) is None and cache.near == 1  # read from a state 2 tokens before it
     cache.store.put(list(range(10, 10 + 1990)), state_of(1, 1), "key:a")
     assert arm(cache, 2000, 0) is None and cache.near == 2  # this user holds one 10 tokens before it
