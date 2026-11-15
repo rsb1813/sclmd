@@ -457,7 +457,7 @@ def test_v1_status_is_open_and_says_what_the_contract_says_and_no_more(net):
     httpd, app, inbox = net(*PUBLIC, "--require-key")
     st, h, body = call(httpd, "GET", "/v1/status")
     s = json.loads(body)
-    assert st == 200 and set(s) == {"ok", "model", "version", "uptime_s", "queue", "zdr", "limits", "caller"}
+    assert st == 200 and set(s) == {"ok", "model", "version", "uptime_s", "queue", "live", "zdr", "limits", "caller"}
     assert s["ok"] is True and isinstance(s["version"], str) and isinstance(s["uptime_s"], int) and s["queue"] == {"under_way": 0, "waiting": 0}
     assert set(s["zdr"]) == {"prompt_logging", "cache_ram_minutes", "cache_disk_hours", "disk_encryption", "shared_between_users"}
     assert s["zdr"]["prompt_logging"] is False
@@ -608,3 +608,44 @@ def test_the_behaviour_thresholds_are_not_in_the_repository():
     """6.20: the owner's thresholds live in serve.toml only; the code's own are off."""
     from scripts import serve_tiers as T
     assert all(T.RULES[k] == 0 for k in ("rpm", "rph", "tph", "least", "most"))
+
+
+def test_v1_status_live_throughput_from_the_engines_counters():
+    """live: reply tokens a second over 10 s and 60 s, requests ended in 60 s; under-way tokens count, never twice."""
+    from scripts import serve_tiers as T
+
+    class Job:
+        def __init__(self, n, done=None):
+            self.out, self.done = [0] * n, done
+
+    eng = SimpleNamespace(totals={"completion_tokens": 0, "requests": 0}, active=[])
+    st = T.Status(SimpleNamespace(server=SimpleNamespace(about=lambda: {})), "m", ver="x")  # no totals: no sampler
+    assert st.live() is None
+    st.adm = SimpleNamespace(server=eng)
+    clock = [1000.0]
+    real = T.time.monotonic
+    T.time.monotonic = lambda: clock[0]
+    try:
+        def tick(dt=1.0):
+            clock[0] += dt
+            written, ended = st._written()
+            st.samples.append((clock[0], max(st.samples[-1][1] if st.samples else 0, written), ended))
+        tick()
+        req = SimpleNamespace(job=Job(0))
+        eng.active.append(req)
+        for _ in range(60):  # 100 tokens a second under way for a minute
+            req.job.out.extend([0] * 100)
+            tick()
+        live = st.live()
+        assert 99 <= live["tok_s"] <= 101 and 98 <= live["tok_s_1m"] <= 101 and live["requests_1m"] == 0
+        # it ends: the engine's totals take its tokens and it leaves active; the rate never jumps
+        req.job.done = "stop"
+        eng.totals["completion_tokens"] += len(req.job.out)
+        eng.totals["requests"] += 1
+        eng.active.remove(req)
+        for _ in range(10):
+            tick()
+        live = st.live()
+        assert live["tok_s"] <= 10 and live["requests_1m"] == 1
+    finally:
+        T.time.monotonic = real

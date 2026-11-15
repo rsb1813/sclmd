@@ -367,8 +367,54 @@ class Status:
     """GET /v1/status (--public-status): cheap (no lock is held long, nothing is read from disk), the same for everyone
     but the caller's tier."""
 
-    def __init__(self, adm, model: str, ver: str | None = None):
+    def __init__(self, adm, model: str, ver: str | None = None, sample_s: float = 1.0):
         self.adm, self.model, self.version = adm, model, ver if ver is not None else version()
+        # live throughput: (time, reply tokens written so far, requests ended so far), one sample a second, the last 70 s
+        self.samples = collections.deque(maxlen=int(70 / sample_s) + 2)
+        self.sample_s = sample_s
+        if hasattr(adm.server, "totals"):
+            threading.Thread(target=self._sampler, name="status-live", daemon=True).start()
+
+    def _written(self) -> tuple:
+        """Reply tokens written so far (ended requests' and the ones under way) and requests ended. Read without the
+        engine's lock: a request ending between the two reads is missed for one sample, never counted twice."""
+        s = self.adm.server
+        t = s.totals
+        done, ended = t["completion_tokens"], t["requests"]
+        under = 0
+        for req in list(s.active):
+            job = getattr(req, "job", None)
+            if job is not None and job.done is None:
+                under += len(job.out)
+        return done + under, ended
+
+    def _sampler(self) -> None:
+        last = 0
+        while True:
+            try:
+                written, ended = self._written()
+                last = max(last, written)  # never backwards (a request between "under way" and "ended")
+                self.samples.append((time.monotonic(), last, ended))
+            except Exception:  # noqa: BLE001  (a sample missed; the status still answers)
+                pass
+            time.sleep(self.sample_s)
+
+    def live(self) -> dict | None:
+        xs = list(self.samples)
+        if len(xs) < 2:
+            return None
+        now, tok, req = xs[-1]
+
+        def since(seconds: float) -> tuple:
+            for t, k, r in xs:
+                if now - t <= seconds + self.sample_s / 2:
+                    return t, k, r
+            return xs[0]
+
+        t10, k10, _ = since(10)
+        t60, k60, r60 = since(60)
+        return {"tok_s": round((tok - k10) / max(now - t10, 1e-9), 1), "tok_s_1m": round((tok - k60) / max(now - t60, 1e-9), 1),
+                "requests_1m": int(req - r60)}
 
     def body(self, handler) -> dict:
         adm = self.adm
@@ -391,7 +437,7 @@ class Status:
         w = N.who_of(handler)
         caller = w.tier if w.tier is not None else (adm.tiers.tier_of(w) if adm.tiers is not None else ("local" if w.local else "ip_unverified"))
         return {"ok": bool(ok), "model": self.model, "version": self.version, "uptime_s": int(time.time() - adm.t0),
-                "queue": {"under_way": int(under_way), "waiting": int(waiting)},
+                "queue": {"under_way": int(under_way), "waiting": int(waiting)}, "live": self.live(),
                 "zdr": {"prompt_logging": False, "cache_ram_minutes": 15 if cache is not None else None, "cache_disk_hours": 1 if disk else 0,
                         "disk_encryption": "AES-GCM" if disk else "none", "shared_between_users": not apart},
                 "limits": {"ip_unverified": tier(q.ip), "ip_verified": tier(q.verified), "key": tier(q.key),
