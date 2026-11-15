@@ -1,4 +1,4 @@
-# The internet server (design.md 6.16, 6.17): the owner's settings. Copy to serve.toml (git ignores it), edit the
+# The internet server (design.md 6.16, 6.17, 6.19): the owner's settings. Copy to serve.toml (git ignores it), edit the
 # lines marked EDIT, and start serve.bat: supervise = true runs it through scripts/supervise.py. The proxy PC:
 # deploy/Caddyfile.example. This PC's firewall (port 8001 from the proxy PC only): deploy/firewall.example.ps1.
 # API keys are never read from here (the repository is pushed to a mirror): set SCLMD_API_KEY ("name:key", commas)
@@ -15,7 +15,6 @@ wide-rows = 256                  # several prompts read in passes of up to 256 r
 keyless = true                   # long conversations: the full-attention layers keep values only (21 KB a token)
 context = 40992                  # one conversation: a prompt of 32,768 tokens and a reply of 8,192 (the pass's 32 rows are kept free; 40960 cuts it at 8,160)
 typical = 8192                   # the pool's split: conversations at once of 2,000 tokens 4, of 32k 1
-prefix-gib = 2                   # shared prompt prefixes in page-locked RAM
 image = "auto"                   # starts in about 6 s from an engine image (data\images, 11.7 GB, written once a build)
 
 # limits (scripts/serve_net.py, scripts/serve_contract.py)
@@ -26,6 +25,15 @@ stream-ping = 15                 # ": ping" every 15 s until a stream's first to
 max-body-mb = 32                 # 413 above it
 idle-timeout = 120               # an idle connection closed (between requests, or one that stopped sending)
 max-connections = 256            # 503 past it
+
+# prompt caches (scripts/serve_cache.py, design.md 6.19): per user; kept conversations and prefix states 15 min since
+# last use; cache_control 15m (RAM) or 1h (RAM and disk); one page-locked RAM budget in the place of ram-gib and prefix-gib
+prompt-cache = true
+cache-ram-gib = 32               # page-locked RAM: parked conversations, prefix states and cache entries together
+cache-dir = "C:/models/sclmd-cache"   # the 1 h disk cache (AES-GCM; its own files are deleted at start and at exit)
+cache-disk-gib = 64
+cache-turns = true               # also the state before the last user message (1,024 tokens and more): a new question
+                                 # on a document sent as a message of its own, 22 s -> 0.2 s (design.md 6.19)
 
 # users (scripts/serve_net.py, scripts/serve_admin.py)
 require-key = true               # does not start without an API key (SCLMD_API_KEY or api-key-file)

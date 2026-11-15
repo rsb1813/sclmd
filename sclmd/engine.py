@@ -729,30 +729,38 @@ class Engine:
         self._copy_tiles(M.SLIDING, snap["tiles"], snap["data"], out=False)
         self.lengths[seq], self.highs[seq] = snap["at"]
 
-    def park(self, seq: int) -> dict:
+    def park(self, seq: int, alloc=None) -> dict:
         """Takes a sequence off the GPU: what it holds comes back as a state in RAM (its keys and values up to its
         length: 0.42 MB a token for the last 1,040 tokens and 41 KB a token, 21 KB when keyless), and its tiles go back to the pool.
-        unpark() puts it on any free sequence later. A snapshot of it is given up."""
+        unpark() puts it on any free sequence later. A snapshot of it is given up.
+        alloc: [(shape, dtype)] -> the state's tensors of a kind of layer (None: pageable torch tensors)."""
         self.trim(seq)
         state = {"length": self.lengths[seq], "high": self.highs[seq], "kinds": {}, "bytes": 0}
         for t in self.ring:
             js = [j for j, tile in enumerate(self.tiles[t][seq]) if tile >= 0]
-            data = [torch.empty(k.shape[0], len(js), TILE, *k.shape[2:], dtype=k.dtype) for k in self.kv_all[t]]
+            if alloc is not None:
+                data = alloc([((k.shape[0], len(js), TILE, *k.shape[2:]), k.dtype) for k in self.kv_all[t]])
+            else:
+                data = [torch.empty(k.shape[0], len(js), TILE, *k.shape[2:], dtype=k.dtype) for k in self.kv_all[t]]
             self._copy_tiles(t, [self.tiles[t][seq][j] for j in js], data, out=True)
             state["kinds"][t] = {"js": js, "data": data}
             state["bytes"] += sum(d.numel() * d.element_size() for d in data)
         self.release(seq)
         return state
 
-    def save(self, seq: int, pin: bool = True) -> dict:
+    def save(self, seq: int, pin: bool = True, alloc=None) -> dict:
         """A copy in RAM of what a sequence holds, in park()'s form, the sequence left as it is (a prefix many texts
         begin with: unpark() puts it on any free sequence, as often as wanted). Nothing may have been written past its
-        length (save right when the prefix is in; a sliding layer's ring then holds what the next positions read). pin: page-locked RAM (copies to the GPU at full speed)."""
+        length (save right when the prefix is in; a sliding layer's ring then holds what the next positions read). pin: page-locked RAM (copies to the GPU at full speed).
+        alloc: as park()'s (then pin is not looked at)."""
         assert self.highs[seq] == self.lengths[seq], "positions past its length were written: crop and trim first, or save earlier"
         state = {"length": self.lengths[seq], "high": self.highs[seq], "kinds": {}, "bytes": 0}
         for t in self.ring:
             js = [j for j, tile in enumerate(self.tiles[t][seq]) if tile >= 0]
-            data = [torch.empty(k.shape[0], len(js), TILE, *k.shape[2:], dtype=k.dtype, pin_memory=pin) for k in self.kv_all[t]]
+            if alloc is not None:
+                data = alloc([((k.shape[0], len(js), TILE, *k.shape[2:]), k.dtype) for k in self.kv_all[t]])
+            else:
+                data = [torch.empty(k.shape[0], len(js), TILE, *k.shape[2:], dtype=k.dtype, pin_memory=pin) for k in self.kv_all[t]]
             self._copy_tiles(t, [self.tiles[t][seq][j] for j in js], data, out=True)
             state["kinds"][t] = {"js": js, "data": data}
             state["bytes"] += sum(d.numel() * d.element_size() for d in data)

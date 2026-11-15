@@ -15,6 +15,7 @@ import pytest
 
 from scripts import serve as S
 from scripts import serve_admin as A
+from scripts import serve_cache as K
 from scripts import serve_contract as C
 from scripts import serve_net as N
 from scripts import supervise
@@ -439,7 +440,10 @@ def test_serve_toml_supervise_and_int8_true(tmp_path):
 def test_the_public_example_is_read_whole():
     path = os.path.join(ROOT, "serve.public.example.toml")
     cli = A.parse_args(S.parser(), ["--config", path])
-    assert (cli.int8, cli.kv4, cli.wide_rows, cli.keyless, cli.context, cli.typical, cli.prefix_gib, cli.image) == (5.0, True, 256, True, 40992, 8192, 2.0, "auto")
+    assert (cli.int8, cli.kv4, cli.wide_rows, cli.keyless, cli.context, cli.typical, cli.image) == (5.0, True, 256, True, 40992, 8192, "auto")
+    # the prompt caches (scripts/serve_cache.py): the one page-locked budget takes the place of --prefix-gib's
+    assert (cli.prompt_cache, cli.cache_ram_gib, cli.cache_dir, cli.cache_disk_gib, cli.prefix_gib) == (True, 32.0, "C:/models/sclmd-cache", 64.0, 0.0)
+    K.check(cli)
     assert (cli.max_prompt, cli.max_output, cli.max_tokens, cli.stream_ping) == (32768, 8192, 8192, 15.0)
     assert (cli.max_body_mb, cli.idle_timeout, cli.max_connections) == (32.0, 120.0, 256)
     assert cli.anonymous and cli.metrics_local and cli.require_key and cli.trusted_proxies and cli.host == "0.0.0.0"

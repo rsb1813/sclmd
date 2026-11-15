@@ -353,10 +353,12 @@ class Batcher:
             at = eng.lengths[j.seq]  # after the pass: the position after the rows
             if j.pending is None:  # a prompt: when its last token is in, the reply's first token is chosen
                 j.todo, j.read = j.todo[n:], j.read + n
-                if j.pause is not None and at >= j.pause:
-                    if at == j.pause and j.todo and j.at_pause is not None:
-                        j.at_pause(j)
-                    j.pause = None
+                while j.pause is not None and at >= j.pause:
+                    pause = j.pause
+                    if at == pause and j.todo and j.at_pause is not None:
+                        j.at_pause(j)  # (it may set the next pause, further on: scripts/serve_cache.py)
+                    if j.pause == pause:
+                        j.pause = None
                 if not j.todo and j.only_read:
                     j.done = "read"
                 elif not j.todo and j.resume is not None:  # started over, and back where it was

@@ -10,7 +10,8 @@
 # Fields it does not serve, the body's size and the connections: scripts/serve_contract.py. API keys, back-pressure,
 # GET /metrics, the request log and the status file: scripts/serve_admin.py. Who a request is, the prompt's and the
 # reply's limits and a stream's pings (the internet server): scripts/serve_net.py. Quotas and the order of service by
-# priority: scripts/serve_quota.py, sclmd/order.py. ZDR: what it logs of a request is metadata (scripts/serve_contract.py:
+# priority: scripts/serve_quota.py, sclmd/order.py. Prompt caches per user, cache_control and the 1 h disk cache
+# (--prompt-cache): scripts/serve_cache.py. ZDR: what it logs of a request is metadata (scripts/serve_contract.py:
 # why, trace).
 import argparse
 import json
@@ -35,6 +36,7 @@ from sclmd.generate import Picker
 from sclmd.text import Pieces
 from sclmd.stream import VRAM_MARGIN, cap_vram
 from scripts import serve_admin as A
+from scripts import serve_cache as K
 from scripts import serve_contract as C
 from scripts import serve_net as N
 from scripts import serve_ops
@@ -76,6 +78,10 @@ class Request:
         # who sent it (scripts/serve_net.py: tag), the seams of the later stages: the tenant's id (None: tenancy off),
         # its priority (0: everyone alike), the scope of its prompt caches (None: shared, as before)
         self.tenant, self.priority, self.scope = None, 0, None
+        # --prompt-cache (scripts/serve_cache.py): the positions whose states it asks to be cached [(n, seconds, kind)],
+        # and the tokens a state saved for it covers past what it read from a cache (cache_write_tokens); went_on: it goes
+        # on from a conversation of its own, kept or parked (Server._place)
+        self.points, self.wrote, self.went_on = [], 0, False
 
 
 class Kept:
@@ -84,9 +90,10 @@ class Kept:
     later: the conversation with that reply as a later turn writes it, which the sequence is reading in or has read
     (job), so that the next turn finds it there."""
 
-    def __init__(self, seq: int, base: list, snapped: bool):
+    def __init__(self, seq: int, base: list, snapped: bool, scope=None):
         self.seq, self.base, self.snapped, self.used = seq, base, snapped, time.time()
         self.later, self.job = None, None
+        self.scope = scope  # whose it is (req.scope): only a request of the same scope goes on from it
 
     def now(self, eng: E.Engine) -> list:
         """What the sequence holds."""
@@ -96,8 +103,8 @@ class Kept:
 class Parked:
     """A kept conversation that has left the GPU: its tokens and the engine's state of it in RAM (Engine.park)."""
 
-    def __init__(self, tokens: list, state: dict, used: float):
-        self.tokens, self.state, self.used = tokens, state, used
+    def __init__(self, tokens: list, state: dict, used: float, scope=None):
+        self.tokens, self.state, self.used, self.scope = tokens, state, used, scope
 
 
 class Prefixes:
@@ -113,8 +120,9 @@ class Prefixes:
         self.hits = self.stored = 0
         self.waits = 0  # times a request that begins with one waited for keys and values to put it on
 
-    def find(self, full: list, longer_than: int):
-        """The longest prefix held that `full` begins with and is longer than `longer_than` (and shorter than full) -> (tokens, state) or None."""
+    def find(self, full: list, longer_than: int, scope=None):
+        """The longest prefix held that `full` begins with and is longer than `longer_than` (and shorter than full) -> (tokens, state) or None.
+        (scope: none here; scripts/serve_cache.py's Store takes this place with --prompt-cache.)"""
         best = None
         for key, entry in self.held.items():
             if longer_than < len(key) < len(full) and (best is None or len(key) > len(best)) and tuple(full[: len(key)]) == key:
@@ -161,6 +169,7 @@ class Server:
         self.ops = None  # --crash-only: the lifecycle (scripts/serve_ops.py: install); None: as before
         self.idle_wait = None  # seconds an idle engine thread waits for a request before it turns anyway (None: until one comes)
         self.order = None  # --priorities (sclmd/order.py: scripts/serve_quota.py installs it): the waiting list, the passes and make room by priority
+        self.cache = None  # --prompt-cache: scripts/serve_cache.py's Cache (install); None: as before
 
     def submit(self, req: Request) -> None:
         self.inbox.put(req)
@@ -180,6 +189,13 @@ class Server:
         self.unused.append(old.seq)
         if old.later is None and not self._to_start(old):  # nothing of it can be gone on from
             self.eng.release(old.seq)
+            return True
+        if self.cache is not None:  # --prompt-cache: page-locked, in the one budget of parked conversations and cache entries
+            tokens = old.now(self.eng)
+            state = self.eng.park(old.seq, alloc=K.alloc)
+            if K.locked(state):  # (RAM that could not be page-locked keeps nothing: the conversation is forgotten)
+                self.parked.append(Parked(tokens, state, old.used, old.scope))
+                self.cache.fit(self)
             return True
         self.parked.append(Parked(old.now(self.eng), self.eng.park(old.seq), old.used))
         while sum(p.state["bytes"] for p in self.parked) > self.ram:  # RAM is full: the oldest parked ones are forgotten
@@ -216,13 +232,15 @@ class Server:
         if self.batch.starved and self.active:
             return False
         for k in self.kept.values():
+            if k.scope != req.scope:  # another user's (--prompt-cache): never gone on from
+                continue
             for held in (k.now(eng), k.base):  # as far as the sequence has got, else back at its last turn's start
                 n = len(held)
                 if most < n < len(req.full) and req.full[:n] == held:
                     best, most = k, n
-        back = max((p for p in self.parked if most < len(p.tokens) < len(req.full) and req.full[: len(p.tokens)] == p.tokens),
+        back = max((p for p in self.parked if p.scope == req.scope and most < len(p.tokens) < len(req.full) and req.full[: len(p.tokens)] == p.tokens),
                    key=lambda p: len(p.tokens), default=None)
-        shared = self.prefixes.find(req.full, len(back.tokens) if back is not None else most) if self.prefixes.held else None
+        shared = self.prefixes.find(req.full, len(back.tokens) if back is not None else most, req.scope) if self.prefixes.held else None
         if shared is not None:  # a prefix kept for everyone: a copy of it goes onto a sequence (the copy in RAM stays)
             back = Parked(list(shared[0]), shared[1], time.time())
         reused = 0
@@ -265,12 +283,15 @@ class Server:
         # the sequence holds exactly what is counted as kept: nothing of another conversation
         assert eng.lengths[seq] == reused, f"sequence {seq} holds {eng.lengths[seq]} positions where {reused} were expected"
         req.reused = reused
+        req.went_on = bool(reused) and shared is None and (back is not None or best is not None)  # from its own kept or parked conversation
         stop = self.stop if req.stop_ids is None else req.stop_ids
         req.job = Job(seq, req.full[reused:], req.max_new, req.pick, stop, emit=lambda t, q=req.events: q.put(("token", t)),
                       start=req.start, base=req.full[:reused])
         if shared is not None and reused:
             self.prefixes.hits += 1
-        if reused < req.cut < len(req.full) and self.prefixes.wants(req.full[: req.cut]):  # its shared part is kept when read
+        if self.cache is not None:  # --prompt-cache: its prefix state and the states it asks for, saved as it is read
+            self.cache.arm(self, req)
+        elif reused < req.cut < len(req.full) and self.prefixes.wants(req.full[: req.cut]):  # its shared part is kept when read
             req.job.pause, req.job.at_pause = req.cut, lambda job, cut=req.cut: self._keep_prefix(job, cut)
         self.batch.add(req.job)
         self.active.append(req)
@@ -293,7 +314,7 @@ class Server:
         # it was cut while it read everything again after starting over (its sequence does not hold the turn start then)
         stopped = job.done == "cancelled" and req.stop_text is not None and job.pending is not None and eng.lengths[seq] >= req.start
         if (job.done in ("stop", "length") or stopped) and job.out:
-            kept = self.kept[seq] = Kept(seq, req.full[: req.start], job.snapped)
+            kept = self.kept[seq] = Kept(seq, req.full[: req.start], job.snapped, req.scope)
             try:
                 later = self.canon(req, job.out) if self.canon is not None else None
             except Exception as e:  # noqa: BLE001  (a template that cannot write the reply: nothing is read ahead)
@@ -316,6 +337,7 @@ class Server:
         now = time.perf_counter()
         usage = {"prompt_tokens": len(req.full), "completion_tokens": len(job.out), "total_tokens": len(req.full) + len(job.out),
                  "prompt_tokens_details": {"cached_tokens": req.reused}}
+        K.usage(self, req, usage["prompt_tokens_details"])  # --prompt-cache: cache_write_tokens
         self.totals["requests"] += 1
         self.totals["prompt_tokens"] += len(req.full)
         self.totals["cached_tokens"] += req.reused
@@ -344,6 +366,8 @@ class Server:
         except queue.Empty:
             pass
         self.waiting = [r for r in self.waiting if not r.cancelled]
+        if self.cache is not None:  # --prompt-cache: states read from disk come in; what is past its time goes
+            self.cache.tick(self)
         if self.order is None:
             while self.waiting and self._place(self.waiting[0]):
                 self.waiting.pop(0)
@@ -408,7 +432,8 @@ class Server:
                                     "free_gib": round(sum(tile[t] * free[t] for t in tile) / 2**30, 2)},
                 "started_over_for_memory": self.batch.restarts, "passes": self.batch.passes, "passes_by_width": dict(self.batch.widths), "rows_per_pass": round(self.batch.rows / max(self.batch.passes, 1), 2),
                 "guesses_kept": round(self.batch.kept_rows / max(self.batch.guess_rows, 1), 2),
-                "tokens_per_second_while_busy": round(self.totals["completion_tokens"] / max(self.busy_s, 1e-9), 1)}
+                "tokens_per_second_while_busy": round(self.totals["completion_tokens"] / max(self.busy_s, 1e-9), 1),
+                **({"prompt_cache": self.cache.about()} if self.cache is not None else {})}
 
 
 class App:
@@ -612,6 +637,11 @@ class App:
         max_new = min(wanted, room)
         if max_new < 1:
             raise Refused(400, "max_tokens is at least 1")
+        points = []
+        if getattr(self.server, "cache", None) is not None:  # --prompt-cache: cache_control's marks (scripts/serve_cache.py)
+            with self.lock:
+                points, more = K.points(self, body, messages, tools, think, full, strict, self.server.cache.turns)
+            ignored = sorted(set(ignored) | set(more))
         temperature = float(body.get("temperature", 1.0) if body.get("temperature") is not None else 1.0)
         top_p = float(body.get("top_p", 0.95) if body.get("top_p") is not None else 0.95)
         top_k = int(body.get("top_k", 64) or 64)
@@ -619,6 +649,7 @@ class App:
         pick = Picker(temperature, max(1, min(top_k, 1024)), top_p, seed=int(seed) & 0x3FFFFFFF if seed is not None else uuid.uuid4().int & 0x3FFFFFFF)
         req = Request(full, start, max_new, pick, think, messages, cut)
         req.ignored = ignored
+        req.points = points
         req.tools, req.opened = tools, opened
         if tools and body.get("parallel_tool_calls") is False:  # one call: the reply ends with it
             req.stop_ids = tuple(self.server.stop) + (self.marks()["ids"].end,)
@@ -715,6 +746,7 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, TypeError, AttributeError, OverflowError, RecursionError) as e:
             return self._error(400, f"the body is not a chat completion request: {str(e)[:300]}")
         N.tag(self, req)  # who sent it: req.tenant, req.priority, req.scope (scripts/serve_net.py)
+        K.before(app, req)  # --prompt-cache: a state of the disk cache its prompt begins with, read into RAM first
         req.stops = stops
         if odd:  # a stop that is not text: what is text of it is served
             req.ignored = sorted(set(req.ignored) | {"stop"})
@@ -959,6 +991,7 @@ def parser() -> argparse.ArgumentParser:
     E.add_kv4_option(ap)
     C.add_options(ap)
     A.add_options(ap)
+    K.add_options(ap)
     serve_ops.add_options(ap)
     return ap
 
@@ -968,6 +1001,7 @@ def main() -> None:
     ap = parser()
     cli = A.parse_args(ap)  # serve.toml's options (--config) under the command line's
     keys = A.start(cli)  # the API keys; a host other than loopback without one: a warning (--require-key: no start)
+    K.check(cli)
     E.use_int8_option(cli)  # the whole engine: every request's rows on the integer products, so a reply's bits do not depend on its neighbours
     kv4 = E.use_kv4_option(cli)
     import sys
@@ -1022,6 +1056,7 @@ def main() -> None:
     httpd = C.BoundedHTTPServer((cli.host, cli.port), Handler, cli.max_connections) if early is None else early
     httpd.app = app
     A.install(app, server, cli, httpd, keys)  # /metrics, keys, back-pressure, the request log and status file (scripts/serve_admin.py)
+    K.install(app, server, cli)  # --prompt-cache (scripts/serve_cache.py)
     if early is not None:  # --crash-only: the port already serves its placeholder; the real handler only once keys and limits are set
         serve_ops.serving(early, Handler, app)
     serve_ops.started(app, ops, engine_thread)  # --crash-only's watchdog; --image auto: the image written while it serves
