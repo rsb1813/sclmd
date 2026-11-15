@@ -9,8 +9,9 @@
 # One thread owns the engine; the HTTP threads only hand it requests and turn the tokens it settles into text.
 # Fields it does not serve, the body's size and the connections: scripts/serve_contract.py. API keys, back-pressure,
 # GET /metrics, the request log and the status file: scripts/serve_admin.py. Who a request is, the prompt's and the
-# reply's limits and a stream's pings (the internet server): scripts/serve_net.py. ZDR: what it logs of a request is
-# metadata (scripts/serve_contract.py: why, trace).
+# reply's limits and a stream's pings (the internet server): scripts/serve_net.py. Quotas and the order of service by
+# priority: scripts/serve_quota.py, sclmd/order.py. ZDR: what it logs of a request is metadata (scripts/serve_contract.py:
+# why, trace).
 import argparse
 import json
 import os
@@ -159,6 +160,7 @@ class Server:
         self.t0, self.busy_s = time.time(), 0.0
         self.ops = None  # --crash-only: the lifecycle (scripts/serve_ops.py: install); None: as before
         self.idle_wait = None  # seconds an idle engine thread waits for a request before it turns anyway (None: until one comes)
+        self.order = None  # --priorities (sclmd/order.py: scripts/serve_quota.py installs it): the waiting list, the passes and make room by priority
 
     def submit(self, req: Request) -> None:
         self.inbox.put(req)
@@ -168,7 +170,7 @@ class Server:
         longest ago leaves the GPU (to RAM while there is room for it there). False: none is kept."""
         if not self.kept:
             return False
-        old = min(self.kept.values(), key=lambda k: k.used)
+        old = min(self.kept.values(), key=lambda k: k.used) if self.order is None else self.order.to_park(self)  # (--priorities: the worst class first)
         if self.ram <= 0:
             self._forget(old)
             return True
@@ -342,8 +344,11 @@ class Server:
         except queue.Empty:
             pass
         self.waiting = [r for r in self.waiting if not r.cancelled]
-        while self.waiting and self._place(self.waiting[0]):
-            self.waiting.pop(0)
+        if self.order is None:
+            while self.waiting and self._place(self.waiting[0]):
+                self.waiting.pop(0)
+        else:  # --priorities: by priority, any request that can be placed (sclmd/order.py)
+            self.order.place(self)
         for req in self.active:
             if req.cancelled:
                 req.job.cancel = True
@@ -393,7 +398,8 @@ class Server:
         eng = self.eng
         tile = {t: E.tile_bytes(eng.cfg, t, eng.lean, eng.kv4) for t in eng.ring}
         free = eng.free_tiles()
-        return {"requests": {"under_way": len(self.active), "waiting": len(self.waiting) + self.inbox.qsize(), **self.totals},
+        order = {"order": self.order.about()} if self.order is not None else {}  # --priorities
+        return {"requests": {"under_way": len(self.active), "waiting": len(self.waiting) + self.inbox.qsize(), **self.totals}, **order,
                 "conversations_kept": len(self.kept), "conversations_in_ram": len(self.parked),
                 "ram_gib": round(sum(p.state["bytes"] for p in self.parked) / 2**30, 2), "sequences": eng.sequences,
                 "prefixes": {"held": len(self.prefixes.held), "gib": round(self.prefixes.bytes() / 2**30, 3), "stored": self.prefixes.stored,
@@ -630,6 +636,7 @@ class Handler(BaseHTTPRequestHandler):
     def send_response(self, code, message=None) -> None:
         A.answered(self, code)  # every answer's status: /metrics and the request log (scripts/serve_admin.py)
         super().send_response(code, message)
+        A.status_headers(self)  # --quotas: the tenant's x-ratelimit-* headers (scripts/serve_quota.py)
 
     def _json(self, status: int, obj: dict, headers: dict | None = None) -> None:
         data = json.dumps(obj, ensure_ascii=False).encode()

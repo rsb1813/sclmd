@@ -9,6 +9,7 @@
 #   SCLMD_API_KEY=n1:KEY python -m scripts.serve_canned PORT --anonymous --trusted-proxies 127.0.0.1 --metrics-local
 #       --max-prompt 64 --max-output 100 --max-tokens 100 --stream-ping 1 --first-ms 3500
 #   SCLMD_CHECK_KEY=KEY uv run --no-project --with openai python scripts/openai_client_check.py PORT --net
+# The quota items (N2: scripts/serve_quota.py; the headers, GET /v1/usage, the daily limit's 429): see --quota below.
 # SCLMD_CHECK_KEY is the key the client sends (default "none": a server without keys takes any).
 import os
 import sys
@@ -63,6 +64,54 @@ if "--rate-limit" in sys.argv[2:]:
     except openai.RateLimitError:
         check("the library waits Retry-After and is then served", False, f"gave up after {time.perf_counter() - t:.1f} s")
     busy.join()
+    print("ALL OK" if ok else "SOMETHING FAILED")
+    sys.exit(0 if ok else 1)
+
+
+if "--quota" in sys.argv[2:]:
+    # N2 (scripts/serve_quota.py): a stand-in with --quotas, --anonymous, 127.0.0.1 as a trusted proxy, and the key's
+    # own day of 4 requests:
+    #   SCLMD_API_KEY="n2:KEY rpd=4" python -m scripts.serve_canned PORT --quotas --priorities --anonymous --trusted-proxies 127.0.0.1
+    #   SCLMD_CHECK_KEY=KEY uv run --no-project --with openai python scripts/openai_client_check.py PORT --quota
+    import http.client
+    import json
+
+    hello = [{"role": "user", "content": "hi"}]
+    names = ["x-ratelimit-limit-requests", "x-ratelimit-limit-tokens", "x-ratelimit-remaining-requests", "x-ratelimit-remaining-tokens",
+             "x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"]
+    first = client.chat.completions.with_raw_response.create(model="x", messages=hello)
+    second = client.chat.completions.with_raw_response.create(model="x", messages=hello)
+    h1, h2 = first.headers, second.headers
+    check("x-ratelimit-* on an answer, read by the library", all(h1.get(n) for n in names) and first.parse().choices[0].message.content.startswith("Hello!"),
+          ", ".join(f"{n[12:]}={h1.get(n)}" for n in names))
+    check("  remaining requests go down by one", int(h1["x-ratelimit-remaining-requests"]) - int(h2["x-ratelimit-remaining-requests"]) == 1,
+          f"{h1['x-ratelimit-remaining-requests']} then {h2['x-ratelimit-remaining-requests']}")
+    away = OpenAI(base_url=client.base_url, api_key="-", default_headers={"Authorization": "", "X-Forwarded-For": "203.0.113.9"}, max_retries=0, timeout=20)
+    raw = away.chat.completions.with_raw_response.create(model="x", messages=hello)
+    check("  an address without a key: its own limits", raw.headers.get("x-ratelimit-limit-tokens") == "100000"
+          and raw.headers.get("x-ratelimit-limit-requests") == "120", f"{raw.headers.get('x-ratelimit-limit-tokens')}")
+    here = OpenAI(base_url=client.base_url, api_key="-", default_headers={"Authorization": ""}, max_retries=0, timeout=20)
+    raw = here.chat.completions.with_raw_response.create(model="x", messages=hello)
+    check("  this PC: exempt, no headers", not any(raw.headers.get(n) for n in names))
+    conn = http.client.HTTPConnection("127.0.0.1", int(sys.argv[1]), timeout=10)
+    conn.request("GET", "/v1/usage", headers={"Authorization": f"Bearer {KEY}"})
+    r = conn.getresponse()
+    usage = json.loads(r.read())
+    check("GET /v1/usage: the caller's own", r.status == 200 and usage.get("user", "").startswith("key:") and usage["day"]["requests"] == 2
+          and usage["day"]["limit_requests"] == 4, json.dumps({k: usage.get(k) for k in ("user", "over_quota")}))
+    client.chat.completions.create(model="x", messages=hello)
+    client.chat.completions.create(model="x", messages=hello)  # the day's 4
+    t = time.perf_counter()
+    try:
+        client.with_options(max_retries=2).chat.completions.create(model="x", messages=hello)
+        check("the daily limit: RateLimitError, not retried (Retry-After past 120 s)", False, "no error raised")
+    except openai.RateLimitError as e:
+        took, b = time.perf_counter() - t, e.body or {}
+        check("the daily limit: RateLimitError, not retried (Retry-After past 120 s)", e.status_code == 429 and b.get("code") == "rate_limit_exceeded"
+              and b.get("type") == "requests" and int(e.response.headers.get("retry-after", 0)) > 120 and took < 2,
+              f"{took:.2f} s, Retry-After {e.response.headers.get('retry-after')}: {e.message[:90]}")
+    r = away.chat.completions.create(model="x", messages=hello)
+    check("  another tenant is still served", r.choices[0].message.content.startswith("Hello!"))
     print("ALL OK" if ok else "SOMETHING FAILED")
     sys.exit(0 if ok else 1)
 

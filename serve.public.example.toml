@@ -34,6 +34,16 @@ anonymous = true                 # a request without a key is served as its addr
 trusted-proxies = "192.168.0.10" # EDIT: the proxy PC's LAN address: its X-Forwarded-For alone is read
 metrics-local = true             # GET /metrics, and GET /'s counts, from this PC only
 
+# quotas and priorities (scripts/serve_quota.py, sclmd/order.py; design.md 6.18). 6.16's numbers are the defaults:
+# a key 500,000 tokens and 600 requests an hour, an address without a key 100,000 and 120, the day 24 times that, all
+# requests without a key 20,000,000 tokens a day (tph, rph, ip-tph, ip-rph, daily-times, keyless-day). A key's own:
+# "name: key tph=1000000 rph=1200" in the key file.
+quotas = true                    # over the hour's quota a request is still served, at a lower priority; the day's: 429
+quota-file = "logs/serve_quota.json"   # the counters (tenant ids and numbers only), read back at start
+priorities = true                # this PC, then in quota, then over quota 12 steps lower; a step better every 10 s waited
+# max-waiting and queue-timeout stay off: each refuses requests (429, 503), and 6.16 refuses only at the daily limit;
+# max-connections (256) bounds the requests that wait
+
 # what is written: metadata only (ZDR: no prompt or reply)
 request-log = "logs/serve_requests.jsonl"
 status-file = "logs/serve_status.json"

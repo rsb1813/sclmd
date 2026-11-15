@@ -18,6 +18,7 @@
 # - serve.toml (--config): every option, the command line over it; keys are never read from it.
 # - --debug (a loopback host only): POST /debug/fault arms an injected fault, GET /debug/audit checks the books of the
 #   keys and values at idle (scripts/soak.py uses both).
+# Quotas and priorities (N2): scripts/serve_quota.py, through the hooks here (submit, ended, get, post, status_headers).
 import argparse
 import hmac
 import ipaddress
@@ -33,6 +34,7 @@ from datetime import datetime
 
 from scripts import serve_contract as C
 from scripts import serve_net as N
+from scripts import serve_quota as Q
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG = os.path.join(ROOT, "serve.toml")  # read when it is there (--config another; --config "" none)
@@ -90,10 +92,13 @@ def finish_label(finish) -> str:
 # API keys
 
 _NAMED = re.compile(r"^([A-Za-z0-9_.-]{1,40})\s*:\s*(\S.*)$")
+_LIMIT = re.compile(r"^(tph|rph|tpd|rpd)=(\d+)$")  # a key's own quota after it (scripts/serve_quota.py)
 
 
-def parse_keys(text: str, source: str) -> list:
-    """name:key or key entries, by commas or lines ('#' starts a comment line) -> [(name, key bytes)]."""
+def parse_keys(text: str, source: str, limits: dict | None = None) -> list:
+    """name:key or key entries, by commas or lines ('#' starts a comment line) -> [(name, key bytes)]. Words after the
+    key that are all tph=N, rph=N, tpd=N or rpd=N are the key's own quota (into `limits`, by name; --quotas); an entry
+    with any other words after the key is the key as a whole, as before."""
     keys = []
     for part in re.split(r"[,\r\n]", text or ""):
         part = part.strip()
@@ -101,21 +106,29 @@ def parse_keys(text: str, source: str) -> list:
             continue
         m = _NAMED.match(part)
         name, key = (m.group(1), m.group(2).strip()) if m else (f"{source}{len(keys) + 1}", part)
+        words = key.split()
+        if len(words) > 1 and all(_LIMIT.match(w) for w in words[1:]):
+            key = words[0]
+            if limits is not None:
+                limits[name] = {_LIMIT.match(w).group(1): int(_LIMIT.match(w).group(2)) for w in words[1:]}
         keys.append((name, key.encode()))
     return keys
 
 
 def load_keys(cli) -> list:
-    keys = parse_keys(os.environ.get(ENV_KEY, ""), "key")
+    """The API keys; a key's own quota goes to cli.key_limits (name -> {tph, rph, tpd, rpd})."""
+    limits = {}
+    keys = parse_keys(os.environ.get(ENV_KEY, ""), "key", limits)
     if getattr(cli, "api_key_file", ""):
         try:
             with open(cli.api_key_file, encoding="utf-8") as f:
-                keys += parse_keys(f.read(), "file")
+                keys += parse_keys(f.read(), "file", limits)
         except OSError as e:
             raise SystemExit(f"--api-key-file {cli.api_key_file}: {e}")
     names = [n for n, _ in keys]
     if len(set(names)) != len(names):
         raise SystemExit("two API keys have the same name")
+    cli.key_limits = limits
     return keys
 
 
@@ -308,6 +321,7 @@ class Admin:
         self.app, self.server, self.httpd = app, server, httpd
         self.keys, self.max_waiting, self.queue_timeout, self.debug = list(keys), max_waiting, queue_timeout, debug
         self.users = users if users is not None else N.Users(self.keys, name_of=key_name)  # who a request is (scripts/serve_net.py)
+        self.quota = self.order = None  # --quotas, --priorities (scripts/serve_quota.py: install)
         self.host, self.port = host, port
         self.lock = threading.Lock()
         self.inflight = {}  # id(request) -> Entry
@@ -408,16 +422,29 @@ class Admin:
         beyond the sequences that are free."""
         entry = Entry(req, rid, getattr(handler, "_r4_key", None), stream, handler.client_address[0] if handler.client_address else None)
         with self.lock:  # the count and the hand-over together: requests that come at once cannot all pass a count of N - 1
-            waiting = self._waiting() if self.max_waiting > 0 else None
+            daily = Q.admit(self, req)  # --quotas: a daily limit (429), before anything is counted
+            waiting = self._waiting() if self.max_waiting > 0 and daily is None else None
+            if waiting is not None and self.order is not None:  # --priorities: only those it would wait behind count
+                waiting = [e for e in waiting if getattr(e.req, "klass", e.req.priority) <= req.priority]
             over = len(waiting) - self._free() if waiting is not None else 0
             if waiting is not None and over >= self.max_waiting:
                 after = self.retry_after(waiting)
                 self.refused["queue_full"] += 1
                 refused = True
+            elif daily is not None:
+                refused = True
             else:
                 self.inflight[id(req)] = entry
+                if self.quota is not None:
+                    self.quota.taken(req)
                 self.server.submit(req)
                 refused = False
+        if daily is not None:  # (scripts/serve_quota.py) OpenAI's 429 with Retry-After; the log keeps which limit
+            handler._r4_logged = True
+            self._write({"id": rid, "key": entry.key, "client": entry.client, "status": 429, "finish": "daily_limit", "limit": daily.kind,
+                         "tenant": req.tenant})
+            handler._json(429, daily.body(), daily.headers())
+            return False
         if refused:
             handler._r4_logged = True
             self._write({"id": rid, "key": entry.key, "client": entry.client, "status": 429, "finish": "queue_full", "waiting": over})
@@ -495,6 +522,8 @@ class Admin:
         if entry is None:
             return
         handler._r4 = None  # the connection's next request starts afresh
+        if self.quota is not None:  # --quotas: what it cost (nothing if it never reached the engine)
+            self.quota.settle(req, event)
         job = getattr(req, "job", None)
         record = {"id": entry.rid, "key": entry.key, "client": entry.client, "status": getattr(handler, "_r4_status", None), "stream": entry.stream,
                   "prompt": len(req.full), "kept": getattr(req, "reused", 0), "reply": len(getattr(job, "out", ()))}
@@ -519,6 +548,8 @@ class Admin:
             record["ignored"] = req.ignored
         if getattr(req, "tenant", None) is not None:  # tenancy on (scripts/serve_net.py): who it was
             record["tenant"] = req.tenant
+        if self.order is not None:  # --priorities: its priority when it was last ordered (sclmd/order.py)
+            record["priority"] = getattr(req, "priority", 0)
         if getattr(job, "seq", None) is not None:
             record["seq"] = job.seq
         s = self.server
@@ -673,6 +704,13 @@ class Admin:
             family("sclmd_connections", "gauge", "connections served now (a thread each)", [({}, n["connections"]["live"])])
             family("sclmd_connections_turned_away_total", "counter", "connections answered 503 past --max-connections", [({}, n["connections"]["turned_away"])])
         family("sclmd_injected_faults_total", "counter", "faults injected through /debug/fault", [({"kind": k}, v) for k, v in sorted(n["injected"].items())])
+        if self.quota is not None:  # --quotas (scripts/serve_quota.py): counts only, never a tenant
+            self.quota.families(family)
+        if self.order is not None:  # --priorities (sclmd/order.py)
+            o = self.order.n
+            family("sclmd_order_total", "counter", "the order of service: requests placed, placed past the waiting list's head, placed while "
+                   "texts waited for keys and values; guess rows the best writers took before worse prompts",
+                   [({"what": k}, o[k]) for k in ("placed", "placed_past_the_head", "placed_while_starved", "best_guess_rows")])
         return "\n".join(lines) + "\n"
 
     # the status file
@@ -800,6 +838,9 @@ def get(handler) -> bool:
         handler.end_headers()
         handler.wfile.write(data)
         return True
+    if path == "/v1/usage" and adm.quota is not None:  # --quotas: the caller's own usage and limits (scripts/serve_quota.py)
+        handler._json(200, adm.quota.usage_of(N.who_of(handler).tenant))
+        return True
     if path == "/debug/audit" and adm.debug and _local(handler):
         s = adm.server
         if not hasattr(s, "batch"):
@@ -832,6 +873,8 @@ def post(handler) -> bool:
         return False
     path = handler.path.split("?")[0].rstrip("/")
     if not _allowed(adm, handler, path):
+        return True
+    if path == "/v1/chat/completions" and adm.quota is not None and Q.refused_early(adm, handler):  # --quotas: already at a daily limit
         return True
     if path == "/debug/fault" and adm.debug and _local(handler):
         try:
@@ -911,6 +954,13 @@ def answered(handler, code: int) -> None:
         if tenant is not None:
             record["tenant"] = tenant
         adm._write(record)
+
+
+def status_headers(handler) -> None:
+    """Right after every answer's status line (Handler.send_response): with --quotas, the tenant's x-ratelimit-*."""
+    adm = _admin(handler)
+    if adm is not None and adm.quota is not None:
+        Q.status_headers(adm, handler)
 
 
 def message(handler, param=None, code=None) -> None:
@@ -1024,14 +1074,17 @@ def add_options(ap) -> None:
                    "(without it: a warning)")
     g.add_argument("--max-waiting", type=int, default=0, help="answer 429 (with Retry-After) to a request when this many already wait for "
                    "a sequence beyond the sequences free now (unused or kept: a burst at an idle server is taken in up to those first; "
-                   "0: no bound, as before; 64 suggested)")
+                   "0: no bound, as before; 64 suggested; with --priorities only those of a class no worse than its own count; "
+                   "serve.public.example.toml leaves it off: 6.16 refuses only at the daily limit)")
     g.add_argument("--queue-timeout", type=float, default=0.0, help="answer 503 (with Retry-After) to a request that has waited this many "
-                   "seconds for a sequence; with it, a stream's headers go out when it has one (0: wait for ever, as before; 120 suggested)")
+                   "seconds for a sequence; with it, a stream's headers go out when it has one (0: wait for ever, as before; 120 suggested; "
+                   "serve.public.example.toml leaves it off: it would refuse over-quota requests that --priorities keeps waiting)")
     g.add_argument("--request-log", default="", help="a JSON line a request here, e.g. logs/serve_requests.jsonl (\"\": none, as before)")
     g.add_argument("--request-log-mb", type=float, default=64.0, help="the request log is rotated (.1, .2, .3) past this size")
     g.add_argument("--status-file", default="", help="the server's state as JSON, rewritten every 5 s, e.g. logs/serve_status.json (\"\": none)")
     g.add_argument("--debug", action="store_true", help="POST /debug/fault and GET /debug/audit, for scripts/soak.py (a loopback --host only)")
     N.add_options(ap)  # who a request is and the limits (scripts/serve_net.py)
+    Q.add_options(ap)  # quotas and priorities (scripts/serve_quota.py)
 
 
 def _defaults_from(ap, data: dict, path: str) -> dict:
@@ -1096,6 +1149,7 @@ def start(cli) -> list:
     (--require-key: no start)."""
     keys = load_keys(cli)
     N.check(cli)
+    Q.check(cli, keys)
     if cli.debug and not loopback(cli.host):
         raise SystemExit("--debug serves its fault endpoint only on a loopback --host (127.0.0.1)")
     if not loopback(cli.host) and not keys:
@@ -1109,6 +1163,8 @@ def start(cli) -> list:
     for name, key in keys:
         if len(key) < 16:
             print(f"[serve] warning: the API key {name!r} has only {len(key)} characters", flush=True)
+        if len(key.split()) > 1:  # (its own quota written wrongly? tph=, rph=, tpd=, rpd= take whole numbers)
+            print(f"[serve] warning: the API key {name!r} has a space in it", flush=True)
     return keys
 
 
@@ -1129,4 +1185,5 @@ def install(app, server, cli, httpd, keys: list) -> Admin:
     said = N.line(cli, users)
     if said:
         print(said, flush=True)
+    Q.install(adm, server, cli)  # --quotas, --priorities (scripts/serve_quota.py; nothing without them)
     return adm

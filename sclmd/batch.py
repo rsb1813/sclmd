@@ -10,6 +10,9 @@
 # prompts someone waits on are left that 32 rows do not take: such a pass has the logits of its last 32 rows at most
 # (E.logits_first), so the rows whose logits are looked at (the texts being written and their guesses, a prompt's last
 # row) are put at its end (_fit).
+#
+# With an Order (sclmd/order.py: scripts/serve.py --priorities; Batcher.order) the jobs get the tiles, the prompts'
+# rows and the guesses of a pass by priority instead of as they came and in turn; the texts are the same.
 import torch
 
 from . import engine as E
@@ -61,6 +64,9 @@ class Job:
         self.cancel = False  # set from outside: the text ends at the next pass
         self.snapped = False
         self.read = self.passes = self.rows = 0  # prompt tokens read here, passes it had rows in, rows it was given
+        # the order of service (sclmd/order.py, --priorities): when its request came (None: when the batcher first saw
+        # it), its priority (lower first) and class; its level and place in this pass
+        self.t_arrival, self.priority, self.klass, self.level, self.rank = None, 0, 0, 0, 0
         # a position at which the reading stops for a moment: when the sequence holds exactly that many positions,
         # at_pause(job) is called between passes (scripts/serve.py keeps the shared prefix there), then it reads on
         self.pause, self.at_pause = None, None
@@ -87,6 +93,7 @@ class Batcher:
         self.jobs = []
         self.turn = 0
         self.make_room = None  # called when the pool of keys and values is empty: frees some and says so, or says no
+        self.order = None  # sclmd/order.py's Order (--priorities): the tiles, rows and guesses of a pass by priority (None: as below)
         self.passes = self.rows = self.guess_rows = self.kept_rows = 0
         self.starved = 0  # jobs that had to wait for keys and values in the last pass
         self.ended = self.restarts = 0  # jobs that have ended; times a job had to start over for lack of memory
@@ -181,6 +188,8 @@ class Batcher:
         eng, live = self.eng, order
         wide = width > E.ATT_ROWS
         writers = [j for j in order if j.pending is not None]
+        if self.order is not None:  # by level (sclmd/order.py): the best writers' rows first
+            writers = self.order.writers(writers)
         rows, free = {}, width
         for j in writers[: min(free, E.ATT_ROWS)]:
             rows[j] = 1
@@ -201,14 +210,21 @@ class Batcher:
         # texts are being written (their guesses come before the rest of it)
         ahead = [] if wide else [j for j in order if j.only_read]
         waiting = [j for j in order if j.pending is None and not j.only_read]
+        if self.order is not None:
+            waiting = self.order.readers(waiting)
         if wide:  # a sequence a segment, MAX_SEGS of them in a pass (a narrow pass has fewer rows than that)
             waiting = waiting[: E.MAX_SEGS - len(rows)]
-        free -= read(waiting, free)
+        able = (lambda j: min(self.depth, j.max_new - len(j.out), room[j] - 1)) if self.drafter is not None else None  # noqa: E731
+        guessed = 0  # (sclmd/order.py) guesses the best class's writers took before the prompts of a worse class
+        if self.order is None:
+            free -= read(waiting, free)
+        else:  # level by level; the best class's writers take their whole guess depth before a worse class's prompts
+            given, guessed = self.order.prompts(waiting, writers, rows, read, free, E.ATT_ROWS - sum(j in rows for j in writers) if wide else None, able)
+            free -= given + guessed
         free -= read(ahead, min(free, width // 4) if writers else free)
         if self.drafter is not None:
-            able = lambda j: min(self.depth, j.max_new - len(j.out), room[j] - 1)  # noqa: E731
             # (a wide pass: the guesses that fit beside the writers in the rows it has the logits of)
-            spare = min(free, E.ATT_ROWS - sum(j in rows for j in writers)) if wide else free
+            spare = min(free, E.ATT_ROWS - sum(j in rows for j in writers) - guessed) if wide else free
             while spare and any(rows[j] - 1 < able(j) for j in writers if j in rows):
                 for j in writers:
                     if spare and j in rows and rows[j] - 1 < able(j):
@@ -235,6 +251,8 @@ class Batcher:
             for j in self.jobs:
                 j.held = None
             live = list(self.jobs)
+        if self.order is not None:  # (sclmd/order.py) every job's level; the tiles go to the jobs in its order
+            live = self.order.before(self, live)
         rows = self._share(live)
         self.turn += 1
         # The tiles the pass needs. When the pool is short (and make_room frees nothing more), the jobs get theirs in
@@ -263,8 +281,8 @@ class Batcher:
             return True
         if not use:
             holders = [j for j in self.jobs if any(x >= 0 for t in eng.ring for x in eng.tiles[t][j.seq])]
-            if len(holders) > 1:
-                self._start_over(holders[-1])
+            if len(holders) > 1:  # (sclmd/order.py: the last of the worst level)
+                self._start_over(holders[-1] if self.order is None else self.order.last(holders))
             else:
                 victim = holders[-1] if holders else live[-1]
                 victim.done = "full"
