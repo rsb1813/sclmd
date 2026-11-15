@@ -10,10 +10,22 @@ from . import model as M
 
 # SCLMD_DLL: another build of the engine (to compare builds: scripts/bits_check.py)
 DLL = os.environ.get("SCLMD_DLL") or os.path.join(os.path.dirname(__file__), "..", "engine", "build", "sclmd.dll")
-MAX_TOKENS = 32  # the most rows the kernels take in a pass; an engine is made for 8, 16 or 32 (Engine.rows)
+MAX_TOKENS = 256  # the most rows the kernels take in a pass; an engine is made for 8, 16, 32, 64, 128 or 256 (Engine.rows)
+ROWS = (8, 16, 32, 64, 128, 256)
+MAX_SEGS = 64  # segments of a pass (engine/sclmd.cu)
+# a wider pass's attention takes as many rows at a time as its memory holds (sized for this many at the whole context),
+# and the pass has the logits of its last ATT_ROWS rows at most
+ATT_ROWS = 32
 TILE = 16   # positions of keys and values a sequence is given at a time
 SPARE = 16  # positions a sliding layer keeps past its window at least: a pass writes its rows while its first row still reads a window back
 DRAFTER_BYTES = 240 << 20  # the drafter at 4 bits a weight (0.47B weights) and its work memory
+
+
+def logits_first(rows: int, logits_from: int) -> int:
+    """The first row a pass of `rows` rows has logits of (engine/sclmd.cu): from logits_from's group of eight on, and
+    in a pass of more than ATT_ROWS rows of its last ATT_ROWS at most."""
+    asked = max(0, logits_from) // 8 * 8
+    return max(asked, (rows - ATT_ROWS + 7) // 8 * 8) if rows > ATT_ROWS else asked
 
 
 class KVFull(Exception):
@@ -75,9 +87,31 @@ def fixed_bytes(cfg: M.Config, head_bits: int, capacity: int, pool: dict | None 
     kv = sum(tile_bytes(cfg, t, keyless, kv4) * (ring_tiles(cfg, t, capacity, rows) + extra_tiles(cfg, t, kv4) if pool is None else pool[t])
              for t in kinds)
     # the logits of the main model and the drafter, attention's scores and weights, and the rest
-    work = 2 * rows * cfg.vocab * 4 + cfg.heads * rows * (max(capacity, cfg.window + rows) + 32) * 6 + (32 << 20)
+    narrow = min(rows, ATT_ROWS)  # the logits and attention's scores are of ATT_ROWS rows at most
+    work = 2 * narrow * cfg.vocab * 4 + cfg.heads * narrow * (max(capacity, cfg.window + rows) + 32) * 6 + (32 << 20)
+    # the rest (32 MiB) holds the rows' own work memory of up to ATT_ROWS rows (0.36 MiB a row for the real model); the
+    # rows of a wider engine past those are counted (256 rows: 80 MiB more)
+    work += max(0, rows - ATT_ROWS) * row_bytes(cfg, kv4)
     work += sum(capacity * turned(cfg, t) * 4 for t in kinds if keyless_kind(t, keyless))  # cos and sin of every position
     return head + kv + work
+
+
+def work_sizes(cfg: M.Config, kv4: bool = False) -> tuple:
+    """(widest head, a matrix's widest output, its widest input): the values a row of an Engine's work memory holds.
+    kv4: with 4-bit layers (kv4_layers), whose queries are kept twice (turned and as they are) and their output twice
+    (turned and back), every row's (the real model's widest head, 512, is already twice its sliding one)."""
+    widest_head = cfg.heads * max(cfg.head_dim.values())
+    if kv4 and kv4_layers(cfg):
+        widest_head = max(widest_head, 2 * cfg.heads * cfg.head_dim[M.SLIDING])
+    y_size = max(max(cfg.heads * cfg.head_dim[t] + 2 * cfg.kv_heads[t] * cfg.head_dim[t] for t in cfg.head_dim), cfg.mlp, cfg.hidden)
+    return widest_head, y_size, max(cfg.hidden, widest_head, cfg.mlp)
+
+
+def row_bytes(cfg: M.Config, kv4: bool = False) -> int:
+    """The bytes of the work memory an Engine has for each row of its passes: h, h2, hn, y, y2, attn (float32), qhat
+    (fp16) and xf (fp16 inputs)."""
+    widest_head, y_size, x_size = work_sizes(cfg, kv4)
+    return 4 * (3 * cfg.hidden + y_size + cfg.mlp + widest_head) + 2 * widest_head + 2 * x_size
 
 
 class Mat(C.Structure):
@@ -100,14 +134,14 @@ class Layer(C.Structure):
 
 class Segs(C.Structure):
     """The rows of a pass by sequence (engine/sclmd.cu)."""
-    _fields_ = [("n", C.c_int)] + [(name, C.c_int * MAX_TOKENS) for name in ("row0", "cnt", "pos0", "seq")]
+    _fields_ = [("n", C.c_int)] + [(name, C.c_int * MAX_SEGS) for name in ("row0", "cnt", "pos0", "seq")]
 
 
 class Model(C.Structure):
     _fields_ = ([("layers", C.c_void_p)] + [(n, C.c_int) for n in ("n_layers", "hidden", "mlp", "heads", "window", "vocab")] +
                 [("eps", C.c_float), ("softcap", C.c_float), ("head", Mat), ("rot_head", Rot), ("norm", C.c_void_p)] +
                 [(p, C.c_void_p) for p in ("h", "h2", "fps", "xf", "y", "y2", "qhat", "scores", "probs", "attn", "hn", "logits")] +
-                [("int8", C.c_float), ("pad_int8", C.c_int)])
+                [("int8", C.c_float), ("pad_int8", C.c_int), ("scores_room", C.c_longlong)])
 
 
 # The integer products (brief B1, lossy, off by default): the layers' matrices take int8 inputs, clipped at INT8_SIGMA
@@ -260,7 +294,7 @@ class Engine:
         assert capacity % TILE == 0, "the capacity is a multiple of 16"
         self.int8 = int8_default() if int8 is None else float(int8)  # 0: off; else the clip in rms of the inputs (INT8_SIGMA)
         self.kv4 = kv4_default() if kv4 is None else bool(kv4)  # brief K3: kv4_layers() keep their keys and values at 4 bits
-        assert rows in (8, 16, 32), "a pass has 8, 16 or 32 rows"
+        assert rows in ROWS, "a pass has 8, 16, 32, 64, 128 or 256 rows"
         self.cfg, self.device, self.capacity, self.sequences, self.rows = cfg, device, capacity, sequences, rows
         self.lengths = [0] * sequences  # positions each sequence holds
         self.highs = [0] * sequences  # one past the furthest position written since its start: what a sliding layer's ring has lost follows from it
@@ -369,17 +403,16 @@ class Engine:
             cl.scalar, cl.full, cl.head_dim, cl.kv_heads, cl.ring = float(lay["scalar"]), int(t == M.FULL), hd, kvh, self.ring[t]
             if device != "cpu":
                 torch.cuda.empty_cache()  # packing's temporaries, or the allocator keeps them beside the codes
-        widest_head = cfg.heads * max(cfg.head_dim.values())
-        if self.kv4_set:  # a 4-bit layer's queries twice (turned and as they are) and its output twice (turned and back)
-            widest_head = max(widest_head, 2 * cfg.heads * cfg.head_dim[M.SLIDING])
-        y_size = max(max(cfg.heads * cfg.head_dim[t] + 2 * cfg.kv_heads[t] * cfg.head_dim[t] for t in cfg.head_dim), cfg.mlp, cfg.hidden)
-        x_size = max(cfg.hidden, widest_head, cfg.mlp)
+        widest_head, y_size, x_size = work_sizes(cfg, bool(self.kv4_set))  # (row_bytes: what a row of the work memory below takes)
         # attention takes the positions a pass reads in whole tiles of 16: up to 15 more at either end
-        scores = cfg.heads * rows * (max(capacity, cfg.window + rows) + 32)
+        # (sized for ATT_ROWS rows at most: a wider pass's attention takes as many rows at a time as this holds, at least
+        # ATT_ROWS: Model.scores_room)
+        narrow = min(rows, ATT_ROWS)
+        scores = cfg.heads * narrow * (max(capacity, cfg.window + rows) + 32)
         z = lambda *shape, dtype=torch.float32: torch.zeros(*shape, dtype=dtype, device=device)  # noqa: E731
         # the kernels' work memory, by the names of the DLL's Model (what a pass leaves in them is the last layer's)
-        self.work = dict(h=z(rows, cfg.hidden), hn=z(rows, cfg.hidden), logits=z(rows, cfg.vocab),
-                         h2=z(rows, cfg.hidden), fps=z(3 * 32), xf=z(rows // 8, x_size // 16, 32, dtype=torch.int64),  # fps: scales, then prep_k's sums (3 * MAX_TOKENS)
+        self.work = dict(h=z(rows, cfg.hidden), hn=z(rows, cfg.hidden), logits=z(narrow, cfg.vocab),
+                         h2=z(rows, cfg.hidden), fps=z(3 * MAX_TOKENS), xf=z(rows // 8, x_size // 16, 32, dtype=torch.int64),  # fps: scales, then prep_k's sums (3 * MAX_TOKENS)
                          y=z(rows, y_size), y2=z(rows, cfg.mlp), qhat=z(rows, widest_head, dtype=torch.float16),
                          attn=z(rows, widest_head), scores=z(scores), probs=z(scores, dtype=torch.float16))
         self.h, self.hn, self.logits = self.work["h"], self.work["hn"], self.work["logits"]
@@ -388,6 +421,7 @@ class Engine:
         m.n_layers, m.hidden, m.mlp, m.heads, m.window, m.vocab = cfg.n_layers, cfg.hidden, cfg.mlp, cfg.heads, cfg.window, cfg.vocab
         m.eps, m.softcap = cfg.eps, cfg.softcap or 0.0
         m.int8 = self.int8
+        m.scores_room = scores  # a wide pass's attention takes as many rows at a time as fit (engine/sclmd.cu)
         m.head, m.rot_head, m.norm = self._mat(*head), self._rot(cfg.hidden), f32(norm).data_ptr()
         for name, t in self.work.items():
             setattr(m, name, t.data_ptr())
@@ -520,9 +554,12 @@ class Engine:
         up to self.rows rows in all; a sequence's rows are its next positions. -> (logits [rows, vocab], outputs
         after the final norm): views of the engine's memory, which the next pass writes over.
         logits_from: the first row whose logits are wanted (the rows before it are a prompt's: their logits are not
-        computed and hold what an earlier pass left; the number of rows: none are)."""
+        computed and hold what an earlier pass left; the number of rows: none are).
+        A pass of more than ATT_ROWS rows returns the logits of its rows from logits_first(rows, logits_from) on
+        only (the last ATT_ROWS at most)."""
         total = sum(n for _, n in parts)
         assert 0 < total <= self.rows and len({seq for seq, _ in parts}) == len(parts) and all(n > 0 for _, n in parts)
+        assert len(parts) <= MAX_SEGS, f"a pass has {MAX_SEGS} sequences at most"
         segs, row = Segs(), 0
         for i, (seq, n) in enumerate(parts):
             at = self.lengths[seq]
@@ -539,6 +576,8 @@ class Engine:
         for seq, n in parts:
             self.lengths[seq] += n
             self.highs[seq] = max(self.highs[seq], self.lengths[seq])
+        if total > ATT_ROWS:  # a wide pass: the logits of the rows from logits_first() on only
+            return self.logits[: total - logits_first(total, logits_from)], self.hn[:total]
         return self.logits[:total], self.hn[:total]
 
     def run(self, parts: list, logits_from: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
@@ -549,13 +588,16 @@ class Engine:
 
     def feed(self, ids: list, keep: str = "all", seq: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
         """Run tokens at a sequence's next positions, a pass's rows at a time -> (logits [n, vocab], last outputs after
-        the final norm). keep="last": only the last pass's rows (a long prompt's logits would not fit: 1 MB a token)."""
+        the final norm). keep="last": only the last pass's rows (a long prompt's logits would not fit: 1 MB a token);
+        of a pass of more than ATT_ROWS rows the logits of its last ATT_ROWS (logits_first) and the outputs of all.
+        keep="all" on an engine of more than ATT_ROWS rows reads ATT_ROWS rows a pass."""
         assert self.lengths[seq] + len(ids) <= self.capacity, "past the engine's capacity"
         logits, hidden = [], []
-        for a in range(0, len(ids), self.rows):
-            last = a + self.rows >= len(ids)
+        width = self.rows if keep == "last" else min(self.rows, ATT_ROWS)
+        for a in range(0, len(ids), width):
+            last = a + width >= len(ids)
             # with keep="last" only the last pass's logits are looked at: the passes before compute none
-            lg, hn = self.run([(seq, ids[a : a + self.rows])], 0 if keep == "all" or last else self.rows)
+            lg, hn = self.run([(seq, ids[a : a + width])], 0 if keep == "all" or last else width)
             if keep == "all" or last:
                 logits.append(lg.clone())
                 hidden.append(hn.clone())
@@ -853,7 +895,9 @@ class EngineDrafter:
             inv[:rotated] = 1.0 / (theta ** (torch.arange(0, 2 * rotated, 2).float() / hd))
             cl.inv_freq = f32(inv).data_ptr()
             cl.scalar, cl.full, cl.head_dim, cl.kv_heads = float(lay["scalar"]), int(t == M.FULL), hd, cfg.kv_heads[t]
-        z = lambda *shape: self._own(torch.zeros(eng.rows, *shape, dtype=torch.float32, device=dev))  # noqa: E731  (a row a sequence)
+        # a row a sequence, ATT_ROWS at most (the main model's scores' memory, which the drafter uses, is that wide)
+        self.rows = min(eng.rows, ATT_ROWS)
+        z = lambda *shape: self._own(torch.zeros(self.rows, *shape, dtype=torch.float32, device=dev))  # noqa: E731
         self.inp, self.h, self.hn, self.logits, self.next = z(2 * main.hidden), z(cfg.hidden), z(cfg.hidden), z(cfg.vocab), z(main.hidden)
         self.h2 = z(cfg.hidden)
         c = self.c = DrafterC()
@@ -911,6 +955,7 @@ class EngineDrafter:
         token at lengths[r] (its embedding in the main model) and a hidden state -> (logits [rows, vocab], the hidden
         states for the guesses after). Both are the drafter's own memory: the next step writes over them."""
         eng, rows = self.eng, len(lengths)
+        assert rows <= self.rows, f"the drafter guesses for {self.rows} sequences at a time at most"
         for length, seq in zip(lengths, seqs):
             assert length <= eng.lengths[seq] and eng._kept(length - (eng.cfg.window + 1), seq), "further back than the sliding layers keep"
         n = eng.cfg.hidden

@@ -38,7 +38,8 @@ def main():
     ap.add_argument("--name", default="v1")
     ap.add_argument("--plan", default=os.path.join(ROOT, "data", "plans", "fit_own_v1_11.9.json"))
     ap.add_argument("--capacity", type=int, default=16384)
-    ap.add_argument("--rows", type=int, default=16)
+    # (8, 16 or 32: a pass of more rows has the logits of its last 32 only, and the sums would leave the others out)
+    ap.add_argument("--rows", type=int, default=16, choices=(8, 16, 32))
     ap.add_argument("--reserve", type=float, default=0.4)
     ap.add_argument("--upto", type=int, default=13000, help="positions the text is read to")
     ap.add_argument("--save", default="")
@@ -79,7 +80,10 @@ def main():
                 token = int(logits.argmax())
                 sums.append(["guess", at, step, token] + bits(logits) + bits(hidden))
     for kind, group in eng.kv_all.items():
-        for name, t in zip(("keys", "values", "key scales", "value scales") if len(group) == 4 else ("values", "value scales"), group):
+        # (a keyless kind: values only; --kv4: the sliding kind's int8 layers, then its 4-bit ones' codes and scales)
+        names = {2: ("values", "value scales"), 4: ("keys", "values", "key scales", "value scales"),
+                 8: ("keys", "values", "key scales", "value scales", "4-bit keys", "4-bit values", "4-bit key scales", "4-bit value scales")}[len(group)]
+        for name, t in zip(names, group):
             sums.append([f"{kind} {name}"] + bits(t))
     digest = hashlib.sha1(json.dumps(sums).encode()).hexdigest()[:16]
     print(f"[bits] {len(sums)} outputs up to position {at}: {digest}", flush=True)

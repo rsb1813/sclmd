@@ -5,6 +5,11 @@
 # verifies as in generate.py. A wider pass costs more (COST), so the width is the one whose rows are expected to
 # yield the most tokens for the time. Whatever the mix, a text's tokens are the ones it would get alone: the engine
 # computes a row the same beside any others, and a choice depends only on (seed, position).
+#
+# On an engine of 64, 128 or 256 rows (brief B2; scripts/serve.py --wide-rows) a pass may also have that many while
+# prompts someone waits on are left that 32 rows do not take: such a pass has the logits of its last 32 rows at most
+# (E.logits_first), so the rows whose logits are looked at (the texts being written and their guesses, a prompt's last
+# row) are put at its end (_fit).
 import torch
 
 from . import engine as E
@@ -16,9 +21,20 @@ from .generate import Picker
 # 34.7, 37.4 at 2,048; before the matrix kernel's blocks took four strips: 21.7, 26.6, 35.6, 37.8 and 1.25, 1.67, 1.80)
 COST = ((8, 1.0), (16, 1.17), (24, 1.58), (32, 1.70))
 
+# What a pass of up to 64, 128 or 256 rows costs next to one of 32, by the engine's products (True: --int8, whose
+# kernel takes two, four or eight sets of groups, so a pass costs about what the widest of its set does: 48 rows 1.52,
+# 96 rows 2.21, 192 rows 3.84; fp16 products run 32 rows a launch and cost about their rows: 48 rows 1.53, 96 2.70,
+# 192 5.29). scripts/pass_profile.py --rows 256 [--int8] on the real model at 3 bits a weight, 2026-11-15, the mean
+# of the ratios at 64 and 2,048 positions (32, 64, 128, 256 rows: int8 25.4, 39.6, 57.7, 102.1 ms at 64 positions and
+# 27.7, 43.8, 65.0, 116.4 at 2,048; fp16 31.3, 57.4, 111.8, 220.6 and 33.6, 61.8, 119.0, 234.0;
+# logs/exp/B2-server/profile_int8.log, profile_fp16.log)
+WIDE_COST = {True: ((64, 1.57), (128, 2.31), (256, 4.11)), False: ((64, 1.84), (128, 3.56), (256, 7.01))}
 
-def cost(rows: int) -> float:
-    return next(c for most, c in COST if rows <= most)
+
+def cost(rows: int, int8: bool = False) -> float:
+    if rows <= COST[-1][0]:
+        return next(c for most, c in COST if rows <= most)
+    return COST[-1][1] * next(c for most, c in WIDE_COST[bool(int8)] if rows <= most)
 
 # How often the guess at depth 1, 2, ... is kept: where the batcher starts from; it goes by what it sees after that
 KEEP = (0.75, 0.56, 0.42, 0.32, 0.25, 0.20)
@@ -61,15 +77,20 @@ class Job:
 
 
 class Batcher:
-    def __init__(self, eng: E.Engine, drafter: E.EngineDrafter | None = None, depth: int = 6):
+    """widths: those a pass may have (default: 8, 16 and 32 up to the engine's rows, and an engine's wider ones)."""
+
+    def __init__(self, eng: E.Engine, drafter: E.EngineDrafter | None = None, depth: int = 6, widths: tuple | None = None):
         self.eng, self.drafter, self.depth = eng, drafter, depth
+        self.choices = tuple(sorted(widths)) if widths else tuple(w for w in E.ROWS if w <= eng.rows)
+        assert all(w in E.ROWS and w <= eng.rows for w in self.choices) and self.choices[0] <= E.ATT_ROWS, self.choices
+        self.int8 = bool(getattr(eng, "int8", 0))  # the products a wide pass's cost is measured for (WIDE_COST)
         self.jobs = []
         self.turn = 0
         self.make_room = None  # called when the pool of keys and values is empty: frees some and says so, or says no
         self.passes = self.rows = self.guess_rows = self.kept_rows = 0
         self.starved = 0  # jobs that had to wait for keys and values in the last pass
         self.ended = self.restarts = 0  # jobs that have ended; times a job had to start over for lack of memory
-        self.widths = {8: 0, 16: 0, 32: 0}  # passes by width
+        self.widths = dict.fromkeys(sorted({8, 16, 32} | set(self.choices)), 0)  # passes by width
         self.sent = [20.0] * len(KEEP)  # guesses sent at each depth, and those kept (starting as if KEEP had been seen 20 times)
         self.held = [20.0 * k for k in KEEP]
 
@@ -82,31 +103,89 @@ class Batcher:
         at = self.turn % len(live)
         order = live[at:] + live[:at]
         keep = [h / s for h, s in zip(self.held, self.sent)]
-        best = None
-        for width in (8, 16, 32):
-            if width > self.eng.rows:
-                break
+        best, narrow = None, {}
+        for width in self.choices:
+            if width > E.ATT_ROWS and not self._unread(order, narrow):
+                break  # a wider pass is for prompts someone waits on that the narrower ones leave unread
             rows = self._fill(order, width)
+            if width <= E.ATT_ROWS:
+                narrow = rows
             total = sum(rows.values())
             gain = sum(n if j.pending is None else 1 + sum(keep[: n - 1]) for j, n in rows.items())
-            rate = gain / cost(total)
+            rate = gain / cost(total, self.int8)
             if best is None or rate > 1.03 * best[0]:  # a wider pass has to be clearly worth it
                 best = (rate, rows)
         return best[1]
 
+    def _room(self, j: Job) -> int:
+        """Positions the job's sequence can take in the next pass: up to its capacity, or to its pause."""
+        eng = self.eng
+        room = eng.capacity - eng.lengths[j.seq]
+        if j.pause is not None and eng.lengths[j.seq] < j.pause:  # a prompt read up to its pause first
+            room = min(room, j.pause - eng.lengths[j.seq])
+        return room
+
+    def _unread(self, order: list, rows: dict) -> bool:
+        """Whether a prompt someone waits on has tokens it could read that `rows` does not give it."""
+        return any(j.pending is None and not j.only_read and rows.get(j, 0) < min(len(j.todo), self._room(j)) for j in order)
+
+    @staticmethod
+    def _ends(j: Job, n: int) -> bool:
+        """Whether n rows read the last of the job's prompt, whose logits choose the reply's first token (step(): not quiet)."""
+        return j.pending is None and not j.only_read and j.resume is None and n >= len(j.todo)
+
+    def _fit(self, rows: dict) -> dict:
+        """The rows of a pass of more than ATT_ROWS rows by job, such that every row whose logits are looked at is one
+        that the pass has the logits of (its last ATT_ROWS at most, from a group of eight: E.logits_first). step() puts
+        them at the end: the prompts that end in the pass, the one with the most rows first (only its last row needs
+        them), then the texts being written. While they do not fit, in this order: up to 7 rows fewer of the prompts
+        that do not end (a pass of a whole number of eights has the logits of its last 32), a guess fewer, a prompt
+        that ends reads all but its last token (which the next pass reads), a text being written waits a pass."""
+        rows = dict(rows)
+        while True:
+            total = sum(rows.values())
+            if total <= E.ATT_ROWS:
+                return rows
+            ends = sorted((j for j in rows if self._ends(j, rows[j])), key=lambda j: -rows[j])
+            writers = [j for j in rows if j.pending is not None]
+            tail = (1 + sum(rows[j] for j in ends[1:]) if ends else 0) + sum(rows[j] for j in writers)
+            if tail <= total - E.logits_first(total, 0):
+                return rows
+            quiet = sorted((j for j in rows if j.pending is None and j not in ends), key=lambda j: -rows[j])
+            over = total % 8
+            if tail <= E.ATT_ROWS and 0 < over <= sum(rows[j] for j in quiet):
+                for j in quiet:
+                    cut = min(over, rows[j])
+                    rows[j] -= cut
+                    over -= cut
+                    if not rows[j]:
+                        del rows[j]
+                    if not over:
+                        break
+                continue
+            guessing = [j for j in writers if rows[j] > 1]
+            if guessing:
+                rows[max(reversed(guessing), key=lambda j: rows[j])] -= 1
+            elif len(ends) > 1:
+                rows[ends[-1]] -= 1
+                if not rows[ends[-1]]:
+                    del rows[ends[-1]]
+            else:
+                del rows[writers[-1]]
+
     def _fill(self, order: list, width: int) -> dict:
         """Rows of a pass of `width` rows by job. Every text being written gets one (when there are more than fit, in
-        turn); the prompts being read share what is left; then guesses, one more for each writer in turn."""
+        turn); the prompts being read share what is left; then guesses, one more for each writer in turn. A pass of
+        more than ATT_ROWS rows takes ATT_ROWS writers at most and no reading ahead (which stays in the narrower
+        passes), and its rows are fitted to its logits (_fit)."""
         eng, live = self.eng, order
+        wide = width > E.ATT_ROWS
         writers = [j for j in order if j.pending is not None]
         rows, free = {}, width
-        for j in writers[:free]:
+        for j in writers[: min(free, E.ATT_ROWS)]:
             rows[j] = 1
             free -= 1
-        room = {j: eng.capacity - eng.lengths[j.seq] for j in live}
-        for j in live:  # a prompt read up to its pause first
-            if j.pause is not None and eng.lengths[j.seq] < j.pause:
-                room[j] = min(room[j], j.pause - eng.lengths[j.seq])
+        room = {j: self._room(j) for j in live}
 
         def read(readers: list, most: int) -> int:
             """Up to `most` rows shared among the readers; how many were given."""
@@ -120,18 +199,23 @@ class Batcher:
 
         # prompts someone is waiting on; then the reading done ahead of need, a quarter of the pass at most while
         # texts are being written (their guesses come before the rest of it)
-        ahead = [j for j in order if j.only_read]
-        free -= read([j for j in order if j.pending is None and not j.only_read], free)
+        ahead = [] if wide else [j for j in order if j.only_read]
+        waiting = [j for j in order if j.pending is None and not j.only_read]
+        if wide:  # a sequence a segment, MAX_SEGS of them in a pass (a narrow pass has fewer rows than that)
+            waiting = waiting[: E.MAX_SEGS - len(rows)]
+        free -= read(waiting, free)
         free -= read(ahead, min(free, width // 4) if writers else free)
         if self.drafter is not None:
             able = lambda j: min(self.depth, j.max_new - len(j.out), room[j] - 1)  # noqa: E731
-            while free and any(rows[j] - 1 < able(j) for j in writers if j in rows):
+            # (a wide pass: the guesses that fit beside the writers in the rows it has the logits of)
+            spare = min(free, E.ATT_ROWS - sum(j in rows for j in writers)) if wide else free
+            while spare and any(rows[j] - 1 < able(j) for j in writers if j in rows):
                 for j in writers:
-                    if free and j in rows and rows[j] - 1 < able(j):
+                    if spare and j in rows and rows[j] - 1 < able(j):
                         rows[j] += 1
-                        free -= 1
+                        free, spare = free - 1, spare - 1
         read(ahead, free)
-        return rows
+        return self._fit(rows) if wide else rows
 
     @torch.no_grad()
     def step(self) -> bool:
@@ -187,6 +271,10 @@ class Batcher:
                 self.jobs.remove(victim)
                 self.ended += 1
             return True
+        wide = sum(rows[j] for j in use) > E.ATT_ROWS
+        if wide:  # some jobs may have waited for keys and values: the rest fitted to the pass's logits again
+            rows = self._fit({j: rows[j] for j in use})
+            use = [j for j in use if j in rows]
         eng._provide([(j.seq, eng.lengths[j.seq], rows[j]) for j in use])
         # a turn start that the reply is about to write over is copied to RAM first
         for j in use:
@@ -204,7 +292,12 @@ class Batcher:
         # (and none at all when it is read ahead, or read again after starting over). The pass computes the logits
         # from the first row that needs them, and only those rows' choices are fetched.
         quiet = lambda j: j.pending is None and (len(j.todo) > rows[j] or j.only_read or j.resume is not None)  # noqa: E731
-        use = [j for j in use if quiet(j)] + [j for j in use if not quiet(j)]
+        ends = []
+        if wide:  # (_fit) the prompts that end, the one with the most rows first, then the texts being written
+            ends = sorted((j for j in use if not quiet(j) and j.pending is None), key=lambda j: -rows[j])
+            use = [j for j in use if quiet(j)] + ends + [j for j in use if j.pending is not None]
+        else:
+            use = [j for j in use if quiet(j)] + [j for j in use if not quiet(j)]
         parts = []
         for j in use:
             if j.pending is None:
@@ -212,13 +305,19 @@ class Batcher:
             else:
                 parts.append((j.seq, [j.pending] + guesses.get(j, [])))
         skip = sum(len(ids) for j, (_, ids) in zip(use, parts) if quiet(j))  # the rows without logits
+        if ends:
+            skip += rows[ends[0]] - 1  # of the first prompt that ends, only the last row's are looked at
         logits, hidden = eng.run(parts, skip)
+        total = sum(len(ids) for _, ids in parts)
+        # the pass row whose logits are logits[0]: a pass of more than ATT_ROWS rows has those of its last rows only
+        base = E.logits_first(total, skip) if total > E.ATT_ROWS else 0
+        assert base <= skip, (total, skip, base)
         # the choices of all texts come off the GPU together: every row's first choice, and for the texts that sample
         # every row's largest logits (one wait for the pass, not one a text)
         loud = [j for j in use if not quiet(j)]
         top = max((j.pick.top_k for j in loud if j.pick is not None and j.pick.temperature > 0), default=0)
-        vals, idx = (t.cpu() for t in logits[skip:].float().topk(top, dim=-1)) if top else (None, None)
-        first = logits[skip:].argmax(-1).cpu() if any(j.pick is not None and j.pick.temperature <= 0 for j in loud) else None
+        vals, idx = (t.cpu() for t in logits[skip - base :].float().topk(top, dim=-1)) if top else (None, None)
+        first = logits[skip - base :].argmax(-1).cpu() if any(j.pick is not None and j.pick.temperature <= 0 for j in loud) else None
 
         def choose(j: Job, a: int, b: int, position: int) -> list:
             """Job j's tokens at `position`.. from rows a..b-1 of the pass."""
@@ -226,8 +325,7 @@ class Batcher:
             return first[a:b].tolist() if j.pick.temperature <= 0 else j.pick.draw(vals[a:b], idx[a:b], position)
 
         self.passes += 1
-        total = sum(len(ids) for _, ids in parts)
-        self.widths[8 if total <= 8 else 16 if total <= 16 else 32] += 1
+        self.widths[8 if total <= 8 else 16 if total <= 16 else next(w for w in self.widths if w >= total)] += 1
         row = 0
         for j, (_, ids) in zip(use, parts):
             n, hn = len(ids), hidden[row : row + len(ids)]

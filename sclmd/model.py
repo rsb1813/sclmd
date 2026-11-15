@@ -52,7 +52,7 @@ class Config:
         over = next(iter(c.get("per_layer_config", {}).values()), None)
         if over is None:
             over = {"head_dim": c.get("global_head_dim", 512), "num_key_value_heads": c.get("num_global_key_value_heads")}
-        head = {SLIDING: c["head_dim"], FULL: over["head_dim"]}
+        head = {SLIDING: c["head_dim"], FULL: over.get("head_dim", c["head_dim"])}  # (written back without it: the same as the sliding one's)
         kv = {SLIDING: c["num_key_value_heads"], FULL: over.get("num_key_value_heads") or c["num_key_value_heads"]}
         if not k_eq_v:
             raise ValueError("only attention_k_eq_v checkpoints are supported")

@@ -7,3 +7,4 @@ nvcc -O2 -std=c++20 -arch=sm_120 -Xcompiler "/EHsc /O2 /utf-8" mma_gemm.cu -o bu
 nvcc -O2 -std=c++20 -arch=sm_120 -Xptxas -v -Xcompiler "/EHsc /O2 /utf-8" mma_rate.cu -o build\mma_rate.exe || exit /b 1
 nvcc -O2 -std=c++20 -arch=sm_120 -Xptxas -v -Xcompiler "/EHsc /O2 /utf-8" mma_s8.cu -o build\mma_s8.exe || exit /b 1
 nvcc -O2 -std=c++20 -arch=sm_120 -Xcompiler "/EHsc /O2 /utf-8" attn_bench.cu -o build\attn_bench.exe || exit /b 1
+nvcc -O2 -std=c++20 -arch=sm_120 -Xptxas -v -Xcompiler "/EHsc /O2 /utf-8" mma_wide.cu -o build\mma_wide.exe || exit /b 1

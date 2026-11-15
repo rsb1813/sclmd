@@ -41,6 +41,13 @@ MODEL = "gemma-4-31b-it"
 Refused = C.Refused  # a request that cannot be served: (HTTP status, message[, field])
 
 
+def narrow(eng) -> int:
+    """The rows of the passes that write (the margin a conversation keeps below the context): the widest of the
+    batcher's widths up to 32, which the Server keeps on its engine (--rows; --wide-rows: the wider passes only read
+    prompts, so a request fits as on a server without them, a --rows 16 one's too); else an engine's rows, 32 at most."""
+    return getattr(eng, "narrow_rows", None) or min(eng.rows, E.ATT_ROWS)
+
+
 class Request:
     """A chat completion under way: what the HTTP thread and the engine's thread know of it."""
 
@@ -128,11 +135,12 @@ class Server:
     keys and values run short, the one used longest ago moves to RAM (parked, up to `ram` bytes), and comes back
     when its next turn arrives."""
 
-    def __init__(self, tok, eng: E.Engine, drafter, stop: tuple, ram: int = 0, prefix_ram: int = 0):
+    def __init__(self, tok, eng: E.Engine, drafter, stop: tuple, ram: int = 0, prefix_ram: int = 0, widths: tuple | None = None):
         self.tok, self.eng, self.stop, self.ram = tok, eng, stop, ram
         self.prefixes = Prefixes(prefix_ram)
         self.parked = []
-        self.batch = Batcher(eng, drafter, DEPTH)
+        self.batch = Batcher(eng, drafter, DEPTH, widths)  # widths: of a pass (Batcher; --rows and --wide-rows)
+        eng.narrow_rows = max(w for w in self.batch.choices if w <= E.ATT_ROWS)  # narrow(): from the widths, not the engine's rows
         self.batch.make_room = self._make_room
         self.canon = None  # (request, the reply's tokens) -> the conversation's tokens with the reply as a later turn writes it
         self.inbox, self.waiting, self.active = queue.Queue(), [], []
@@ -278,7 +286,7 @@ class Server:
             except Exception as e:  # noqa: BLE001  (a template that cannot write the reply: nothing is read ahead)
                 print(f"[serve] seq {seq}: the reply's later form could not be made ({type(e).__name__}: {e})", flush=True)
                 later = None
-            if later is not None and later[: req.start] == kept.base and req.start < len(later) <= eng.capacity - 2 * eng.rows:
+            if later is not None and later[: req.start] == kept.base and req.start < len(later) <= eng.capacity - 2 * narrow(eng):
                 # the reply as a later turn writes it is read in from the turn's start, with rows nothing else needs
                 if job.snapped:
                     eng.restore(seq)
@@ -540,7 +548,7 @@ class App:
         with self.lock:
             (before, full, part, sharing), tools, messages, ignored = prompt(tools, messages, ignored)
             eng = self.server.eng
-            if tools and not strict and eng.capacity - len(T.ids_of(full)) - eng.rows < 16:
+            if tools and not strict and eng.capacity - len(T.ids_of(full)) - narrow(eng) < 16:
                 # the tools' declarations leave no room in the context: left out and named, as before they were served
                 (before, full, part, sharing), tools, messages, ignored = prompt(None, messages, sorted(set(ignored) | {"tools"}))
         before, full, part = (T.ids_of(x) for x in (before, full, part))
@@ -558,7 +566,7 @@ class App:
         if sharing and not shared:  # the tools' system turn alone (the template writes nothing for no message): up to its end
             closed = self.marks()["closed"]
             cut = next((i + len(closed) for i in range(len(full)) if full[i : i + len(closed)] == closed), 0)
-        room = eng.capacity - len(full) - eng.rows
+        room = eng.capacity - len(full) - narrow(eng)
         if room < 16:
             raise Refused(400, f"the conversation is {len(full)} tokens: the context holds {eng.capacity}")
         asked = body.get("max_completion_tokens", body.get("max_tokens"))
@@ -874,7 +882,14 @@ def main() -> None:
     ap.add_argument("--think", action="store_true", help="think unless the request says otherwise")
     ap.add_argument("--head", type=int, default=8)
     ap.add_argument("--no-drafter", action="store_true")
-    ap.add_argument("--rows", type=int, default=32, help="the most rows of a pass (8, 16 or 32): tokens of all requests together")
+    ap.add_argument("--rows", type=int, default=32, choices=(8, 16, 32), help="the most rows of a pass: tokens of all requests together")
+    ap.add_argument("--wide-rows", type=int, default=0, choices=(0, 64, 128, 256), help="passes of up to this many rows while prompts "
+                    "are being read (0: off): several requests' prompts in one pass, the rows that write at its end; the same "
+                    "replies. They pay with --int8 (256 rows: 1.3, 1.6 and 1.8 times the requests a second of 16 clients with "
+                    "prompts of 50, 500 and 2,000 tokens; fp16 products: 1.00-1.15 times; with --kv4 too; design.md 6.13). The "
+                    "engine's work memory grows (256 rows: 81 MiB, 128 rows: 35, computed), and a conversation of more than 1,056 "
+                    "tokens keeps that many positions past the sliding window for 32 (256 rows: up to 89 MiB more, 46 with --kv4; "
+                    "128 rows: 38): fewer conversations fit")
     ap.add_argument("--reserve", type=float, default=VRAM_MARGIN / 2**30, help="GiB of the VRAM that is free now to leave to other programs")
     ap.add_argument("--keyless", action="store_true", help="long conversations: the ten full-attention layers keep their values only and "
                     "the keys are made of them when read: 21 KB a token past 1,024 tokens for 41 (a conversation of 40,960 tokens 1.2 GiB "
@@ -902,7 +917,9 @@ def main() -> None:
     # the VRAM that is free now, less what is left to other programs, the head, the work memory, the drafter and room
     # to load in: that much is shared between the layers' codes and the conversations' keys and values
     free = torch.cuda.mem_get_info()[0] - reserve
-    rest = E.fixed_bytes(cfg, cli.head, context, pool={M.SLIDING: 0, M.FULL: 0}, rows=cli.rows, keyless=cli.keyless, kv4=kv4) + (0 if cli.no_drafter else E.DRAFTER_BYTES)
+    rows = cli.wide_rows or cli.rows  # the engine's: the widest pass
+    widths = tuple(w for w in E.ROWS if w <= cli.rows) + tuple(w for w in E.ROWS if E.ATT_ROWS < w <= cli.wide_rows)
+    rest = E.fixed_bytes(cfg, cli.head, context, pool={M.SLIDING: 0, M.FULL: 0}, rows=rows, keyless=cli.keyless, kv4=kv4) + (0 if cli.no_drafter else E.DRAFTER_BYTES)
     both = free - rest - LOAD_ROOM
     least = P.code_bytes(cfg, P.uniform(cfg, 6))
     if both - least < (256 << 20):
@@ -913,15 +930,17 @@ def main() -> None:
     typical = max(cli.typical, cfg.window)
     pool = pool_for(cfg, kv, typical / (cfg.window + E.SPARE + (E.TILE if kv4 else 0)), cli.keyless, kv4)
     with torch.no_grad():
-        eng = E.Engine.load(cli.name, plan, cli.head, context, sequences=cli.sequences, pool=pool, rows=cli.rows, keyless=cli.keyless, kv4=kv4)
+        eng = E.Engine.load(cli.name, plan, cli.head, context, sequences=cli.sequences, pool=pool, rows=rows, keyless=cli.keyless, kv4=kv4)
         drafter = None if cli.no_drafter else E.EngineDrafter.load(eng, ckpt("drafter"), cli.name, depth=DEPTH)
     stop = (tok.eos_token_id, tok.convert_tokens_to_ids("<turn|>"), tok.convert_tokens_to_ids("<|tool_response>"))
-    server = Server(tok, eng, drafter, stop, ram=int(cli.ram_gib * 2**30), prefix_ram=int(cli.prefix_gib * 2**30))
+    server = Server(tok, eng, drafter, stop, ram=int(cli.ram_gib * 2**30), prefix_ram=int(cli.prefix_gib * 2**30), widths=widths)
     bits = round(P.bits_per_weight(cfg, plan), 2)
-    one = (E.tile_bytes(cfg, M.SLIDING, kv4=kv4) * (E.ring_tiles(cfg, M.SLIDING, context, cli.rows) + E.extra_tiles(cfg, M.SLIDING, kv4))
+    one = (E.tile_bytes(cfg, M.SLIDING, kv4=kv4) * (E.ring_tiles(cfg, M.SLIDING, context, rows) + E.extra_tiles(cfg, M.SLIDING, kv4))
            + E.tile_bytes(cfg, M.FULL, cli.keyless) * typical // E.TILE)
     facts = {"bits_per_weight": bits, "kl_estimate": None if estimate is None else round(estimate, 3),
              "vram_gib": round(torch.cuda.memory_allocated() / 2**30, 2), "drafter": drafter is not None}
+    if cli.wide_rows:  # (only then: the facts of a server without it stay as they were)
+        facts["wide_rows"] = cli.wide_rows
     app = App(server, tok, cli.think, cli.max_tokens, facts)
     C.apply(cli, app, Handler)
     threading.Thread(target=server.run, daemon=True).start()
@@ -931,7 +950,9 @@ def main() -> None:
           + (f" (KL about {estimate:.3f} on its own text)" if estimate else " (KL about 0.10 on its own text)")
           + f" · VRAM {facts['vram_gib']} GiB\n[serve] keys and values {kv / 2**30:.2f} GiB: about {kv // one} conversations of {typical} tokens "
           f"at once, or {kv // (E.tile_bytes(cfg, M.SLIDING, kv4=kv4) + E.tile_bytes(cfg, M.FULL, cli.keyless)) * E.TILE} tokens of shorter ones; "
-          f"a conversation holds up to {context} tokens; thinking {'on' if cli.think else 'off'} unless asked", flush=True)
+          f"a conversation holds up to {context} tokens; thinking {'on' if cli.think else 'off'} unless asked"
+          + (f"\n[serve] passes of up to {cli.wide_rows} rows while prompts are read (widths {', '.join(map(str, widths))}; "
+             f"the engine's work memory and sliding rings for {rows} rows)" if cli.wide_rows else ""), flush=True)
     print(f"[serve] the pool's tiles {dict(eng.pool)}" + (" (keys and values of the sliding layers at 4 bits: --kv4)" if kv4 else "")
           + ": conversations at once of " + ", ".join(f"{n:,} tokens {c}" for n, c in conversations_at(eng, (200, 500, 1000, 2000, 8000)).items())
           + f" (and at most {eng.sequences} sequences)", flush=True)

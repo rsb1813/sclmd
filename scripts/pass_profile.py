@@ -28,7 +28,7 @@ def main():
     ap.add_argument("--at", default="64,2048", help="context lengths to measure at")
     ap.add_argument("--tokens", default="1,7")
     ap.add_argument("--passes", type=int, default=20)
-    ap.add_argument("--rows", type=int, default=8, help="the rows the engine is made for (8, 16 or 32)")
+    ap.add_argument("--rows", type=int, default=8, choices=E.ROWS, help="the rows the engine is made for")
     ap.add_argument("--capacity", type=int, default=8192)
     ap.add_argument("--reserve", type=float, default=0.75, help="GiB of the free VRAM left to other programs")
     E.add_int8_option(ap)
@@ -58,7 +58,7 @@ def main():
         for tokens in [int(t) for t in args.tokens.split(",")]:
             def passes(n):
                 for _ in range(n):
-                    eng.feed(filler[:tokens])
+                    eng.feed(filler[:tokens], keep="last")  # one pass: every row's logits (of the last 32 in a wider one)
                     eng.crop(at)
             passes(3)
             torch.cuda.synchronize()

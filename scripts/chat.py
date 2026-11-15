@@ -285,8 +285,10 @@ def main() -> None:
     ap.add_argument("--no-drafter", action="store_true")
     ap.add_argument("--keyless", action="store_true", help="for long contexts: the full-attention layers keep their values only (21 KB a token "
                     "for 41) and the keys are made of them when read; other bits than without it, of the same precision")
-    ap.add_argument("--rows", type=int, default=ROWS, choices=(8, 16, 32), help="tokens of a prompt read in one pass: 32 reads a prompt about 45%% "
-                    "faster than 16 and takes 62 MB more VRAM (86 MB at a context of 16,384), which the plan cannot spend on 4-bit matrices")
+    ap.add_argument("--rows", type=int, default=ROWS, choices=E.ROWS, help="tokens of a prompt read in one pass: 32 reads a prompt about 45%% "
+                    "faster than 16 and takes 62 MB more VRAM (86 MB at a context of 16,384), which the plan cannot spend on 4-bit matrices; "
+                    "64-256 read faster still with --int8 only (brief B2: 256 rows about 1.9 times 32 on the server's engine) and take "
+                    "170 MB more than 32 (computed)")
     ap.add_argument("--reserve", type=float, default=VRAM_MARGIN / 2**30, help="GiB of the VRAM that is free now to leave to other "
                     "programs. Less means more matrices at 4 bits; if other programs then take more, Windows pages VRAM out and everything slows down")
     E.add_int8_option(ap)

@@ -1,4 +1,5 @@
-// The engine: one pass of the Gemma 4 decoder over up to 32 new tokens (rows), on the GPU, from pair codes.
+// The engine: one pass of the Gemma 4 decoder over up to 256 new tokens (rows; past 32 for reading prompts, brief B2),
+// on the GPU, from pair codes.
 // The rows may belong to several sequences (conversations): a pass is made of segments, each a run of rows that are
 // consecutive positions of one sequence, and a row attends only to its own sequence.
 // A pass costs little more for 8 rows than for one, 1.1 times as much for 16 and 1.6 times for 32 (the codes are
@@ -21,9 +22,14 @@
 
 #define API extern "C" __declspec(dllexport)
 
-static const int MAX_TOKENS = 32;  // rows of a pass: up to four groups of the eight columns of the tensor-core instruction
+// rows of a pass: up to 32 groups of the eight columns of the tensor-core instruction. Up to 32 rows a warp holds every
+// group (gemm_k / gemm8_k). A wider pass: with the integer option its groups are split over the warps of a block
+// (gemm8_wide_k, brief B2), with fp16 products gemm_k goes 32 rows a launch; its attention takes as many rows at a time
+// as the scores' memory holds (Model.scores_room, sized for ATT_ROWS rows), so that memory is what a 32-row pass needs.
+static const int MAX_TOKENS = 256;
+static const int ATT_ROWS = 32;    // rows of a pass attention takes at a time at least (and the most rows a pass has logits of)
 static const int TWO_PHASE = 9;    // rows from which a matrix's input is prepared in two kernels (prep_k)
-static const int MAX_SEGS = 32;    // segments of a pass: at most a sequence a row
+static const int MAX_SEGS = 64;    // segments of a pass
 
 // The rows of a pass by sequence: segment i is rows row0[i] .. row0[i] + cnt[i] - 1 (the segments follow each other
 // and cover every row), positions pos0[i] .. of sequence seq[i].
@@ -97,24 +103,29 @@ struct Model {
     Mat head;
     Rot rot_head;
     const float* norm;  // the final norm [hidden]
-    // work memory; [rows]: the most rows a pass of this model may have (8, 16 or 32: the caller sizes the memory)
+    // work memory; [rows]: the most rows a pass of this model may have (8, 16, 32, 64, 128 or 256: the caller sizes
+    // the memory)
     float* h;        // [rows][hidden] the residual stream of the tokens of this pass (in: the embeddings; out: the last layer's output)
     float* h2;       // [rows][hidden] where the residual stream's next step is written (the two take turns)
-    float* fps;      // [rows] the power of two an input was divided by to fit fp16
+    float* fps;      // [3 * MAX_TOKENS] the power of two an input was divided by to fit fp16 (then prep_k's sums)
     uint64_t* xf;    // [rows / 8][widest input / 16][32] a matrix's input as the instruction reads it, eight rows a group
     float* y;        // [rows][widest output] a matrix's output
     float* y2;       // [rows][mlp] (up's output beside gate's)
     uint16_t* qhat;  // [rows][heads * widest head] the queries, normalized and rotated (fp16)
-    float* scores;   // [kv heads * queries][positions in whole tiles] attention scores, segment after segment
+    float* scores;   // [kv heads * queries][positions in whole tiles] attention scores, segment after segment, of the
+                     // rows attention takes at a time (scores_room values: ATT_ROWS rows at the whole context)
     uint16_t* probs; // the same layout: attention weights (fp16)
     float* attn;     // [rows][heads * widest head] attention's output
     float* hn;       // [rows][hidden] the last output after the final norm (what the drafter is handed)
-    float* logits;   // [rows][vocab]
+    float* logits;   // [min(rows, ATT_ROWS)][vocab] (a pass of more rows has the logits of its last ATT_ROWS at most: pass())
     // An option, off when 0 (brief B1, lossy): the layers' matrices multiply int8 inputs by int8 codebooks on the
     // integer tensor-core instruction (gemm8_k). A matrix's input is rounded per token with the clip at int8 times
     // its rms. The head stays fp16 (and the drafter, which has its own prep).
     float int8;
     int pad_int8;
+    // the values m.scores (and m.probs) have room for: a pass of more than ATT_ROWS rows runs attention over as many
+    // rows at a time as fit (ATT_ROWS at least; 0: ATT_ROWS)
+    long long scores_room;
 };
 
 __device__ __forceinline__ void mma(float c[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
@@ -502,6 +513,110 @@ __global__ void gemm8_k(Mat m0, Mat m1, Mat m2, float* y0, float* y1, float* y2,
                 int sum = 0;
                 for (int w = 0; w < segs; ++w) sum += part[local][w][lane][i];
                 const int row = strip * 16 + (lane >> 2) + (i >= 2 ? 8 : 0), token = 8 * g + 2 * (lane & 3) + (i & 1);
+                if (token < tokens) y[size_t(token) * m.rows + row] = m.scale[row] * m.book_scale * fps[token] * float(sum);
+            }
+        __syncthreads();
+    }
+}
+
+// gemm8_k for a pass of more than four groups (brief B2; bench/mma_wide.cu is the kill test and the form's choice).
+// One warp holds four groups in its registers (c[4][4] + b[4][4]), so the groups are split over SETS warps of a block
+// that take the same strip and tiles: each decodes a quad of tiles of its strip in turn into shared memory, and each
+// multiplies all the decoded quads with its own four groups (a decoded run shared by the group-set warps, form B).
+// Keeping many strips a block on the same input matters most: a block's input is every group's, and with the
+// engine's split of a strip's tiles over 4-8 warps the blocks had one strip and read the input once a strip
+// (gate+up at 32 groups 1,152 us against 461 with segs 1). So `segs` is 1 here and a block has up to 4 strips.
+// The int32 sums are exact: a row's result has the same bits as in gemm8_k (y is the same expression).
+#define WIDE_WARPS 32
+template <int SETS>
+__global__ void __launch_bounds__(1024) gemm8_wide_k(Mat m0, Mat m1, Mat m2, float* y0, float* y1, float* y2, const uint32_t* xf, const float* fps, int segs, int tokens,
+                             int strips) {
+    extern __shared__ uint4 frags[];  // [warp][2][32]: a quad's eight A registers a lane
+    __shared__ uint32_t luts[3][256];
+    __shared__ int part[WIDE_WARPS][32][4];
+    const int wid = threadIdx.x >> 5, lane = threadIdx.x & 31, team = segs * strips;
+    const int set = wid / team, rest = wid % team, local = rest / segs, warp = rest % segs;
+    if (m0.rows)
+        for (int i = threadIdx.x; i < (1 << m0.bits); i += blockDim.x) luts[0][i] = m0.lut8[i];
+    if (m1.rows)
+        for (int i = threadIdx.x; i < (1 << m1.bits); i += blockDim.x) luts[1][i] = m1.lut8[i];
+    if (m2.rows)
+        for (int i = threadIdx.x; i < (1 << m2.bits); i += blockDim.x) luts[2][i] = m2.lut8[i];
+    __syncthreads();
+    int strip = blockIdx.x * strips + local, which = 0;
+    Mat m = m0;
+    float* y = y0;
+    if (strip >= m0.rows / 16) {
+        strip -= m0.rows / 16, m = m1, y = y1, which = 1;
+        if (strip >= m1.rows / 16) strip -= m1.rows / 16, m = m2, y = y2, which = 2;
+    }
+    const bool idle = strip >= m.rows / 16;
+    const uint32_t* slut = luts[which];
+    // the matrices share the input: its tiles are m0's (an idle warp's m may have none, and every warp takes part in
+    // the block's waits)
+    const int tiles = m0.cols / 16, per = tiles / segs, first = warp * per, g0 = 4 * set, nq = per / 4;
+    int c[4][4];
+#pragma unroll
+    for (int g = 0; g < 4; ++g) c[g][0] = c[g][1] = c[g][2] = c[g][3] = 0;
+    const uint4* xw = reinterpret_cast<const uint4*>(xf) + size_t(first / 4) * 32 + lane;
+    const size_t group = size_t(tiles) * 8;
+    for (int r = 0; r < nq; r += SETS) {
+        const int q = r + set;
+        if (!idle && q < nq) {
+            const int j = first + 4 * q;
+            uint32_t a[8];
+            if (m.bits == 8) {
+                const uint32_t* cw = m.codes + (size_t(strip) * tiles + j) * 32 + lane;
+                uint32_t w[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) w[i] = cw[size_t(i) * 32];
+#pragma unroll
+                for (int i = 0; i < 4; i += 2) {
+                    const uint32_t u = w[i], v = w[i + 1];
+                    a[2 * i] = join8(slut[u & 255], slut[u >> 16 & 255]), a[2 * i + 1] = join8(slut[u >> 8 & 255], slut[u >> 24]);
+                    a[2 * i + 2] = join8(slut[v & 255], slut[v >> 16 & 255]), a[2 * i + 3] = join8(slut[v >> 8 & 255], slut[v >> 24]);
+                }
+            } else {
+                const uint32_t* cq = m.codes + (size_t(strip) * (tiles / 4) + j / 4) * 96 + lane;
+                const uint32_t q0 = cq[0], q1 = cq[32], q2 = cq[64];
+                const uint64_t lo = uint64_t(q0) | uint64_t(q1) << 32, hi = q2;
+                const uint32_t k10 = uint32_t(lo >> 60 | hi << 4) & 63;
+                const uint32_t t[16] = {slut[lo & 63],       slut[lo >> 6 & 63],  slut[lo >> 12 & 63], slut[lo >> 18 & 63],
+                                        slut[lo >> 24 & 63], slut[lo >> 30 & 63], slut[lo >> 36 & 63], slut[lo >> 42 & 63],
+                                        slut[lo >> 48 & 63], slut[lo >> 54 & 63], slut[k10],           slut[hi >> 2 & 63],
+                                        slut[hi >> 8 & 63],  slut[hi >> 14 & 63], slut[hi >> 20 & 63], slut[hi >> 26 & 63]};
+                a[0] = join8(t[0], t[2]), a[1] = join8(t[1], t[3]), a[2] = join8(t[4], t[6]), a[3] = join8(t[5], t[7]);
+                a[4] = join8(t[8], t[10]), a[5] = join8(t[9], t[11]), a[6] = join8(t[12], t[14]), a[7] = join8(t[13], t[15]);
+            }
+            frags[(wid * 2) * 32 + lane] = make_uint4(a[0], a[1], a[2], a[3]);
+            frags[(wid * 2 + 1) * 32 + lane] = make_uint4(a[4], a[5], a[6], a[7]);
+        }
+        __syncthreads();
+        const int here = nq - r < SETS ? nq - r : SETS;
+        if (!idle)
+            for (int s = 0; s < here; ++s) {
+                const int src = s * team + rest, jq = (r + s);  // the quad's place among the warp's
+                uint4 b[4];
+#pragma unroll
+                for (int g = 0; g < 4; ++g) b[g] = xw[(g0 + g) * group + size_t(jq) * 32];
+                const uint4 lo = frags[(src * 2) * 32 + lane], hi = frags[(src * 2 + 1) * 32 + lane];
+#pragma unroll
+                for (int g = 0; g < 4; ++g) {
+                    mma8(c[g], lo.x, lo.y, lo.z, lo.w, b[g].x, b[g].y);
+                    mma8(c[g], hi.x, hi.y, hi.z, hi.w, b[g].z, b[g].w);
+                }
+            }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        for (int i = 0; i < 4; ++i) part[wid][lane][i] = c[g][i];
+        __syncthreads();
+        if (warp == 0 && !idle)
+            for (int i = 0; i < 4; ++i) {
+                int sum = 0;
+                for (int w = 0; w < segs; ++w) sum += part[wid + w][lane][i];
+                const int row = strip * 16 + (lane >> 2) + (i >= 2 ? 8 : 0), token = 8 * (g0 + g) + 2 * (lane & 3) + (i & 1);
                 if (token < tokens) y[size_t(token) * m.rows + row] = m.scale[row] * m.book_scale * fps[token] * float(sum);
             }
         __syncthreads();
@@ -1430,6 +1545,18 @@ static int segs_for(int cols) {
 // One launch for a matrix, or for up to three that share the input in xf (b and c may have no rows).
 static void gemm(const uint64_t* xf, const float* fps, int tokens, const Mat& a, float* ya, const Mat& b = Mat{}, float* yb = nullptr,
                  const Mat& c = Mat{}, float* yc = nullptr) {
+    if (tokens > 32) {
+        // more than four groups on the fp16 instruction: 32 rows a launch (the same bits as a 32-row pass; a wider
+        // kernel was no faster a group there: bench/mma_wide.cu, 0.82-1.0 of four groups' time a group at best, and
+        // only with another order of the sums)
+        const size_t group = size_t(a.cols / 16) * 32;  // a group's words in xf
+        for (int t0 = 0; t0 < tokens; t0 += 32) {
+            const int n = tokens - t0 < 32 ? tokens - t0 : 32;
+            gemm(xf + size_t(t0 / 8) * group, fps + t0, n, a, ya + size_t(t0) * a.rows, b, yb ? yb + size_t(t0) * b.rows : nullptr, c,
+                 yc ? yc + size_t(t0) * c.rows : nullptr);
+        }
+        return;
+    }
     const int segs = segs_for(a.cols), all = (a.rows + b.rows + c.rows) / 16;
     // as many strips a block as its threads allow, up to four. Measured on the real model (a pass at 64 positions):
     // 32 rows 36.3 ms with a strip a block, 31.4 ms with four; 16 rows 25.2 -> 22.6 ms; 8 rows the same (20.3 ms)
@@ -1442,10 +1569,48 @@ static void gemm(const uint64_t* xf, const float* fps, int tokens, const Mat& a,
         gemm_k<4><<<blocks, 32 * segs * strips>>>(a, b, c, ya, yb, yc, xf, fps, segs, tokens, strips);
 }
 
+// Strips a block of gemm8_wide_k: 4 (bench/mma_wide.cu), or SCLMD_WIDE_STRIPS (measurements), within its 32 warps
+// (`warps`: a strip's warps, segs * sets).
+static int wide_strips(int warps) {
+    static const int want = getenv("SCLMD_WIDE_STRIPS") ? atoi(getenv("SCLMD_WIDE_STRIPS")) : GEMM_STRIPS;
+    const int most = WIDE_WARPS / warps;
+    return want < 1 ? 1 : want > most ? most : want;
+}
+
+// The warps a launch of gemm8_wide_k should have at least (SCLMD_WIDE_TARGET for measurements): 4,096, 49 for each
+// of the card's 84 multiprocessors.
+static int wide_target() {
+    static const int want = getenv("SCLMD_WIDE_TARGET") ? atoi(getenv("SCLMD_WIDE_TARGET")) : 4096;
+    return want;
+}
+
 // gemm on the integer instruction (xf as prep_k wrote it with sigma), with the same launch
 static void gemm8(const uint64_t* xf64, const float* fps, int tokens, const Mat& a, float* ya, const Mat& b = Mat{}, float* yb = nullptr,
                   const Mat& c = Mat{}, float* yc = nullptr) {
     const uint32_t* xf = reinterpret_cast<const uint32_t*>(xf64);
+    if (tokens > 32) {  // more than four groups: gemm8_wide_k, the groups four a warp
+        const int groups = (tokens + 7) / 8, sets = groups <= 8 ? 2 : groups <= 16 ? 4 : 8, all = (a.rows + b.rows + c.rows) / 16;
+        // a strip's tiles split over as few warps as keep the card busy: a matrix of few strips and long rows (down,
+        // o) on one warp a strip had too few warps (down at 64 rows 14.1 ms a pass against 3.9 at 32)
+        int segs = 1;
+        while (segs < segs_for(a.cols) && all * segs * sets < wide_target() && 2 * segs * sets <= WIDE_WARPS) segs *= 2;
+        const int strips = wide_strips(segs * sets), blocks = (all + strips - 1) / strips, threads = 32 * segs * sets * strips;
+        const size_t frags = size_t(threads / 32) * 2 * 32 * 16;
+        static bool raised = false;  // the shared memory past 48 KB a block is asked for once
+        if (!raised) {
+            cudaFuncSetAttribute(gemm8_wide_k<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 32 * 1024);
+            cudaFuncSetAttribute(gemm8_wide_k<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, 32 * 1024);
+            cudaFuncSetAttribute(gemm8_wide_k<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, 32 * 1024);
+            raised = true;
+        }
+        if (sets == 2)
+            gemm8_wide_k<2><<<blocks, threads, frags>>>(a, b, c, ya, yb, yc, xf, fps, segs, tokens, strips);
+        else if (sets == 4)
+            gemm8_wide_k<4><<<blocks, threads, frags>>>(a, b, c, ya, yb, yc, xf, fps, segs, tokens, strips);
+        else
+            gemm8_wide_k<8><<<blocks, threads, frags>>>(a, b, c, ya, yb, yc, xf, fps, segs, tokens, strips);
+        return;
+    }
     const int segs = segs_for(a.cols), all = (a.rows + b.rows + c.rows) / 16;
     const int strips = GEMM_STRIPS * segs * 32 <= 1024 ? GEMM_STRIPS : 1024 / (segs * 32), blocks = (all + strips - 1) / strips;
     if (tokens <= 8)
@@ -1664,6 +1829,28 @@ static void kv4_read(const Layer& l, const Att& a, int groups, const uint16_t* q
 // matrix input from the residual stream, which writes the stream's next state to the other of m.h and m.h2.
 static int pass(const Model* mp, int tokens, const Segs* segs, int logits_from);
 
+// Rows from .. from + count - 1 of a pass as segments of their own (rows counted from `from`): a segment cut at an
+// edge keeps its sequence, with the position of its first row here.
+static Segs rows_of(const Segs& g, int from, int count) {
+    Segs s{};
+    for (int i = 0; i < g.n; ++i) {
+        const int lo = g.row0[i] > from ? g.row0[i] : from, end = g.row0[i] + g.cnt[i] < from + count ? g.row0[i] + g.cnt[i] : from + count;
+        if (lo >= end) continue;
+        s.row0[s.n] = lo - from, s.cnt[s.n] = end - lo, s.pos0[s.n] = g.pos0[i] + lo - g.row0[i], s.seq[s.n] = g.seq[i];
+        ++s.n;
+    }
+    return s;
+}
+
+// The first row a pass of more than ATT_ROWS rows has logits of: from the group of eight logits_from is in, and of
+// the last ATT_ROWS rows at most (m.logits has ATT_ROWS rows); a pass of up to ATT_ROWS rows keeps them at their rows.
+static int logits_first(int tokens, int logits_from) {
+    const int asked = logits_from < 0 ? 0 : logits_from / 8 * 8, last = (tokens - ATT_ROWS + 7) / 8 * 8;
+    return asked > last ? asked : last;
+}
+
+API int sclmd_logits_first(int tokens, int logits_from) { return tokens > ATT_ROWS ? logits_first(tokens, logits_from) : (logits_from < 0 ? 0 : logits_from / 8 * 8); }
+
 API int sclmd_pass(const Model* mp, int tokens, const Segs* segs) { return pass(mp, tokens, segs, 0); }
 
 // The pass with the logits of the rows from `logits_from` on only (of its group of eight rows on; from `tokens`: of
@@ -1687,22 +1874,48 @@ static int pass(const Model* mp, int tokens, const Segs* segs, int logits_from) 
         gemm_of(m, tokens, l.q, yq, l.k, yk, l.v, yv);  // a full-attention layer's v has no rows
         tick(P_QKV);
         const Att a = att_for(*segs, l.full, m.heads, m.window - 1);
-        const int rep = m.heads / kvh, groups = (rep * a.most + 7) / 8;
-        if (l.kv4) {  // brief K3: a sliding layer that keeps its keys and values at 4 bits
+        const int rep = m.heads / kvh;
+        // every row's keys and values first, then attention over as many rows at a time as the scores' memory holds,
+        // ATT_ROWS at least (a row reads only positions up to its own, whose keys are written by then; a sliding
+        // layer's ring holds window + rows positions, so what the pass writes is not where its first row still reads).
+        // The chunks go to the kernels of a pass of their width (scores_once_k, attend_wide_k from enough groups),
+        // which give a query the same bits in any chunk (tests/test_wide.py against passes of one row).
+        // A 4-bit layer (brief K3, Layer::kv4) goes the same way: kv4_write for every row, then kv4_read a chunk at a
+        // time. Its plain queries sit past every row's turned ones (m.qhat + tokens rows) and its turned sums past every
+        // row's output (m.attn + tokens rows), a chunk's at its own rows there (the Engine sizes both for twice its rows).
+        // When the ring goes round within the pass, writing position 16 ring + p over the ring tile 0 takes the first
+        // tile's int8 position p / 2 and scale p; every row of the pass reads from p + 2 on, as its ring holds window +
+        // rows (tests/test_kv4_wide.py).
+        if (l.kv4)
             kv4_write(m, l, a, tokens, yq, yk, yv);
-            tick(P_HEADS);
-            kv4_read(l, a, groups, m.qhat, m.qhat + size_t(tokens) * nqo, m.attn, m.attn + size_t(tokens) * nqo, m.scores, m.probs, m.heads, m.window);
-        } else {
-        heads_k<<<dim3(m.heads + 2 * kvh, tokens), hd>>>(yq, yk, l.v.rows ? yv : nullptr, l.q_norm, l.k_norm, l.inv_freq, m.qhat, l.keys,
-                                                       l.values, l.kscale, l.vscale, l.tiles, a, m.heads, kvh, l.ring, m.eps,
-                                                       l.keys ? nullptr : l.k_norm, l.turned);
+        else
+            heads_k<<<dim3(m.heads + 2 * kvh, tokens), hd>>>(yq, yk, l.v.rows ? yv : nullptr, l.q_norm, l.k_norm, l.inv_freq, m.qhat, l.keys,
+                                                           l.values, l.kscale, l.vscale, l.tiles, a, m.heads, kvh, l.ring, m.eps,
+                                                           l.keys ? nullptr : l.k_norm, l.turned);
         tick(P_HEADS);
-        scores(tiles_of(a), groups, m.qhat, l, m.scores, a, m.heads);
-        tick(P_SCORES);
-        softmax_k<<<dim3(rep * tokens, kvh), 256>>>(m.scores, m.probs, l.vscale, l.tiles, a, m.heads, kvh, l.full ? 0 : m.window, l.ring);
-        tick(P_SOFTMAX);
-        attend(groups, m.probs, l.values, m.attn, l.tiles, a, m.heads, kvh, hd, l.ring);
-        tick(P_ATTEND);
+        for (int c0 = 0, cn; c0 < tokens; c0 += cn) {
+            cn = tokens - c0;
+            Att ac = a;
+            if (tokens > ATT_ROWS)
+                for (;;) {  // as many rows as the scores' memory holds (in steps of ATT_ROWS)
+                    ac = att_for(rows_of(*segs, c0, cn), l.full, m.heads, m.window - 1);
+                    const long long need = ac.off[ac.n - 1] + (long long)m.heads * ac.cnt[ac.n - 1] * ac.stride[ac.n - 1];
+                    if (cn <= ATT_ROWS || need <= m.scores_room) break;
+                    cn = cn - ATT_ROWS > ATT_ROWS ? cn - ATT_ROWS : ATT_ROWS;
+                }
+            const int groups = (rep * ac.most + 7) / 8;
+            uint16_t* qhat = m.qhat + size_t(c0) * nqo;
+            if (l.kv4) {
+                kv4_read(l, ac, groups, qhat, m.qhat + size_t(tokens + c0) * nqo, m.attn + size_t(c0) * nqo, m.attn + size_t(tokens + c0) * nqo,
+                         m.scores, m.probs, m.heads, m.window);
+                continue;
+            }
+            scores(tiles_of(ac), groups, qhat, l, m.scores, ac, m.heads);
+            tick(P_SCORES);
+            softmax_k<<<dim3(rep * cn, kvh), 256>>>(m.scores, m.probs, l.vscale, l.tiles, ac, m.heads, kvh, l.full ? 0 : m.window, l.ring);
+            tick(P_SOFTMAX);
+            attend(groups, m.probs, l.values, m.attn + size_t(c0) * nqo, l.tiles, ac, m.heads, kvh, hd, l.ring);
+            tick(P_ATTEND);
         }
         prep(m, m.attn, nullptr, nullptr, nqo, l.rot_o, 1, tokens);
         tick(P_INPUT);
@@ -1723,9 +1936,12 @@ static int pass(const Model* mp, int tokens, const Segs* segs, int logits_from) 
     }
     // the last residual step, the final norm (kept in m.hn) and the head. Two steps a layer: the stream ends in m.h
     prep_head(m, h, nullptr, m.norm, n, m.rot_head, 0, tokens, owed, spare, m.hn);
-    const int first = logits_from < 0 ? 0 : logits_from / 8 * 8;  // the first row of the group of eight the logits start in
+    int first = logits_from < 0 ? 0 : logits_from / 8 * 8;  // the first row of the group of eight the logits start in
+    // a pass of more than ATT_ROWS rows: the logits of its last ATT_ROWS at most (from a group's first row on), from
+    // m.logits' first row (logits_first() says which)
+    const int lbase = tokens > ATT_ROWS ? (first = logits_first(tokens, logits_from)) : 0;
     if (first < tokens) {
-        float* logits = m.logits + size_t(first) * m.vocab;
+        float* logits = m.logits + size_t(first - lbase) * m.vocab;
         gemm(m.xf + size_t(first / 8) * (n / 16) * 32, m.fps + first, tokens - first, m.head, logits);
         if (m.softcap > 0) {
             const size_t count = size_t(tokens - first) * m.vocab;

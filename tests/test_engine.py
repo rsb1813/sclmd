@@ -92,10 +92,11 @@ class Reference:
 
 
 class Small:
-    def __init__(self):
+    def __init__(self, **text):
+        """text: changes to ETEXT (tests/test_wide.py: heads of 256 and 512, which the real model's kernels take)."""
         from transformers import Gemma4ForCausalLM, Gemma4TextConfig
 
-        config = Gemma4TextConfig(**ETEXT)
+        config = Gemma4TextConfig(**dict(ETEXT, **text))
         state = {k: v.to(DEV) for k, v in randomize(Gemma4ForCausalLM(config).eval(), 5).state_dict().items()}
         self.cfg = cfg = M.Config.from_text_config(config.to_dict())
         self.ref_layers, self.eng_layers = [], []
