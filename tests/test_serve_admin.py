@@ -569,9 +569,10 @@ def test_the_config_file_gives_defaults_the_command_line_overrides(tmp_path, cap
     assert A.parse_args(fresh, ["--config", ""]).max_waiting == 0  # no file at all: as before
 
 
-def test_an_abbreviation_never_reads_as_config(tmp_path, capsys):
+def test_an_abbreviation_never_reads_as_config(tmp_path, capsys, monkeypatch):
     """--con was --context before --config came: it must not be taken as a file name; --conf x is refused, not
     half-read (the file's options would be missing)."""
+    monkeypatch.setattr(A, "CONFIG", str(tmp_path / "absent.toml"))  # the working copy's own serve.toml (the owner's) is not this test's
     cfg = tmp_path / "serve.toml"
     cfg.write_text("max-waiting = 12\n", encoding="utf-8")
     ap = argparse.ArgumentParser()

@@ -89,7 +89,7 @@ def main():
         print(f"[prefix] {args.compare[0]}: 1 and 8 clients the same: {sum(ab[0][k] == ab[-1][k] for k in ab[0])} of {len(ab[0])}")
         return
     items, system = items_and_system(args.items, args.system)
-    cmd = [sys.executable, "-m", "scripts.serve", "--port", str(args.port), "--context", "2048", "--sequences", "16"]
+    cmd = [sys.executable, "-m", "scripts.serve", "--port", str(args.port), "--config", "", "--context", "2048", "--sequences", "16"]
     if args.ram_gib is not None:
         cmd += ["--ram-gib", args.ram_gib]
     if args.mode == "on":

@@ -101,7 +101,8 @@ def parse_keys(text: str, source: str, limits: dict | None = None) -> list:
     by name); an entry with any other words after the key is the key as a whole. Without it (no --quotas) every entry
     is the key as a whole, as before: the string that authenticates does not change without the option."""
     keys = []
-    for part in re.split(r"[,\r\n]", text or ""):
+    lines = [x.strip() for x in re.split(r"[\r\n]", text or "")]
+    for part in (p for line in lines if not line.startswith("#") for p in line.split(",")):  # a comment line is skipped whole, commas and all
         part = part.strip()
         if not part or part.startswith("#"):
             continue

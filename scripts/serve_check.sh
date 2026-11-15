@@ -4,7 +4,7 @@
 #   sh scripts/serve_check.sh [serve_bench options ...]      (server options: SERVE_ARGS; default --clients 1,4,8)
 PY=/h/projects/sclm/.venv/Scripts/python.exe
 LOG=logs/serve_check_server.log
-PYTHONIOENCODING=utf-8 $PY -m scripts.serve --port 8012 $SERVE_ARGS > "$LOG" 2>&1 &
+PYTHONIOENCODING=utf-8 $PY -m scripts.serve --port 8012 --config "" $SERVE_ARGS > "$LOG" 2>&1 &
 pid=$!
 ok=0
 for i in $(seq 1 60); do

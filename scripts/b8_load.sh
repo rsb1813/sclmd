@@ -4,7 +4,7 @@
 PY=/h/projects/sclm/.venv/Scripts/python.exe
 tag=$1
 shift
-PYTHONIOENCODING=utf-8 $PY -m scripts.serve --port 8011 $SERVE_ARGS > "data/task_load_bench_serve_$tag.log" 2>&1 &
+PYTHONIOENCODING=utf-8 $PY -m scripts.serve --port 8011 --config "" $SERVE_ARGS > "data/task_load_bench_serve_$tag.log" 2>&1 &
 pid=$!
 echo "[b8] server pid $pid"
 ok=0

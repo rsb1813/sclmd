@@ -182,6 +182,8 @@ def test_a_keys_own_limits_follow_it_and_r4s_lines_read_as_before():
     assert got == [("alice", b"sk-alice-0123456789"), ("bob", b"sk-bob"), ("file3", b"sk-x"), ("carol", b"sk with words")]
     assert limits == {"alice": {"tph": 1000000, "rph": 1200}, "bob": {"tpd": 0}, "file3": {"tph": 5}}
     assert A.parse_keys("a:k1 tph=1,b:k2", "key", {}) == [("a", b"k1"), ("b", b"k2")]  # SCLMD_API_KEY's commas
+    # a comment line is skipped whole: a comma in it does not make the rest of the line a key
+    assert A.parse_keys("# keys: one a line, limits may follow: tph=N\nowner: sk-owner-0123456789", "file") == [("owner", b"sk-owner-0123456789")]
     # without --quotas (no limits to fill) the whole entry is the key, as before N2: what authenticates does not change
     assert A.parse_keys("alice: sk-alice-0123456789 tph=1000000\nsk-x tph=5", "file") == [("alice", b"sk-alice-0123456789 tph=1000000"),
                                                                                             ("file2", b"sk-x tph=5")]
