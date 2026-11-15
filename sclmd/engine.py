@@ -434,9 +434,17 @@ class Engine:
 
     @classmethod
     def load(cls, name: str, plan: dict, head: int, capacity: int = 8192, device: str = "cuda", sequences: int = 1,
-             pool: dict | None = None, rows: int = 8, keyless: bool = False, int8: float | None = None, kv4: bool | None = None) -> "Engine":
+             pool: dict | None = None, rows: int = 8, keyless: bool = False, int8: float | None = None, kv4: bool | None = None,
+             image: str | None = None) -> "Engine":
         """The original model with the stored codes `name`: plan is layer -> {matrix: bits a pair}, head the output
-        head's bits. The layers come off the disk one at a time; the embedding table stays in RAM."""
+        head's bits. The layers come off the disk one at a time; the embedding table stays in RAM.
+        image: "off" (default; also SCLMD_IMAGE), "auto" or "read": the packed codes from an engine image (sclmd/image.py)."""
+        image = image or os.environ.get("SCLMD_IMAGE") or "off"
+        if image != "off":
+            from . import image as IM
+
+            return IM.load(cls, name, plan, head, image, capacity=capacity, device=device, sequences=sequences, pool=pool, rows=rows,
+                           keyless=keyless, int8=int8, kv4=kv4)
         from . import ckpt
         from .checkpoint import Checkpoint
 
@@ -461,7 +469,11 @@ class Engine:
         self.keep.append(t)
         return t
 
+    _image = None  # while an image fills the engine: where _mat takes its tensors from (sclmd/image.py)
+
     def _mat(self, codes: torch.Tensor, scales: torch.Tensor, book: torch.Tensor, bits: int, out: torch.Tensor | None = None) -> Mat:
+        if self._image is not None:  # the same tensors, filled from an image afterwards (sclmd/image.py)
+            return self._image.mat(self, codes, bits, out)
         dev = self.device
         packed = pack(codes, bits, out=out) if out is not None else self._own(pack(codes, bits, device=dev))
         table = self._own(lut(book.to(dev)))

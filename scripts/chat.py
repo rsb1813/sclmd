@@ -293,6 +293,9 @@ def main() -> None:
                     "programs. Less means more matrices at 4 bits; if other programs then take more, Windows pages VRAM out and everything slows down")
     E.add_int8_option(ap)
     E.add_kv4_option(ap)
+    ap.add_argument("--image", default="off", choices=("off", "auto", "read"), help="the packed codes from an engine image under "
+                    "data/images (sclmd/image.py): the same bytes, read in a few seconds. auto writes one (about 13 GB) when there is none, for "
+                    "--plan c6 or a plan file only (a plan fitted to the free VRAM changes from start to start: it is only read); read never writes")
     cli = ap.parse_args()
     E.use_int8_option(cli)
     kv4 = E.use_kv4_option(cli)
@@ -324,7 +327,8 @@ def main() -> None:
         plan, head = P.read(cli.plan)
         head = head or cli.head
     with torch.no_grad():
-        eng = E.Engine.load(cli.name, plan, head, -(-cli.context // E.TILE) * E.TILE, rows=cli.rows, keyless=cli.keyless)
+        eng = E.Engine.load(cli.name, plan, head, -(-cli.context // E.TILE) * E.TILE, rows=cli.rows, keyless=cli.keyless,
+                            image="read" if cli.image == "auto" and cli.plan == "auto" else cli.image)
         drafter = None if cli.no_drafter else E.EngineDrafter.load(eng, ckpt("drafter"), cli.name, depth=DEPTH)
         opts = {"temperature": 1.0, "top_p": 0.95, "top_k": 64, "num_predict": 4096, "verbose": True, "showthink": False}
         session = Session(tok, eng, drafter)

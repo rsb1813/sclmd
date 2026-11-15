@@ -33,6 +33,7 @@ from sclmd.text import Pieces
 from sclmd.stream import VRAM_MARGIN, cap_vram
 from scripts import serve_admin as A
 from scripts import serve_contract as C
+from scripts import serve_ops
 
 DEPTH = 6  # the drafter's generation_config.json: num_assistant_tokens
 SHARES = "own_v1"  # the measurements a plan is fitted from (scripts/chat.py)
@@ -150,6 +151,8 @@ class Server:
         self.unused = list(range(eng.sequences - 1, -1, -1))
         self.totals = {"requests": 0, "prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0}
         self.t0, self.busy_s = time.time(), 0.0
+        self.ops = None  # --crash-only: the lifecycle (scripts/serve_ops.py: install); None: as before
+        self.idle_wait = None  # seconds an idle engine thread waits for a request before it turns anyway (None: until one comes)
 
     def submit(self, req: Request) -> None:
         self.inbox.put(req)
@@ -327,7 +330,7 @@ class Server:
             idle = not self.active and not self.waiting and not self.batch.jobs
             if idle and not wait and self.inbox.empty():
                 return False
-            self.waiting.append(self.inbox.get(timeout=None if idle else 0))
+            self.waiting.append(self.inbox.get(timeout=self.idle_wait if idle else 0))
             while True:
                 self.waiting.append(self.inbox.get_nowait())
         except queue.Empty:
@@ -361,12 +364,17 @@ class Server:
         while True:
             try:
                 self.turn()
+                if self.ops is not None:
+                    self.ops.beat()
             except Exception as e:  # noqa: BLE001
                 traceback.print_exc()
+                told = self.ops.failed(e) if self.ops is not None else None  # --crash-only: (503, why) when the engine is dead
                 print(f"[serve] the engine's thread failed: {type(e).__name__}: {e}; {len(self.active) + len(self.waiting)} requests are told", flush=True)
                 for req in self.active + self.waiting:
-                    req.events.put(("error", 500, f"the server failed while answering: {type(e).__name__}"))
+                    req.events.put(("error",) + (told or (500, f"the server failed while answering: {type(e).__name__}")))
                 self.reset()
+                if self.ops is not None:
+                    self.ops.after_failure()  # --crash-only: a dead engine ends the process here (exit 75)
 
     def reset(self) -> None:
         """Forgets every conversation and job: the engine as it was when it was loaded."""
@@ -915,6 +923,7 @@ def main() -> None:
     E.add_kv4_option(ap)
     C.add_options(ap)
     A.add_options(ap)
+    serve_ops.add_options(ap)
     cli = A.parse_args(ap)  # serve.toml's options (--config) under the command line's
     keys = A.start(cli)  # the API keys; a host other than loopback without one: a warning (--require-key: no start)
     E.use_int8_option(cli)  # the whole engine: every request's rows on the integer products, so a reply's bits do not depend on its neighbours
@@ -928,9 +937,10 @@ def main() -> None:
 
     transformers.logging.set_verbosity_error()
     reserve = int(cli.reserve * 2**30)
+    early = serve_ops.bind_early(cli)  # --crash-only: the port answers 503 "starting" while the engine loads
     print("[serve] loading (about 15 s) ...", flush=True)
     cap_vram(margin=reserve)
-    tok = AutoTokenizer.from_pretrained(ckpt("orig"))
+    tok = serve_ops.Later(lambda: AutoTokenizer.from_pretrained(ckpt("orig")), cli.image != "off")  # --image: while the image is read
     cfg = M.Config.load(ckpt("orig"))
     context = -(-cli.context // E.TILE) * E.TILE
     # the VRAM that is free now, less what is left to other programs, the head, the work memory, the drafter and room
@@ -949,10 +959,13 @@ def main() -> None:
     typical = max(cli.typical, cfg.window)
     pool = pool_for(cfg, kv, typical / (cfg.window + E.SPARE + (E.TILE if kv4 else 0)), cli.keyless, kv4)
     with torch.no_grad():
-        eng = E.Engine.load(cli.name, plan, cli.head, context, sequences=cli.sequences, pool=pool, rows=rows, keyless=cli.keyless, kv4=kv4)
+        eng = E.Engine.load(cli.name, plan, cli.head, context, sequences=cli.sequences, pool=pool, rows=rows, keyless=cli.keyless, kv4=kv4,
+                            image=serve_ops.image_mode(cli, estimate is not None))
         drafter = None if cli.no_drafter else E.EngineDrafter.load(eng, ckpt("drafter"), cli.name, depth=DEPTH)
+    tok = tok.get()
     stop = (tok.eos_token_id, tok.convert_tokens_to_ids("<turn|>"), tok.convert_tokens_to_ids("<|tool_response>"))
     server = Server(tok, eng, drafter, stop, ram=int(cli.ram_gib * 2**30), prefix_ram=int(cli.prefix_gib * 2**30), widths=widths)
+    ops = serve_ops.install(server, cli)  # --crash-only (None without it)
     bits = round(P.bits_per_weight(cfg, plan), 2)
     one = (E.tile_bytes(cfg, M.SLIDING, kv4=kv4) * (E.ring_tiles(cfg, M.SLIDING, context, rows) + E.extra_tiles(cfg, M.SLIDING, kv4))
            + E.tile_bytes(cfg, M.FULL, cli.keyless) * typical // E.TILE)
@@ -962,10 +975,12 @@ def main() -> None:
         facts["wide_rows"] = cli.wide_rows
     app = App(server, tok, cli.think, cli.max_tokens, facts)
     C.apply(cli, app, Handler)
-    threading.Thread(target=server.run, daemon=True).start()
-    httpd = C.BoundedHTTPServer((cli.host, cli.port), Handler, cli.max_connections)
+    engine_thread = threading.Thread(target=server.run, daemon=True)
+    engine_thread.start()
+    httpd = C.BoundedHTTPServer((cli.host, cli.port), Handler, cli.max_connections) if early is None else serve_ops.serving(early, Handler, app)
     httpd.app = app
     A.install(app, server, cli, httpd, keys)  # /metrics, keys, back-pressure, the request log and status file (scripts/serve_admin.py)
+    serve_ops.started(app, ops, engine_thread)  # --crash-only's watchdog; --image auto: the image written while it serves
     print(f"[serve] {MODEL} at http://{cli.host}:{cli.port}/v1 · {bits} bits a weight"
           + (f" (KL about {estimate:.3f} on its own text)" if estimate else " (KL about 0.10 on its own text)")
           + f" · VRAM {facts['vram_gib']} GiB\n[serve] keys and values {kv / 2**30:.2f} GiB: about {kv // one} conversations of {typical} tokens "
@@ -976,6 +991,8 @@ def main() -> None:
     print(f"[serve] the pool's tiles {dict(eng.pool)}" + (" (keys and values of the sliding layers at 4 bits: --kv4)" if kv4 else "")
           + ": conversations at once of " + ", ".join(f"{n:,} tokens {c}" for n, c in conversations_at(eng, (200, 500, 1000, 2000, 8000)).items())
           + f" (and at most {eng.sequences} sequences)", flush=True)
+    if ops is not None:  # --crash-only: the port serves in a thread of its own; Ctrl+C or Ctrl+Break stops it gracefully
+        return serve_ops.until_stopped(ops, cli.drain_s)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
