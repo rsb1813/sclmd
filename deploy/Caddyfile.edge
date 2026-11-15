@@ -78,6 +78,25 @@ ssalmuck-ai.duckdns.org {
 	@gverify path_regexp gverify ^/google[0-9a-f]{8,32}\.html$
 
 	handle @api {
+		# CORS (browser clients with their own key; design.md 6.23): a preflight is answered only when the request
+		# will carry a key, and an answer is readable cross-site only when its request carried one. A keyless
+		# cross-site call stays blocked: no web page can spend its visitors' addresses. /v1 has no cookies: "*".
+		@preflight {
+			method OPTIONS
+			header_regexp acrh Access-Control-Request-Headers (?i)(^|[\s,])(authorization|x-api-key)($|[\s,])
+		}
+		handle @preflight {
+			header Access-Control-Allow-Origin "*"
+			header Access-Control-Allow-Methods "GET, POST, OPTIONS"
+			header Access-Control-Allow-Headers "{http.request.header.Access-Control-Request-Headers}"
+			header Access-Control-Max-Age "86400"
+			respond 204
+		}
+		@keyed expression `{http.request.header.Authorization} != "" || {http.request.header.X-Api-Key} != ""`
+		header @keyed {
+			Access-Control-Allow-Origin "*"
+			Access-Control-Expose-Headers "*"
+		}
 		request_body {
 			max_size 32MiB
 		}
