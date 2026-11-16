@@ -632,6 +632,49 @@ def test_a_sleep_file_stops_the_server_and_its_removal_starts_it_again(tmp_path)
     assert not any(alive(int(r[0])) for r in runs), runs
 
 
+
+def test_the_sleeper_watches_the_file_and_the_games(tmp_path):
+    """--sleep-for: asleep while a named program runs (any case), awake wake_after seconds after it ended."""
+    from scripts.supervise import Sleeper
+
+    now, procs = [0.0], [{"explorer.exe"}]
+    s = Sleeper(str(tmp_path / "serve_sleep"), " BF6.exe , other.EXE", every=3, wake_after=20, images=lambda: procs[0], clock=lambda: now[0])
+    assert s.names == {"bf6.exe", "other.exe"} and s.why() is None
+    procs[0] = {"explorer.exe", "bf6.exe"}
+    now[0] = 1.0  # within `every` of the last look: not looked again yet
+    assert s.why() is None
+    now[0] = 3.0
+    assert s.why() == "bf6.exe runs"
+    procs[0] = {"explorer.exe"}  # the game ends
+    now[0] = 6.0
+    assert s.why() == "bf6.exe runs"  # still within wake_after
+    now[0] = 3.0 + 3 + 20 + 0.1
+    assert s.why() is None
+    (tmp_path / "serve_sleep").touch()
+    assert "serve_sleep" in s.why()
+    assert Sleeper(str(tmp_path / "x"), "").why() is None  # no names: the process list is never read
+
+
+@WINDOWS
+def test_a_watched_program_puts_the_server_to_sleep_and_its_end_wakes_it(tmp_path):
+    """A stand-in game (ping.exe for 12 s): the server sleeps while it runs and starts again after it ended."""
+    sup, port = supervise(tmp_path, {}, "--sleep-file", str(tmp_path / "serve_sleep"), "--sleep-for", "PING.EXE", "--wake-after", "0")
+    game = None
+    try:
+        statuses(port, 20, until=lambda o: o[-1][2] == "ok")
+        game = subprocess.Popen(["ping", "-n", "12", "127.0.0.1"], stdout=subprocess.DEVNULL)
+        seen = statuses(port, 30, until=lambda o: o[-1][2] == "asleep")
+        assert seen[-1][1] == 503
+        game.wait(30)
+        statuses(port, 40, until=lambda o: o[-1][2] == "ok")
+    finally:
+        if game is not None and game.poll() is None:
+            game.kill()
+        code = stop(sup)
+    log = "".join(lines(tmp_path / "sup.log"))
+    assert code == 0 and "sleeps while one of these runs: ping.exe" in log and "asleep while ping.exe runs" in log and "awake after" in log, log
+
+
 @WINDOWS
 def test_a_server_that_stops_answering_is_stopped_and_started_again(tmp_path):
     sup, port = supervise(tmp_path, {"R3_CHILD_STUCK": "1"}, "--health-grace", "2", "--max-runs", "2")

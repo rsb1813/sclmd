@@ -802,7 +802,7 @@ R1 열은 마지막 코드로 잰 것이다(그 전 코드로 한 번 더: 80.3%
 
 **`--crash-only`** (supervisor가 붙인다): 포트를 먼저 잡아 엔진이 오르는 동안 503 "starting"; 실패한 턴 뒤 장치를 검사해(동기화와 원소 하나 연산) 끈적한 CUDA 오류면 엔진은 죽은 것이고, 진행 중인 요청에 503을 알린 뒤 exit 75; 장치가 답해도 1분에 `--restart-failures`(3)번이면 같다; 턴마다 심장박동(쉬면 1초마다), `--watchdog-s`(15초) 넘게 없으면 모든 스레드의 스택을 찍고 exit 75; `/health`는 503 dead·stale·draining과 Retry-After; Ctrl+C·Ctrl+Break는 진행 중인 것을 끝내고(`--drain-s` 30초까지) 0으로 끝난다. `SCLMD_FAULT`(시험용 고장 주입)는 `--crash-only`에서만 읽는다.
 
-**supervisor** (`serve.bat --supervise`, `scripts/supervise.py`, torch를 안 읽음): 서버가 0이 아닌 값으로 끝나면 1, 2, 4 … 60초 뒤 다시 띄우고(60초 넘게 돈 뒤면 다시 1초부터), 그동안 포트에서 503 "restarting"과 Retry-After를 준다. ok라고 한 뒤 `/health`가 30초 넘게 ok가 아니면 제가 띄운 프로세스와 그 자식만 PID로 멈춘다. `logs\serve_sleep` 파일이 있는 동안은 서버를 곱게 멈추고 503 "asleep"(게임용). 실제 모델, `--image auto`(이번 빌드):
+**supervisor** (`serve.bat --supervise`, `scripts/supervise.py`, torch를 안 읽음): 서버가 0이 아닌 값으로 끝나면 1, 2, 4 … 60초 뒤 다시 띄우고(60초 넘게 돈 뒤면 다시 1초부터), 그동안 포트에서 503 "restarting"과 Retry-After를 준다. ok라고 한 뒤 `/health`가 30초 넘게 ok가 아니면 제가 띄운 프로세스와 그 자식만 PID로 멈춘다. `logs\serve_sleep` 파일이 있는 동안은 서버를 곱게 멈추고 503 "asleep"(게임용). `--sleep-for BF6.exe`(또는 `serve.toml`의 `sleep-for`, 쉼표로 여럿; 2026-11-16 관리자 요청)이면 그 프로그램이 떠 있는 동안도 같다: 3초마다 `tasklist`로 이름만 보고(게임 프로세스는 열지 않음: 안티치트와 무관), 마지막 것이 끝나고 `--wake-after` 20초 뒤에 다시 띄운다. 실제 모델, `--image auto`(이번 빌드):
 
 | | 끈적한 CUDA 오류 (`SCLMD_FAULT=tile:30`) | 멈춘 엔진 스레드 (`hang:40:30`) | 잠재우기 |
 |---|---|---|---|

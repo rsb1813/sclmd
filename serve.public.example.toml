@@ -5,6 +5,7 @@
 # or name a key file outside the repository (api-key-file below). Names are the command line's, with - or _.
 
 supervise = true                 # serve.bat: through the supervisor (restarts after an engine failure; logs\supervise.log)
+# sleep-for = "Game.exe"         # serve.bat: while this program runs the server sleeps (VRAM free); it starts again 20 s after it ends
 host = "0.0.0.0"                 # the proxy PC reaches this PC over the LAN (the firewall lets only it in)
 port = 8001
 

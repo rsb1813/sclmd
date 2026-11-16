@@ -53,6 +53,7 @@ TTFT_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60, 120)
 LATENCY_BUCKETS = (0.25, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600)
 SECRET = {"api_key", "api_keys", "key", "keys", "sclmd_api_key"}  # never from serve.toml
 SERVE_BAT = {"supervise"}  # serve.toml's keys for serve.bat (scripts/supervise.py: wanted), which the server passes over
+SERVE_BAT_TEXT = {"sleep_for"}  # serve.toml's text keys for scripts/supervise.py (sleep-for = "BF6.exe"), passed over too
 PATHS = ("/v1/chat/completions", "/v1/models", "/health", "/metrics", "/debug", "/")
 # the label values of /metrics: fixed sets, whatever a request says (a made-up method is "other")
 METHODS = ("GET", "POST", "HEAD", "PUT", "DELETE", "OPTIONS", "PATCH")
@@ -1210,6 +1211,10 @@ def _defaults_from(ap, data: dict, path: str) -> dict:
         if dest in SERVE_BAT:  # serve.bat's own (supervise = true: through scripts/supervise.py), not the server's
             if not isinstance(v, bool):
                 raise SystemExit(f"{path}: {k} is a switch: true or false")
+            continue
+        if dest in SERVE_BAT_TEXT:
+            if not isinstance(v, str):
+                raise SystemExit(f"{path}: {k} is text, e.g. \"BF6.exe\"")
             continue
         if dest in SECRET:
             raise SystemExit(f"{path}: {k}: API keys are not read from a file that may be committed: set {ENV_KEY} or --api-key-file")

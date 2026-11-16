@@ -84,6 +84,48 @@ def served_at(args: list, config: str = os.path.join(ROOT, "serve.toml")) -> tup
     return host, port
 
 
+def running_images() -> set:
+    """The image names of the processes running now, lower case (tasklist: names only; no process is opened)."""
+    try:
+        out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True, timeout=10,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    return {line.split('","', 1)[0].strip('"').lower() for line in out.splitlines() if line.startswith('"')}
+
+
+class Sleeper:
+    """Whether the server should sleep now: the sleep file is there, or one of the --sleep-for programs runs (a game).
+    The process list is read every `every` seconds; once the last of them has ended, the server stays asleep
+    `wake_after` seconds more (a game that restarts itself, a launcher's second step)."""
+
+    def __init__(self, path: str, names: str = "", every: float = 3.0, wake_after: float = 20.0, images=running_images, clock=time.monotonic):
+        self.path, self.every, self.wake_after, self.images, self.clock = path, every, wake_after, images, clock
+        self.names = {n.strip().lower() for n in (names or "").split(",") if n.strip()}
+        self.checked, self.seen, self.last_seen = None, None, None
+
+    def game(self):
+        """The watched program running now (or within wake_after), None if none."""
+        if not self.names:
+            return None
+        now = self.clock()
+        if self.checked is None or now - self.checked >= self.every:
+            self.checked = now
+            found = sorted(self.names & self.images())
+            if found:
+                self.seen, self.last_seen = found[0], now
+        if self.last_seen is not None and now - self.last_seen < self.every + self.wake_after:
+            return self.seen
+        return None
+
+    def why(self):
+        """Why the server sleeps now ("the sleep file", "BF6.exe runs"), None when it should run."""
+        if os.path.exists(self.path):
+            return f"{self.path} is there"
+        g = self.game()
+        return f"{g} runs" if g else None
+
+
 def kill_tree(pid: int) -> None:
     """The process we started and its children, by PID."""
     subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
@@ -165,6 +207,9 @@ def main() -> None:
     ap.add_argument("--sleep-file", default=os.path.join(ROOT, "logs", "serve_sleep"), help="while this file is there (for a game), the "
                     "server is stopped gracefully and its VRAM is free; the port answers 503 'asleep'; when it is removed the server starts "
                     "again (from its image with --image auto)")
+    ap.add_argument("--sleep-for", default=None, help="program names, by commas (e.g. BF6.exe): while one runs, the server sleeps as "
+                    "with the sleep file; it wakes --wake-after seconds after the last has ended (serve.toml: sleep-for)")
+    ap.add_argument("--wake-after", type=float, default=20.0, help="seconds after a --sleep-for program has ended before the server starts")
     sup, rest = ap.parse_known_args()
     rest = [a for a in rest if a.lower() != "--supervise"]  # serve.bat --supervise (anywhere, any case) passes it on
     if "--crash-only" not in rest:
@@ -183,7 +228,11 @@ def main() -> None:
     if hasattr(signal, "SIGBREAK"):
         signal.signal(signal.SIGBREAK, stop)
     holder, backoff, runs = Holder(host, port, log), 1.0, 0
+    games = sup.sleep_for if sup.sleep_for is not None else str(configured(rest).get("sleep_for") or "")
+    sleeper = Sleeper(sup.sleep_file, games, wake_after=sup.wake_after)
     log(f"supervising: {' '.join(cmd)}")
+    if sleeper.names:
+        log(f"sleeps while one of these runs: {', '.join(sorted(sleeper.names))}")
 
     def stop_child(child, why: str):
         """A graceful stop: the server lets what is under way finish (Ctrl+Break), else it is stopped by its PID."""
@@ -200,11 +249,12 @@ def main() -> None:
             return child.wait()
 
     while not stopping.is_set():
-        if os.path.exists(sup.sleep_file):  # asleep: no server, the port says so, until the file is gone
+        why_sleep = sleeper.why()
+        if why_sleep:  # asleep: no server, the port says so, until the file is gone and no watched program runs
             t_sleep = time.time()
-            log(f"asleep while {sup.sleep_file} is there")
+            log(f"asleep while {why_sleep}")
             holder.start(30, "asleep")
-            while os.path.exists(sup.sleep_file) and not stopping.is_set():
+            while sleeper.why() and not stopping.is_set():
                 stopping.wait(0.5)
                 holder.until = time.time() + 30
             holder.stop()
@@ -228,9 +278,10 @@ def main() -> None:
             if stopping.is_set():
                 code = stop_child(child, "the supervisor stops")
                 break
-            if os.path.exists(sup.sleep_file):
+            why_sleep = sleeper.why()
+            if why_sleep:
                 why = "sleep"
-                code = stop_child(child, f"{sup.sleep_file} is there")
+                code = stop_child(child, why_sleep)
                 break
             bad = watch.bad()
             if bad is not None and bad > sup.health_grace:
